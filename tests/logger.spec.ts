@@ -217,7 +217,7 @@ describe("createLogger", () => {
     shutdownLogger(logger);
 
     const output = messages.join("");
-    expect(output.match(/Asia\/Tehran/g)?.length).toBe(1);
+    expect(output.match(/Europe\/London/g)?.length).toBe(1);
     expect(output).toContain('"foo": "bar"');
   });
 
