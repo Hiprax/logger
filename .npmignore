@@ -1,0 +1,130 @@
+# Source code (not needed in npm package)
+src/
+__tests__/
+*.ts
+!*.d.ts
+
+# Development and build configuration
+tsconfig.json
+jest.config.js
+eslint.config.ts
+.prettierrc
+.eslintrc*
+.prettierrc*
+
+# Development dependencies and tools
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Build artifacts (keep dist/ as it's specified in package.json files)
+*.tsbuildinfo
+build/
+
+# Testing and coverage
+coverage/
+*.lcov
+.nyc_output/
+test-results/
+playwright-report/
+test-results.xml
+
+# Development scripts and examples
+example-*.js
+example-*.ts
+examples/
+demo/
+
+# Documentation (keep README.md and LICENSE as they're in package.json files)
+docs/
+*.md
+!README.md
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Environment and configuration files
+.env*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Logs and temporary files
+logs/
+*.log
+tmp/
+temp/
+
+# Cache directories
+.npm
+.eslintcache
+.cache
+.parcel-cache
+.fusebox/
+
+# Git and version control
+.git/
+.gitignore
+.gitattributes
+
+# CI/CD and deployment
+.github/
+.gitlab-ci.yml
+.travis.yml
+.circleci/
+azure-pipelines.yml
+
+# Package manager files
+.npmrc
+.yarnrc
+.yarnrc.yml
+
+# TypeScript declaration source maps (not needed in package)
+*.d.ts.map
+*.js.map
+
+# Development tools
+.editorconfig
+.husky/
+.lintstagedrc*
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.backup
+*~
+
+# Security and sensitive files
+.npmrc
+.yarnrc
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Performance and profiling
+*.cpuprofile
+*.heapsnapshot
+*.prof
+
+# Debug files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log* 
