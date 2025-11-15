@@ -60,12 +60,13 @@ const normalizeTimezones = (zones?: string | string[]): string[] => {
   return unique;
 };
 
-const formatMessage = (ctx: TimestampContext) =>
+interface FormatOptions {
+  includeTimestamps?: boolean;
+}
+
+const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
   winston.format.printf((info) => {
-    const utc = moment.utc().format(TIMESTAMP_FORMAT);
-    const additionalZones = ctx.timezones.map(
-      (zone) => `${zone}: ${moment().tz(zone).format(TIMESTAMP_FORMAT)}`,
-    );
+    const { includeTimestamps = true } = options;
     const level = (info.level ?? "info").toUpperCase();
     const label = ctx.label;
     const message =
@@ -74,12 +75,17 @@ const formatMessage = (ctx: TimestampContext) =>
     const { stack, level: _level, message: _msg, ...metadata } = info;
     const cleanedMeta = Object.keys(metadata).length > 0 ? metadata : undefined;
 
-    const lines = [
-      `UTC: ${utc}`,
-      ...additionalZones.map((entry) => entry),
-      `[${level}] (${label})`,
-      message,
-    ];
+    const lines: string[] = [];
+
+    if (includeTimestamps) {
+      const utc = moment.utc().format(TIMESTAMP_FORMAT);
+      const additionalZones = ctx.timezones.map(
+        (zone) => `${zone}: ${moment().tz(zone).format(TIMESTAMP_FORMAT)}`,
+      );
+      lines.push(`UTC: ${utc}`, ...additionalZones.map((entry) => entry));
+    }
+
+    lines.push(`[${level}] (${label})`, message);
 
     if (stack) {
       lines.push(typeof stack === "string" ? stack : JSON.stringify(stack, null, 2));
@@ -147,12 +153,13 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
   const timezones = normalizeTimezones(extraTimezones);
   const label = moduleName === "global" ? "GLOBAL" : moduleName;
   const ctx: TimestampContext = { label, timezones };
-  const baseFormat = formatMessage(ctx);
-  const sharedFormat = winston.format.combine(winston.format.errors({ stack: true }), baseFormat);
+  const fileFormat = formatMessage(ctx);
+  const sharedFormat = winston.format.combine(winston.format.errors({ stack: true }), fileFormat);
+  const consoleMessageFormat = formatMessage(ctx, { includeTimestamps: false });
   const consoleFormat = winston.format.combine(
     winston.format.errors({ stack: true }),
     winston.format.colorize({ message: true }),
-    baseFormat,
+    consoleMessageFormat,
   );
 
   const transports: winston.transport[] = [];
@@ -197,12 +204,88 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     transports.push(...additionalTransports);
   }
 
-  return winston.createLogger({
+  const baseLogger = winston.createLogger({
     level,
     format: sharedFormat,
     transports,
     exitOnError: false,
   });
+
+  const warnedMethods = new Set<string>();
+
+  const emitUnknownMethodWarning = (method: string) => {
+    if (warnedMethods.has(method)) {
+      return;
+    }
+    warnedMethods.add(method);
+    const warningMessage = `Unknown logger method "${method}" called. Falling back to info().`;
+    if (typeof baseLogger.warn === "function") {
+      baseLogger.warn(warningMessage);
+    } else {
+      console.warn(warningMessage);
+    }
+  };
+
+  const ensureLogArgs = (incoming: unknown[]): [any, ...any[]] => {
+    if (incoming.length === 0) {
+      return [""];
+    }
+    return incoming as [any, ...any[]];
+  };
+
+  const toMessageString = (value: unknown): string => {
+    if (typeof value === "string") {
+      return value;
+    }
+    try {
+      const serialized = JSON.stringify(value);
+      if (typeof serialized === "string") {
+        return serialized;
+      }
+    } catch {
+      // fall through to final string coercion
+    }
+    return String(value ?? "");
+  };
+
+  const invokeInfoFallback = (args: unknown[]) => {
+    const infoArgs = ensureLogArgs(args);
+    if (typeof baseLogger.info === "function") {
+      return (baseLogger.info as (...inner: any[]) => winston.Logger)(...infoArgs);
+    }
+    if (typeof baseLogger.log === "function") {
+      const [message, ...rest] = infoArgs;
+      const normalizedMessage = toMessageString(message);
+      if (rest.length > 0) {
+        return (baseLogger.log as winston.LeveledLogMethod)("info", normalizedMessage, ...rest);
+      }
+      return baseLogger.log({
+        level: "info",
+        message: normalizedMessage,
+      });
+    }
+    console.warn("Logger fallback invoked but no info/log method was available.");
+    return undefined;
+  };
+
+  return new Proxy(baseLogger, {
+    get(target, prop, receiver) {
+      if (typeof prop === "string" && !(prop in target)) {
+        return (...args: unknown[]) => {
+          emitUnknownMethodWarning(prop);
+          return invokeInfoFallback(args);
+        };
+      }
+
+      const value = Reflect.get(target, prop, receiver);
+
+      if (typeof value === "function") {
+        return value.bind(target);
+      }
+
+      return value;
+    },
+  }) as winston.Logger;
 };
 
 /** @internal */

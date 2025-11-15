@@ -1,10 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { Request, Response, NextFunction } from "express";
 import type winston from "winston";
-import {
-  createRequestLogger,
-  __requestInternals,
-} from "../src/request-middleware";
+import { createRequestLogger, __requestInternals } from "../src/request-middleware";
 import * as loggerModule from "../src/logger";
 
 const createMockLogger = () => {
@@ -57,7 +54,7 @@ class MockRequest {
 const runMiddleware = (
   middleware: ReturnType<typeof createRequestLogger>,
   requestOverrides: Partial<MockRequest> = {},
-  responseOverrides: Partial<MockResponse> = {}
+  responseOverrides: Partial<MockResponse> = {},
 ) => {
   const req = Object.assign(new MockRequest(), requestOverrides);
   const res = Object.assign(new MockResponse(), responseOverrides);
@@ -77,6 +74,7 @@ describe("createRequestLogger", () => {
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
       logger,
+      includeHttpContext: true,
       includeRequestBody: true,
       includeRequestHeaders: true,
       includeResponseHeaders: ["content-type"],
@@ -103,9 +101,7 @@ describe("createRequestLogger", () => {
       password: "[REDACTED]",
     });
     expect(payload.http.requestHeaders?.authorization).toBe("Bearer secret");
-    expect(payload.http.responseHeaders?.["content-type"]).toBe(
-      "application/json"
-    );
+    expect(payload.http.responseHeaders?.["content-type"]).toBe("application/json");
     expect(payload.http.context).toEqual({ correlationId: "abc" });
     expect(payload.http.requestId).toBe("req-1");
     expect(payload.http.contentLength).toBe(256);
@@ -129,6 +125,7 @@ describe("createRequestLogger", () => {
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
       logger,
+      includeHttpContext: true,
     });
 
     const { res } = runMiddleware(middleware);
@@ -142,7 +139,7 @@ describe("createRequestLogger", () => {
 
   it("uses warn level for client errors by default", () => {
     const { logger, log } = createMockLogger();
-    const middleware = createRequestLogger({ logger });
+    const middleware = createRequestLogger({ logger, includeHttpContext: true });
 
     const { res } = runMiddleware(middleware);
     res.statusCode = 404;
@@ -170,6 +167,7 @@ describe("createRequestLogger", () => {
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
       logger,
+      includeHttpContext: true,
       includeRequestBody: true,
       includeResponseHeaders: true,
       maxBodyLength: 10,
@@ -193,6 +191,7 @@ describe("createRequestLogger", () => {
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
       logger,
+      includeHttpContext: true,
       includeRequestHeaders: ["authorization"],
     });
 
@@ -207,12 +206,12 @@ describe("createRequestLogger", () => {
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
       logger,
+      includeHttpContext: true,
       includeResponseHeaders: true,
     });
 
     const { res } = runMiddleware(middleware);
-    (res as unknown as { getHeaders: () => undefined }).getHeaders = () =>
-      undefined;
+    (res as unknown as { getHeaders: () => undefined }).getHeaders = () => undefined;
     res.emit("finish");
 
     expect(log.mock.calls[0][0].http.responseHeaders).toEqual({});
@@ -222,6 +221,7 @@ describe("createRequestLogger", () => {
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
       logger,
+      includeHttpContext: true,
       includeRequestBody: true,
     });
 
@@ -251,6 +251,7 @@ describe("createRequestLogger", () => {
 
     const middleware = createRequestLogger({
       logger,
+      includeHttpContext: true,
       includeRequestBody: true,
       maxBodyLength: 100,
     });
@@ -267,6 +268,7 @@ describe("createRequestLogger", () => {
 
     const middleware = createRequestLogger({
       logger,
+      includeHttpContext: true,
       includeRequestBody: true,
     });
 
@@ -280,10 +282,21 @@ describe("createRequestLogger", () => {
     expect(payload.http.requestBody).toBe("42");
   });
 
+  it("omits http metadata unless includeHttpContext is true", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({ logger });
+
+    const { res } = runMiddleware(middleware);
+    res.emit("finish");
+
+    expect(log.mock.calls[0][0].http).toBeUndefined();
+  });
+
   it("derives identifiers from headers when req.get is unavailable", () => {
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
       logger,
+      includeHttpContext: true,
       includeRequestHeaders: ["user-agent"],
     });
 
@@ -302,21 +315,17 @@ describe("createRequestLogger", () => {
 
   it("creates a scoped logger when no logger is provided", () => {
     const mock = createMockLogger();
-    const spy = jest
-      .spyOn(loggerModule, "createLogger")
-      .mockReturnValue(mock.logger);
+    const spy = jest.spyOn(loggerModule, "createLogger").mockReturnValue(mock.logger);
 
     createRequestLogger({ label: "api" });
 
-    expect(spy).toHaveBeenCalledWith(
-      expect.objectContaining({ moduleName: "http/api" })
-    );
+    expect(spy).toHaveBeenCalledWith(expect.objectContaining({ moduleName: "http/api" }));
     spy.mockRestore();
   });
 
   it("falls back to defaults when request fields are missing", () => {
     const { logger, log } = createMockLogger();
-    const middleware = createRequestLogger({ logger });
+    const middleware = createRequestLogger({ logger, includeHttpContext: true });
 
     const { res } = runMiddleware(
       middleware,
@@ -327,7 +336,7 @@ describe("createRequestLogger", () => {
       },
       {
         statusCode: undefined as unknown as number,
-      }
+      },
     );
 
     res.emit("finish");
@@ -338,9 +347,137 @@ describe("createRequestLogger", () => {
     expect(payload.http.statusCode).toBe(0);
   });
 
+  it("skips logging entirely when loggingEnabled is false", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({ logger, loggingEnabled: false });
+
+    const { res } = runMiddleware(middleware);
+    res.emit("finish");
+
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it("respects dev-only logging mode", () => {
+    const { logger, log } = createMockLogger();
+    const originalEnv = process.env.NODE_ENV;
+
+    try {
+      process.env.NODE_ENV = "production";
+      let middleware = createRequestLogger({
+        logger,
+        loggingMode: "dev-only",
+        includeHttpContext: true,
+      });
+      const first = runMiddleware(middleware);
+      first.res.emit("finish");
+      expect(log).not.toHaveBeenCalled();
+
+      log.mockClear();
+      process.env.NODE_ENV = "development";
+      middleware = createRequestLogger({
+        logger,
+        loggingMode: "dev-only",
+        includeHttpContext: true,
+      });
+      const second = runMiddleware(middleware);
+      second.res.emit("finish");
+      expect(log).toHaveBeenCalledTimes(1);
+    } finally {
+      process.env.NODE_ENV = originalEnv;
+    }
+  });
+
+  it("respects prod-only logging mode", () => {
+    const { logger, log } = createMockLogger();
+    const originalEnv = process.env.NODE_ENV;
+
+    try {
+      process.env.NODE_ENV = "development";
+      let middleware = createRequestLogger({
+        logger,
+        loggingMode: "prod-only",
+        includeHttpContext: true,
+      });
+      const first = runMiddleware(middleware);
+      first.res.emit("finish");
+      expect(log).not.toHaveBeenCalled();
+
+      log.mockClear();
+      process.env.NODE_ENV = "PRODUCTION";
+      middleware = createRequestLogger({
+        logger,
+        loggingMode: "prod-only",
+        includeHttpContext: true,
+      });
+      const second = runMiddleware(middleware);
+      second.res.emit("finish");
+      expect(log).toHaveBeenCalledTimes(1);
+    } finally {
+      process.env.NODE_ENV = originalEnv;
+    }
+  });
+
+  it("respects test-only logging mode", () => {
+    const { logger, log } = createMockLogger();
+    const originalEnv = process.env.NODE_ENV;
+
+    try {
+      process.env.NODE_ENV = "production";
+      let middleware = createRequestLogger({
+        logger,
+        loggingMode: "test-only",
+        includeHttpContext: true,
+      });
+      runMiddleware(middleware).res.emit("finish");
+      expect(log).not.toHaveBeenCalled();
+
+      log.mockClear();
+      process.env.NODE_ENV = "Testing";
+      middleware = createRequestLogger({
+        logger,
+        loggingMode: "test-only",
+        includeHttpContext: true,
+      });
+      runMiddleware(middleware).res.emit("finish");
+      expect(log).toHaveBeenCalledTimes(1);
+    } finally {
+      process.env.NODE_ENV = originalEnv;
+    }
+  });
+
+  it("supports custom environment logging configuration", () => {
+    const { logger, log } = createMockLogger();
+    const originalEnv = process.env.CUSTOM_ENV;
+
+    try {
+      process.env.CUSTOM_ENV = "";
+      let middleware = createRequestLogger({
+        logger,
+        loggingMode: { sources: ["CUSTOM_ENV"], allow: ["enabled"], fallback: false },
+        includeHttpContext: true,
+      });
+      const first = runMiddleware(middleware);
+      first.res.emit("finish");
+      expect(log).not.toHaveBeenCalled();
+
+      log.mockClear();
+      process.env.CUSTOM_ENV = "enabled";
+      middleware = createRequestLogger({
+        logger,
+        loggingMode: { sources: ["CUSTOM_ENV"], allow: ["enabled"] },
+        includeHttpContext: true,
+      });
+      const second = runMiddleware(middleware);
+      second.res.emit("finish");
+      expect(log).toHaveBeenCalledTimes(1);
+    } finally {
+      process.env.CUSTOM_ENV = originalEnv;
+    }
+  });
+
   it("derives client ip from socket when req.ip is undefined", () => {
     const { logger, log } = createMockLogger();
-    const middleware = createRequestLogger({ logger });
+    const middleware = createRequestLogger({ logger, includeHttpContext: true });
 
     const { res } = runMiddleware(middleware, {
       ip: undefined as unknown as string,
@@ -354,7 +491,7 @@ describe("createRequestLogger", () => {
 
   it("omits ip when neither req.ip nor socket remote address exist", () => {
     const { logger, log } = createMockLogger();
-    const middleware = createRequestLogger({ logger });
+    const middleware = createRequestLogger({ logger, includeHttpContext: true });
 
     const { res } = runMiddleware(middleware, {
       ip: undefined as unknown as string,
@@ -368,7 +505,7 @@ describe("createRequestLogger", () => {
 });
 
 describe("request middleware internals", () => {
-  const { serializeBody, normalizeHeaders, toNumber } = __requestInternals;
+  const { serializeBody, normalizeHeaders, toNumber, shouldLogForEnvironment } = __requestInternals;
 
   it("serializes primitive bodies and truncates strings", () => {
     expect(serializeBody("hello", undefined, 100)).toBe("hello");
@@ -403,5 +540,87 @@ describe("request middleware internals", () => {
   it("converts numeric strings and rejects invalid values", () => {
     expect(toNumber("123")).toBe(123);
     expect(toNumber("abc")).toBeUndefined();
+  });
+
+  it("detects development environments for dev-only logging", () => {
+    const original = process.env.NODE_ENV;
+    try {
+      process.env.NODE_ENV = "development";
+      expect(shouldLogForEnvironment("dev-only")).toBe(true);
+      process.env.NODE_ENV = "production";
+      expect(shouldLogForEnvironment("dev-only")).toBe(false);
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  it("disables logging when mode is never", () => {
+    expect(shouldLogForEnvironment("never")).toBe(false);
+  });
+
+  it("respects custom allow lists and fallback behavior", () => {
+    const originalEnv = process.env.APP_ENV;
+    try {
+      delete process.env.APP_ENV;
+      expect(shouldLogForEnvironment({ sources: ["APP_ENV"], allow: ["qa"], fallback: true })).toBe(
+        true,
+      );
+
+      process.env.APP_ENV = "qa";
+      expect(
+        shouldLogForEnvironment({ sources: ["APP_ENV"], allow: ["qa"], fallback: false }),
+      ).toBe(true);
+
+      process.env.APP_ENV = "prod";
+      expect(
+        shouldLogForEnvironment({ sources: ["APP_ENV"], allow: ["qa"], fallback: false }),
+      ).toBe(false);
+    } finally {
+      if (originalEnv === undefined) {
+        delete process.env.APP_ENV;
+      } else {
+        process.env.APP_ENV = originalEnv;
+      }
+    }
+  });
+
+  it("reuses default sources and allow lists when custom inputs are empty", () => {
+    const originalEnv = process.env.NODE_ENV;
+    try {
+      process.env.NODE_ENV = "DEV";
+      expect(shouldLogForEnvironment({ sources: [], allow: [], fallback: false })).toBe(true);
+      process.env.NODE_ENV = "production";
+      expect(shouldLogForEnvironment({ sources: [], allow: [], fallback: false })).toBe(false);
+    } finally {
+      if (originalEnv === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = originalEnv;
+      }
+    }
+  });
+
+  it("enables logging for prod-only mode when NODE_ENV matches", () => {
+    const original = process.env.NODE_ENV;
+    try {
+      process.env.NODE_ENV = "production";
+      expect(shouldLogForEnvironment("prod-only")).toBe(true);
+      process.env.NODE_ENV = "dev";
+      expect(shouldLogForEnvironment("prod-only")).toBe(false);
+    } finally {
+      process.env.NODE_ENV = original;
+    }
+  });
+
+  it("enables logging for test-only mode when NODE_ENV matches", () => {
+    const original = process.env.NODE_ENV;
+    try {
+      process.env.NODE_ENV = "testing";
+      expect(shouldLogForEnvironment("test-only")).toBe(true);
+      process.env.NODE_ENV = "production";
+      expect(shouldLogForEnvironment("test-only")).toBe(false);
+    } finally {
+      process.env.NODE_ENV = original;
+    }
   });
 });

@@ -8,7 +8,7 @@ Fully typed, production-grade logging toolkit for Node.js applications. Built on
 
 ## Features
 
-- ✅ Multi-target logging (console, per-module files, shared files, custom transports)
+- ✅ Multi-target logging (console, per-module files, shared files, custom transports). Console output stays enabled but omits timestamps so only files capture the full timeline.
 - ✅ Daily rotation with independent retention rules
 - ✅ Guaranteed UTC timestamps plus optional verified IANA timezones
 - ✅ Automatic log directory creation (including nested module scopes)
@@ -53,7 +53,7 @@ const { createLogger } = require("@hiprax/logger");
 | `logDirectory`         | `string`              | `<process.cwd()>/logs`  | Target directory (auto-created).                                                                         |
 | `level`                | `LogLevel`            | `'info'`                | Default level for all transports.                                                                        |
 | `consoleLevel`         | `LogLevel`            | `level`                 | Console-specific level.                                                                                  |
-| `includeConsole`       | `boolean`             | `true`                  | Enables console logging.                                                                                 |
+| `includeConsole`       | `boolean`             | `true`                  | Enables console logging. Console lines omit timestamps; files keep the full multi-timezone output.       |
 | `includeFile`          | `boolean`             | `true`                  | Enables module-specific rotating file logging.                                                           |
 | `includeGlobalFile`    | `boolean`             | `true`                  | Enables shared rotating file logging.                                                                    |
 | `globalModuleName`     | `string`              | `'all-logs'`            | Label for the shared log file.                                                                           |
@@ -93,21 +93,36 @@ app.use(
 );
 ```
 
-The middleware attaches rich structured metadata via `info.http` while emitting a concise human-readable message. It relies on plain Node events (`finish`/`close`) and does **not** depend on `on-finished`, keeping the surface secure and modern.
+When `includeHttpContext` is enabled, the middleware attaches rich structured metadata via `info.http` while emitting a concise human-readable message. It relies on plain Node events (`finish`/`close`) and does **not** depend on `on-finished`, keeping the surface secure and modern.
 
-| Option                   | Type                                                | Default                               | Description                                                        |
-| ------------------------ | --------------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------ |
-| `logger`                 | `winston.Logger`                                    | Scoped `http` logger                  | Provide your own logger or reuse the scoped one.                   |
-| `level`                  | `LogLevel \| (status: number) => LogLevel`          | Auto (`info`/`warn`/`error`)          | Override severity per response.                                    |
-| `label`                  | `string`                                            | `'http'`                              | Included in the auto-generated logger name (`http/<label>`).       |
-| `messageBuilder`         | `(entry) => string`                                 | `"METHOD URL status latency (event)"` | Customize the final message string.                                |
-| `skip`                   | `(req, res) => boolean`                             | `false`                               | Allowlist/denylist support.                                        |
-| `enrich`                 | `(req, res, durationMs) => Record<string, unknown>` | `undefined`                           | Inject extra context (e.g., tenant, user).                         |
-| `includeRequestHeaders`  | `boolean \| string[]`                               | `false`                               | Toggle or limit header emission.                                   |
-| `includeResponseHeaders` | `boolean \| string[]`                               | `false`                               | Same as above for responses.                                       |
-| `includeRequestBody`     | `boolean`                                           | `false`                               | Logs parsed body (with redaction).                                 |
-| `maskBodyKeys`           | `string[]`                                          | `[]`                                  | Keys replaced with `[REDACTED]`. Applies deeply, including arrays. |
-| `maxBodyLength`          | `number`                                            | `3000`                                | Caps serialized body size to prevent log floods.                   |
+| Option                   | Type                                                | Default                               | Description                                                                              |
+| ------------------------ | --------------------------------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `logger`                 | `winston.Logger`                                    | Scoped `http` logger                  | Provide your own logger or reuse the scoped one.                                         |
+| `level`                  | `LogLevel \| (status: number) => LogLevel`          | Auto (`info`/`warn`/`error`)          | Override severity per response.                                                          |
+| `label`                  | `string`                                            | `'http'`                              | Included in the auto-generated logger name (`http/<label>`).                             |
+| `messageBuilder`         | `(entry) => string`                                 | `"METHOD URL status latency (event)"` | Customize the final message string.                                                      |
+| `skip`                   | `(req, res) => boolean`                             | `false`                               | Allowlist/denylist support.                                                              |
+| `enrich`                 | `(req, res, durationMs) => Record<string, unknown>` | `undefined`                           | Inject extra context (e.g., tenant, user).                                               |
+| `includeRequestHeaders`  | `boolean \| string[]`                               | `false`                               | Toggle or limit header emission.                                                         |
+| `includeResponseHeaders` | `boolean \| string[]`                               | `false`                               | Same as above for responses.                                                             |
+| `includeRequestBody`     | `boolean`                                           | `false`                               | Logs parsed body (with redaction).                                                       |
+| `maskBodyKeys`           | `string[]`                                          | `[]`                                  | Keys replaced with `[REDACTED]`. Applies deeply, including arrays.                       |
+| `maxBodyLength`          | `number`                                            | `3000`                                | Caps serialized body size to prevent log floods.                                         |
+| `includeHttpContext`     | `boolean`                                           | `false`                               | Adds the structured payload under `info.http`.                                           |
+| `loggingEnabled`         | `boolean`                                           | `true`                                | Hard enable/disable switch.                                                              |
+| `loggingMode`            | `RequestLoggingMode`                                | `'always'`                            | Env-aware control. Supports `'dev-only'`, `'prod-only'`, `'test-only'`, or custom rules. |
+
+### Environment-aware request logging
+
+- Use `loggingMode: 'dev-only'` to automatically log when `NODE_ENV`, `APP_ENV`, or `ENV` equals `dev`, `development`, or `local` (case-insensitive).
+- Use `loggingMode: 'prod-only'` to emit logs exclusively when the env matches `prod`, `production`, or `live`.
+- Use `loggingMode: 'test-only'` to limit logging to `test`, `testing`, `qa`, or `staging`.
+- Provide a custom configuration, e.g.:
+  ```ts
+  loggingMode: { sources: ["DEPLOYMENT_STAGE"], allow: ["staging", "qa"], fallback: false }
+  ```
+- Pair `loggingEnabled` with boolean expressions (`loggingEnabled: process.env.FEATURE_LOGS === "on"`) for one-line toggles.
+- Keep log output lightweight unless needed by turning `includeHttpContext` on only when you want the structured payload.
 
 ### Timezone Handling
 

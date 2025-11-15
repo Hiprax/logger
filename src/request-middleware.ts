@@ -1,14 +1,20 @@
 import type { Request, Response, NextFunction } from "express";
+import type winston from "winston";
 import type {
   ExpressMiddleware,
   RequestLogEntry,
   RequestLoggerOptions,
   RequestLogEvent,
+  RequestLoggingMode,
 } from "./types";
 import { createLogger } from "./logger";
 import type { LogLevel } from "./types";
 
 const DEFAULT_BODY_LIMIT = 3000;
+const DEFAULT_ENV_SOURCES = ["NODE_ENV", "APP_ENV", "ENV"];
+const DEFAULT_DEV_VALUES = ["dev", "development", "local"];
+const DEFAULT_PROD_VALUES = ["prod", "production", "live"];
+const DEFAULT_TEST_VALUES = ["test", "testing", "qa", "staging"];
 
 const determineLevel = (statusCode: number): LogLevel => {
   if (statusCode >= 500) {
@@ -20,11 +26,7 @@ const determineLevel = (statusCode: number): LogLevel => {
   return "info";
 };
 
-const redactValue = (
-  value: unknown,
-  maskKeys: Set<string>,
-  seen: WeakSet<object>
-): unknown => {
+const redactValue = (value: unknown, maskKeys: Set<string>, seen: WeakSet<object>): unknown => {
   if (!value || typeof value !== "object") {
     return value;
   }
@@ -38,21 +40,16 @@ const redactValue = (
     return value.map((item) => redactValue(item, maskKeys, seen));
   }
 
-  return Object.entries(value as Record<string, unknown>).reduce<
-    Record<string, unknown>
-  >((acc, [key, val]) => {
-    acc[key] = maskKeys.has(key.toLowerCase())
-      ? "[REDACTED]"
-      : redactValue(val, maskKeys, seen);
-    return acc;
-  }, {});
+  return Object.entries(value as Record<string, unknown>).reduce<Record<string, unknown>>(
+    (acc, [key, val]) => {
+      acc[key] = maskKeys.has(key.toLowerCase()) ? "[REDACTED]" : redactValue(val, maskKeys, seen);
+      return acc;
+    },
+    {},
+  );
 };
 
-const serializeBody = (
-  body: unknown,
-  maskKeys?: string[],
-  maxLength = DEFAULT_BODY_LIMIT
-) => {
+const serializeBody = (body: unknown, maskKeys?: string[], maxLength = DEFAULT_BODY_LIMIT) => {
   if (body === undefined || body === null) {
     return undefined;
   }
@@ -60,27 +57,24 @@ const serializeBody = (
   const masked = redactValue(
     body,
     new Set((maskKeys ?? []).map((key) => key.toLowerCase())),
-    new WeakSet()
+    new WeakSet(),
   );
 
   try {
-    const serialized =
-      typeof masked === "string" ? masked : JSON.stringify(masked);
+    const serialized = typeof masked === "string" ? masked : JSON.stringify(masked);
     if (serialized.length > maxLength) {
       return `${serialized.slice(0, maxLength)}…`;
     }
     return typeof masked === "string" ? masked : JSON.parse(serialized);
   } catch {
     const fallback = String(masked);
-    return fallback.length > maxLength
-      ? `${fallback.slice(0, maxLength)}…`
-      : fallback;
+    return fallback.length > maxLength ? `${fallback.slice(0, maxLength)}…` : fallback;
   }
 };
 
 const normalizeHeaders = (
   headers: Record<string, unknown> | undefined,
-  include?: boolean | string[]
+  include?: boolean | string[],
 ) => {
   if (!include) {
     return undefined;
@@ -98,13 +92,10 @@ const normalizeHeaders = (
     return allowEmpty ? {} : undefined;
   }
 
-  const normalized = Object.entries(headers).reduce<Record<string, unknown>>(
-    (acc, [key, val]) => {
-      acc[key.toLowerCase()] = val;
-      return acc;
-    },
-    {}
-  );
+  const normalized = Object.entries(headers).reduce<Record<string, unknown>>((acc, [key, val]) => {
+    acc[key.toLowerCase()] = val;
+    return acc;
+  }, {});
 
   if (include === true) {
     return ensureReturn(normalized);
@@ -133,18 +124,71 @@ const toNumber = (value: unknown): number | undefined => {
 
 const buildDefaultMessage = (entry: RequestLogEntry) => {
   const base = `${entry.method} ${entry.url}`;
-  return `${base} ${entry.statusCode} ${entry.responseTimeMs.toFixed(2)}ms (${
-    entry.event
-  })`;
+  return `${base} ${entry.statusCode} ${entry.responseTimeMs.toFixed(2)}ms (${entry.event})`;
+};
+
+const resolveEnvValue = (sources: string[]): string | undefined => {
+  for (const source of sources) {
+    const value = process.env[source];
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value;
+    }
+  }
+  return undefined;
+};
+
+const matchesEnvRules = (sources: string[], allow: string[], fallback: boolean): boolean => {
+  const current = resolveEnvValue(sources);
+  if (!current) {
+    return fallback;
+  }
+  const normalized = current.toLowerCase();
+  const allowed = allow.map((entry) => entry.toLowerCase());
+  return allowed.includes(normalized);
+};
+
+const shouldLogForEnvironment = (mode: RequestLoggingMode | undefined): boolean => {
+  const selected = mode ?? "always";
+  if (selected === "always") {
+    return true;
+  }
+  if (selected === "never") {
+    return false;
+  }
+  if (selected === "dev-only") {
+    return matchesEnvRules(DEFAULT_ENV_SOURCES, DEFAULT_DEV_VALUES, false);
+  }
+  if (selected === "prod-only") {
+    return matchesEnvRules(DEFAULT_ENV_SOURCES, DEFAULT_PROD_VALUES, false);
+  }
+  if (selected === "test-only") {
+    return matchesEnvRules(DEFAULT_ENV_SOURCES, DEFAULT_TEST_VALUES, false);
+  }
+
+  const sources =
+    Array.isArray(selected.sources) && selected.sources.length > 0
+      ? selected.sources
+      : DEFAULT_ENV_SOURCES;
+  const allow =
+    Array.isArray(selected.allow) && selected.allow.length > 0
+      ? selected.allow
+      : DEFAULT_DEV_VALUES;
+  const fallback = selected.fallback ?? false;
+  return matchesEnvRules(sources, allow, fallback);
 };
 
 /**
  * Creates an Express compatible middleware that logs HTTP requests and responses
  * using the configured Winston logger.
  */
-export const createRequestLogger = (
-  options: RequestLoggerOptions = {}
-): ExpressMiddleware => {
+export const createRequestLogger = (options: RequestLoggerOptions = {}): ExpressMiddleware => {
+  const { loggingEnabled = true, loggingMode } = options;
+  const envAllowsLogging = shouldLogForEnvironment(loggingMode);
+
+  if (!loggingEnabled || !envAllowsLogging) {
+    return (_req: Request, _res: Response, next: NextFunction) => next();
+  }
+
   const {
     logger = createLogger({
       /* c8 ignore next */
@@ -159,6 +203,7 @@ export const createRequestLogger = (
     includeRequestBody,
     maxBodyLength = DEFAULT_BODY_LIMIT,
     maskBodyKeys,
+    includeHttpContext = false,
   } = options;
 
   return (req: Request, res: Response, next: NextFunction) => {
@@ -186,9 +231,7 @@ export const createRequestLogger = (
 
       const statusCode = res.statusCode ?? 0;
       const resolvedLevel =
-        typeof level === "function"
-          ? level(statusCode)
-          : level ?? determineLevel(statusCode);
+        typeof level === "function" ? level(statusCode) : (level ?? determineLevel(statusCode));
 
       const entry: RequestLogEntry = {
         event,
@@ -196,41 +239,29 @@ export const createRequestLogger = (
         url: req.originalUrl ?? req.url ?? "",
         statusCode,
         responseTimeMs: Number(durationMs.toFixed(2)),
-        contentLength:
-          toNumber(res.getHeader("content-length")) ?? initialContentLength,
+        contentLength: toNumber(res.getHeader("content-length")) ?? initialContentLength,
         ip: req.ip ?? req.socket?.remoteAddress ?? undefined,
         userAgent:
           /* c8 ignore next */
           typeof req.get === "function"
-            ? req.get("user-agent") ?? undefined
-            : (
-                req.headers["user-agent"] as string | string[] | undefined
-              )?.toString(),
+            ? (req.get("user-agent") ?? undefined)
+            : (req.headers["user-agent"] as string | string[] | undefined)?.toString(),
         requestId:
           /* c8 ignore next */
           typeof req.get === "function"
-            ? req.get("x-request-id") ?? undefined
-            : (
-                req.headers["x-request-id"] as string | string[] | undefined
-              )?.toString(),
+            ? (req.get("x-request-id") ?? undefined)
+            : (req.headers["x-request-id"] as string | string[] | undefined)?.toString(),
       };
 
       if (includeRequestBody) {
-        entry.requestBody = serializeBody(
-          req.body,
-          maskBodyKeys,
-          maxBodyLength
-        );
+        entry.requestBody = serializeBody(req.body, maskBodyKeys, maxBodyLength);
       }
 
       entry.requestHeaders = normalizeHeaders(
         req.headers as Record<string, unknown>,
-        includeRequestHeaders
+        includeRequestHeaders,
       );
-      entry.responseHeaders = normalizeHeaders(
-        res.getHeaders(),
-        includeResponseHeaders
-      );
+      entry.responseHeaders = normalizeHeaders(res.getHeaders(), includeResponseHeaders);
 
       if (enrich) {
         /* c8 ignore next */
@@ -239,11 +270,16 @@ export const createRequestLogger = (
 
       const message = messageBuilder(entry);
 
-      logger.log({
+      const logEntry: winston.LogEntry & { http?: RequestLogEntry } = {
         level: resolvedLevel,
         message,
-        http: entry,
-      });
+      };
+
+      if (includeHttpContext) {
+        logEntry.http = entry;
+      }
+
+      logger.log(logEntry);
     };
 
     const finishHandler = () => finalize("completed");
@@ -264,4 +300,5 @@ export const __requestInternals = {
   normalizeHeaders,
   toNumber,
   buildDefaultMessage,
+  shouldLogForEnvironment,
 };

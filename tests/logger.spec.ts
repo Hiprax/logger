@@ -8,6 +8,19 @@ import { createLogger, __loggerInternals } from "../src/logger";
 import { InvalidTimezoneError } from "../src/errors";
 
 const createTempDir = () => fs.mkdtempSync(path.join(os.tmpdir(), "adv-logger-"));
+const createNoopTransportLogger = () => {
+  const stream = new PassThrough();
+  return createLogger({
+    includeConsole: false,
+    includeFile: false,
+    includeGlobalFile: false,
+    additionalTransports: [
+      new winston.transports.Stream({
+        stream,
+      }),
+    ],
+  });
+};
 
 const shutdownLogger = (logger: winston.Logger) => {
   logger.close();
@@ -239,6 +252,185 @@ describe("createLogger", () => {
     shutdownLogger(logger);
   });
 
+  it("falls back to info when unknown methods are invoked", () => {
+    const messages: string[] = [];
+    const stream = new PassThrough();
+    stream.on("data", (chunk) => messages.push(chunk.toString()));
+
+    const logger = createLogger({
+      includeConsole: false,
+      includeFile: false,
+      includeGlobalFile: false,
+      additionalTransports: [
+        new winston.transports.Stream({
+          stream,
+        }),
+      ],
+    });
+
+    expect(() => (logger as any).success("custom level")).not.toThrow();
+    shutdownLogger(logger);
+
+    const output = messages.join("");
+    expect(output).toContain('Unknown logger method "success"');
+    expect(output).toContain("custom level");
+    expect(output).toContain("[INFO]");
+  });
+
+  it("warns via console when the logger has no warn method", () => {
+    const logger = createNoopTransportLogger();
+
+    const consoleSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    (logger as any).warn = undefined;
+
+    expect(() => (logger as any).mystery()).not.toThrow();
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('"mystery"'));
+    consoleSpy.mockRestore();
+    shutdownLogger(logger);
+  });
+
+  it("routes fallback logging through base log when info is missing", () => {
+    const logger = createNoopTransportLogger();
+
+    const logSpy = jest.fn();
+    (logger as any).info = undefined;
+    (logger as any).log = logSpy;
+
+    (logger as any).ghost({ foo: "bar" });
+
+    expect(logSpy).toHaveBeenCalledWith({
+      level: "info",
+      message: '{"foo":"bar"}',
+    });
+    shutdownLogger(logger);
+  });
+
+  it("preserves metadata when fallback logging receives extra arguments", () => {
+    const logger = createNoopTransportLogger();
+
+    const logSpy = jest.fn();
+    (logger as any).info = undefined;
+    (logger as any).log = logSpy;
+
+    const meta = { requestId: "abc" };
+    (logger as any).phantom("hello", meta);
+
+    expect(logSpy).toHaveBeenCalledWith("info", "hello", meta);
+    shutdownLogger(logger);
+  });
+
+  it("injects an empty message when fallback is invoked without arguments", () => {
+    const logger = createNoopTransportLogger();
+
+    const infoSpy = jest.fn();
+    (logger as any).info = infoSpy;
+
+    (logger as any).void();
+
+    expect(infoSpy).toHaveBeenCalledWith("");
+    shutdownLogger(logger);
+  });
+
+  it("warns only once per unknown method", () => {
+    const logger = createNoopTransportLogger();
+    const warnSpy = jest.fn();
+    (logger as any).warn = warnSpy;
+
+    (logger as any).mystery();
+    (logger as any).mystery();
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    shutdownLogger(logger);
+  });
+
+  it("stringifies BigInt payloads when info is missing and log receives an object", () => {
+    const logger = createNoopTransportLogger();
+    (logger as any).info = undefined;
+    const logSpy = jest.fn();
+    (logger as any).log = logSpy;
+
+    (logger as any).nebula(42n);
+
+    expect(logSpy).toHaveBeenCalledWith({
+      level: "info",
+      message: "42",
+    });
+    shutdownLogger(logger);
+  });
+
+  it("logs a console warning when neither info nor log exists", () => {
+    const logger = createNoopTransportLogger();
+    const consoleSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    (logger as any).info = undefined;
+    (logger as any).log = undefined;
+
+    (logger as any).phantom();
+
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining("no info/log method was available"),
+    );
+    consoleSpy.mockRestore();
+    shutdownLogger(logger);
+  });
+
+  it("falls back to String(value) when JSON serialization fails", () => {
+    const logger = createNoopTransportLogger();
+    const logSpy = jest.fn();
+    (logger as any).info = undefined;
+    (logger as any).log = logSpy;
+
+    const problematic = {
+      toJSON() {
+        throw new Error("nope");
+      },
+      toString() {
+        return "stringified-problem";
+      },
+    };
+
+    (logger as any).obscure(problematic);
+
+    expect(logSpy).toHaveBeenCalledWith({
+      level: "info",
+      message: "stringified-problem",
+    });
+    shutdownLogger(logger);
+  });
+
+  it("handles circular objects by using String fallback", () => {
+    const logger = createNoopTransportLogger();
+    (logger as any).info = undefined;
+    const logSpy = jest.fn();
+    (logger as any).log = logSpy;
+
+    const circular: any = {};
+    circular.self = circular;
+
+    (logger as any).cyclone(circular);
+
+    expect(logSpy).toHaveBeenCalledWith({
+      level: "info",
+      message: "[object Object]",
+    });
+    shutdownLogger(logger);
+  });
+
+  it("coerces undefined payloads to empty strings when info fallback uses log()", () => {
+    const logger = createNoopTransportLogger();
+    (logger as any).info = undefined;
+    const logSpy = jest.fn();
+    (logger as any).log = logSpy;
+
+    (logger as any).wisp(undefined);
+
+    expect(logSpy).toHaveBeenCalledWith({
+      level: "info",
+      message: "",
+    });
+    shutdownLogger(logger);
+  });
+
   describe("internals", () => {
     it("generates log paths for empty module names", () => {
       const result = __loggerInternals.buildLogFilePath("/tmp", "");
@@ -273,6 +465,23 @@ describe("createLogger", () => {
         Symbol.for("message"),
       ) as string;
       expect(output.replace(/\s+/g, "")).toContain('"foo":"bar"');
+    });
+
+    it("omits timestamps when requested", () => {
+      const formatter = __loggerInternals.formatMessage(
+        {
+          label: "test",
+          timezones: [],
+        },
+        { includeTimestamps: false },
+      );
+      const info = formatter.transform({ level: "info", message: "ping" } as any);
+      const output = Reflect.get(
+        info as Record<PropertyKey, unknown>,
+        Symbol.for("message"),
+      ) as string;
+      expect(output).not.toContain("UTC:");
+      expect(output).toContain("[INFO] (test)");
     });
   });
 });

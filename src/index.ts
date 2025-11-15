@@ -7,6 +7,8 @@ export type {
   RequestLogEntry,
   RequestLogEvent,
   RotationStrategy,
-  LogLevel
+  LogLevel,
+  RequestLoggingMode,
+  RequestLoggingEnvironmentConfig
 } from './types';
 

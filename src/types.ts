@@ -1,14 +1,7 @@
-import type winston from 'winston';
-import type { Request, Response, NextFunction, RequestHandler } from 'express';
+import type winston from "winston";
+import type { Request, Response, NextFunction, RequestHandler } from "express";
 
-export type LogLevel =
-  | 'error'
-  | 'warn'
-  | 'info'
-  | 'http'
-  | 'verbose'
-  | 'debug'
-  | 'silly';
+export type LogLevel = "error" | "warn" | "info" | "http" | "verbose" | "debug" | "silly";
 
 export interface RotationStrategy {
   /**
@@ -84,7 +77,7 @@ export interface TimestampContext {
   timezones: string[];
 }
 
-export type RequestLogEvent = 'completed' | 'aborted';
+export type RequestLogEvent = "completed" | "aborted";
 
 export interface RequestLogEntry {
   event: RequestLogEvent;
@@ -147,7 +140,50 @@ export interface RequestLoggerOptions {
    * Keys within the request body that should be replaced with `[REDACTED]`.
    */
   maskBodyKeys?: string[];
+  /**
+   * Hard override that can enable/disable request logging (Option 2).
+   */
+  loggingEnabled?: boolean;
+  /**
+   * Environment-aware control that decides when logging should run (Option 1).
+   * - `"always"` logs in every environment.
+   * - `"never"` disables logging.
+   * - `"dev-only"` automatically matches common dev env values (`dev`, `development`, `local`, case-insensitive).
+   * - `"prod-only"` auto-matches typical production env values (`prod`, `production`, `live`).
+   * - `"test-only"` auto-matches common test env values (`test`, `testing`, `qa`, `staging`).
+   * - Provide a config object for custom environment variable/value matching.
+   */
+  loggingMode?: RequestLoggingMode;
+  /**
+   * When true, attaches the structured HTTP payload under the `info.http` key.
+   */
+  includeHttpContext?: boolean;
 }
 
 export type ExpressMiddleware = RequestHandler;
 
+export type RequestLoggingMode =
+  | "always"
+  | "never"
+  | "dev-only"
+  | "prod-only"
+  | "test-only"
+  | RequestLoggingEnvironmentConfig;
+
+export interface RequestLoggingEnvironmentConfig {
+  /**
+   * Environment variables to inspect, in priority order.
+   * Defaults to `["NODE_ENV", "APP_ENV", "ENV"]`.
+   */
+  sources?: string[];
+  /**
+   * Case-insensitive values that enable logging when matched.
+   * Defaults to the same values as `"dev-only"`.
+   */
+  allow?: string[];
+  /**
+   * When `true`, logging remains enabled if no environment sources are found.
+   * Defaults to `false`.
+   */
+  fallback?: boolean;
+}
