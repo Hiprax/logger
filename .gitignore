@@ -41,6 +41,11 @@ Thumbs.db
 logs/
 *.log
 
+# AI
+.claude/
+claude/
+CLAUDE.md
+
 # Runtime data
 pids/
 *.pid

@@ -3,6 +3,7 @@ import type { Request, Response, NextFunction } from "express";
 import type winston from "winston";
 import { createRequestLogger, __requestInternals } from "../src/request-middleware";
 import * as loggerModule from "../src/logger";
+import { resetLoggerRegistry } from "../src/logger";
 
 const createMockLogger = () => {
   const log = jest.fn();
@@ -67,6 +68,7 @@ const runMiddleware = (
 
 describe("createRequestLogger", () => {
   afterEach(() => {
+    resetLoggerRegistry();
     jest.restoreAllMocks();
   });
 
@@ -173,7 +175,7 @@ describe("createRequestLogger", () => {
       maxBodyLength: 10,
     });
 
-    const { req, res } = runMiddleware(middleware, {
+    const { res } = runMiddleware(middleware, {
       body: { long: "abcdefghijklmnopqrstuvwxyz" },
       headers: { "content-length": "77" },
     });

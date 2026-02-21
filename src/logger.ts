@@ -9,6 +9,11 @@ import type { LoggerOptions, TimestampContext, LogLevel, RotationStrategy } from
 const TIMESTAMP_FORMAT = "YYYY-MM-DD HH:mm:ss";
 const DEFAULT_LOG_DIR = path.resolve(process.cwd(), "logs");
 
+const loggerRegistry = new Map<string, winston.Logger>();
+
+const buildRegistryKey = (moduleName: string, logDirectory: string): string =>
+  `${logDirectory}::${moduleName}`;
+
 const defaultRotation = Object.freeze({
   maxSize: "20m",
   maxFiles: "14d",
@@ -17,9 +22,7 @@ const defaultRotation = Object.freeze({
 });
 
 const ensureDirectory = (dir: string) => {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  fs.mkdirSync(dir, { recursive: true });
 };
 
 const sanitizeSegment = (value: string) => {
@@ -148,6 +151,12 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     additionalTransports = [],
   } = options;
 
+  const registryKey = buildRegistryKey(moduleName, logDirectory);
+  const cached = loggerRegistry.get(registryKey);
+  if (cached) {
+    return cached;
+  }
+
   ensureDirectory(logDirectory);
 
   const timezones = normalizeTimezones(extraTimezones);
@@ -268,7 +277,7 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     return undefined;
   };
 
-  return new Proxy(baseLogger, {
+  const proxied = new Proxy(baseLogger, {
     get(target, prop, receiver) {
       if (typeof prop === "string" && !(prop in target)) {
         return (...args: unknown[]) => {
@@ -286,6 +295,17 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
       return value;
     },
   }) as winston.Logger;
+
+  loggerRegistry.set(registryKey, proxied);
+  return proxied;
+};
+
+/**
+ * Clears the internal logger registry, allowing fresh instances to be created.
+ * Useful for testing or hot-reload scenarios.
+ */
+export const resetLoggerRegistry = (): void => {
+  loggerRegistry.clear();
 };
 
 /** @internal */

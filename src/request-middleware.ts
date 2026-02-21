@@ -60,12 +60,16 @@ const serializeBody = (body: unknown, maskKeys?: string[], maxLength = DEFAULT_B
     new WeakSet(),
   );
 
+  if (typeof masked === "string") {
+    return masked.length > maxLength ? `${masked.slice(0, maxLength)}…` : masked;
+  }
+
   try {
-    const serialized = typeof masked === "string" ? masked : JSON.stringify(masked);
+    const serialized = JSON.stringify(masked);
     if (serialized.length > maxLength) {
       return `${serialized.slice(0, maxLength)}…`;
     }
-    return typeof masked === "string" ? masked : JSON.parse(serialized);
+    return masked;
   } catch {
     const fallback = String(masked);
     return fallback.length > maxLength ? `${fallback.slice(0, maxLength)}…` : fallback;

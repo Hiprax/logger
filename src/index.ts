@@ -1,4 +1,4 @@
-export { createLogger } from './logger';
+export { createLogger, resetLoggerRegistry } from './logger';
 export { createRequestLogger } from './request-middleware';
 export { InvalidTimezoneError } from './errors';
 export type {
@@ -9,6 +9,7 @@ export type {
   RotationStrategy,
   LogLevel,
   RequestLoggingMode,
-  RequestLoggingEnvironmentConfig
+  RequestLoggingEnvironmentConfig,
+  ExpressMiddleware,
 } from './types';
 

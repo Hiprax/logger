@@ -1,6 +1,6 @@
 # Source code (not needed in npm package)
 src/
-__tests__/
+tests/
 *.ts
 !*.d.ts
 
@@ -9,6 +9,7 @@ tsconfig.json
 jest.config.js
 eslint.config.ts
 .prettierrc
+eslint.config.*
 .eslintrc*
 .prettierrc*
 
@@ -69,6 +70,11 @@ logs/
 *.log
 tmp/
 temp/
+
+# AI
+.claude/
+claude/
+CLAUDE.md
 
 # Cache directories
 .npm

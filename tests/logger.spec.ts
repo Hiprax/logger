@@ -4,7 +4,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import winston from "winston";
 import DailyRotateFile from "winston-daily-rotate-file";
-import { createLogger, __loggerInternals } from "../src/logger";
+import { createLogger, resetLoggerRegistry, __loggerInternals } from "../src/logger";
 import { InvalidTimezoneError } from "../src/errors";
 
 const createTempDir = () => fs.mkdtempSync(path.join(os.tmpdir(), "adv-logger-"));
@@ -33,6 +33,7 @@ const shutdownLogger = (logger: winston.Logger) => {
 
 describe("createLogger", () => {
   afterEach(() => {
+    resetLoggerRegistry();
     jest.restoreAllMocks();
   });
 
@@ -429,6 +430,84 @@ describe("createLogger", () => {
       message: "",
     });
     shutdownLogger(logger);
+  });
+
+  describe("registry", () => {
+    it("returns the same instance for identical moduleName and logDirectory", () => {
+      const root = createTempDir();
+      const first = createLogger({
+        moduleName: "auth",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+      });
+
+      const second = createLogger({
+        moduleName: "auth",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+      });
+
+      expect(first).toBe(second);
+      shutdownLogger(first);
+    });
+
+    it("returns different instances for different module names", () => {
+      const root = createTempDir();
+      const opts = {
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+      };
+
+      const first = createLogger({ ...opts, moduleName: "auth" });
+      const second = createLogger({ ...opts, moduleName: "payments" });
+
+      expect(first).not.toBe(second);
+      shutdownLogger(first);
+      shutdownLogger(second);
+    });
+
+    it("returns different instances for different log directories", () => {
+      const root1 = createTempDir();
+      const root2 = createTempDir();
+      const opts = {
+        moduleName: "auth",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+      };
+
+      const first = createLogger({ ...opts, logDirectory: root1 });
+      const second = createLogger({ ...opts, logDirectory: root2 });
+
+      expect(first).not.toBe(second);
+      shutdownLogger(first);
+      shutdownLogger(second);
+    });
+
+    it("creates fresh instances after resetLoggerRegistry", () => {
+      const root = createTempDir();
+      const opts = {
+        moduleName: "auth",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+      };
+
+      const first = createLogger(opts);
+      resetLoggerRegistry();
+      const second = createLogger(opts);
+
+      expect(first).not.toBe(second);
+      shutdownLogger(first);
+      shutdownLogger(second);
+    });
   });
 
   describe("internals", () => {

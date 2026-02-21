@@ -1,5 +1,5 @@
 import type winston from "winston";
-import type { Request, Response, NextFunction, RequestHandler } from "express";
+import type { Request, Response, RequestHandler } from "express";
 
 export type LogLevel = "error" | "warn" | "info" | "http" | "verbose" | "debug" | "silly";
 
