@@ -1,6 +1,7 @@
 import eslint from "@eslint/js";
 import tseslint from "typescript-eslint";
 import prettier from "eslint-config-prettier";
+import prettierPlugin from "eslint-plugin-prettier";
 
 export default tseslint.config(
   {
@@ -11,6 +12,9 @@ export default tseslint.config(
   ...tseslint.configs.stylistic,
   prettier,
   {
+    plugins: {
+      prettier: prettierPlugin,
+    },
     languageOptions: {
       ecmaVersion: 2021,
       sourceType: "module",
@@ -30,6 +34,7 @@ export default tseslint.config(
         },
       ],
       "no-control-regex": "off",
+      "prettier/prettier": "error",
     },
   },
 );

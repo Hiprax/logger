@@ -1,6 +1,15 @@
-export { createLogger, resetLoggerRegistry } from './logger';
-export { createRequestLogger } from './request-middleware';
-export { InvalidTimezoneError } from './errors';
+export {
+  createLogger,
+  createNoopLogger,
+  resetLoggerRegistry,
+  shutdownLogger,
+  shutdownAllLoggers,
+  defaultRotation,
+  getDefaultRotation,
+} from "./logger";
+export { createRequestLogger, REQUEST_START_SYMBOL } from "./request-middleware";
+export { InvalidTimezoneError, LoggerOptionError, RequestLoggerOptionError } from "./errors";
+export type { LoggerOptionErrorCode, RequestLoggerOptionErrorCode } from "./errors";
 export type {
   LoggerOptions,
   RequestLoggerOptions,
@@ -11,5 +20,8 @@ export type {
   RequestLoggingMode,
   RequestLoggingEnvironmentConfig,
   ExpressMiddleware,
-} from './types';
-
+  LoggableRequest,
+  LoggableResponse,
+  LoggableMiddleware,
+  LoggableNext,
+} from "./types";

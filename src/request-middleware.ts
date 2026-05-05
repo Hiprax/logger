@@ -1,20 +1,148 @@
-import type { Request, Response, NextFunction } from "express";
 import type winston from "winston";
 import type {
-  ExpressMiddleware,
+  LoggableMiddleware,
+  LoggableNext,
+  LoggableRequest,
+  LoggableResponse,
   RequestLogEntry,
   RequestLoggerOptions,
   RequestLogEvent,
   RequestLoggingMode,
 } from "./types";
 import { createLogger } from "./logger";
+import { redactValue, REDACTED } from "./redact";
+import { RequestLoggerOptionError } from "./errors";
 import type { LogLevel } from "./types";
+
+/**
+ * Frozen tuple of every npm log level supported by Winston, in priority order.
+ * Mirrored locally from `src/logger.ts` so this module can validate the
+ * middleware's `level` option without importing the logger module's internals.
+ */
+const VALID_LOG_LEVELS = Object.freeze([
+  "error",
+  "warn",
+  "info",
+  "http",
+  "verbose",
+  "debug",
+  "silly",
+] as const);
+
+const isValidLogLevel = (value: unknown): value is LogLevel =>
+  typeof value === "string" && (VALID_LOG_LEVELS as readonly string[]).includes(value);
+
+/**
+ * Validates the static-string form of `RequestLoggerOptions.level`. The
+ * function-form (`(statusCode) => LogLevel`) is NOT validated here — the
+ * function's return value is checked at request time by the middleware itself.
+ */
+const validateRequestLevelOption = (value: unknown): void => {
+  if (value === undefined || typeof value === "function") {
+    return;
+  }
+  if (!isValidLogLevel(value)) {
+    throw new RequestLoggerOptionError(
+      "INVALID_LEVEL",
+      `Invalid \`level\` option: ${JSON.stringify(value)}. Expected one of: ${VALID_LOG_LEVELS.join(", ")} or a (statusCode) => LogLevel function.`,
+    );
+  }
+};
+
+/**
+ * Validates that a mask-keys option is either an array of strings, the literal
+ * `false` (when permitted by the option), or `undefined`. Throws
+ * `RequestLoggerOptionError({ code: "INVALID_MASK" })` otherwise.
+ *
+ * @param label  Option name used in the error message (e.g. `"maskBodyKeys"`).
+ * @param value  The caller-supplied option value.
+ * @param allowFalse  When true, the literal `false` is accepted (used by
+ *   `maskHeaderKeys` / `maskQueryKeys` to opt out of safe-defaults masking).
+ */
+const validateMaskKeysOption = (label: string, value: unknown, allowFalse: boolean): void => {
+  if (value === undefined) {
+    return;
+  }
+  if (allowFalse && value === false) {
+    return;
+  }
+  if (!Array.isArray(value)) {
+    throw new RequestLoggerOptionError(
+      "INVALID_MASK",
+      `Invalid \`${label}\` option: expected an array of strings${
+        allowFalse ? " (or `false` to opt out)" : ""
+      }, got ${typeof value}.`,
+    );
+  }
+  const badIndex = value.findIndex((entry) => typeof entry !== "string");
+  if (badIndex !== -1) {
+    throw new RequestLoggerOptionError(
+      "INVALID_MASK",
+      `Invalid \`${label}\` option: every entry must be a string. Entry at index ${badIndex} is ${typeof value[badIndex]}.`,
+    );
+  }
+};
 
 const DEFAULT_BODY_LIMIT = 3000;
 const DEFAULT_ENV_SOURCES = ["NODE_ENV", "APP_ENV", "ENV"];
 const DEFAULT_DEV_VALUES = ["dev", "development", "local"];
 const DEFAULT_PROD_VALUES = ["prod", "production", "live"];
 const DEFAULT_TEST_VALUES = ["test", "testing", "qa", "staging"];
+
+/**
+ * Well-known symbol used to override the per-request start timestamp captured
+ * by the middleware. Set `req[REQUEST_START_SYMBOL] = process.hrtime.bigint()`
+ * from an upstream instrumentation hook (e.g., the very first piece of
+ * middleware on the stack) to make `responseTimeMs` reflect the true
+ * end-to-end latency rather than only the time spent inside this middleware
+ * and its downstream handlers.
+ *
+ * The value MUST be a `bigint` produced by `process.hrtime.bigint()` — any
+ * other type is silently ignored and the middleware falls back to capturing
+ * its own start timestamp at entry time. This guards against accidental
+ * misuse (e.g. assigning `Date.now()`) without crashing the request.
+ *
+ * Uses `Symbol.for("hiprax.request.start")` so multiple copies of this
+ * package loaded into the same process (npm-link, mono-repos, dual ESM/CJS
+ * resolution) all observe the same symbol.
+ */
+export const REQUEST_START_SYMBOL: unique symbol = Symbol.for("hiprax.request.start");
+
+/**
+ * Safe-defaults list of header names whose values are redacted when logging.
+ * Opt-out (not opt-in) since these are the most common vectors for leaking
+ * secrets via HTTP logs (bearer tokens, session cookies, API keys).
+ */
+const DEFAULT_MASKED_HEADER_KEYS: readonly string[] = [
+  "authorization",
+  "cookie",
+  "set-cookie",
+  "x-api-key",
+  "proxy-authorization",
+];
+
+/**
+ * Safe-defaults list of query-string parameter names whose values are redacted
+ * when logging the request URL. Covers the most common token/key/secret param
+ * names used by OAuth callbacks, ad-hoc bearer tokens, and login forms.
+ */
+const DEFAULT_MASKED_QUERY_KEYS: readonly string[] = [
+  "token",
+  "access_token",
+  "api_key",
+  "apikey",
+  "key",
+  "code",
+  "secret",
+  "password",
+];
+
+/**
+ * Sentinel base used to parse relative URLs (e.g. `"/auth/login?token=abc"`)
+ * with `URL`. The base is stripped after re-stringification so the logged URL
+ * keeps its original relative form.
+ */
+const URL_PARSE_SENTINEL_BASE = "http://hiprax-logger.invalid";
 
 const determineLevel = (statusCode: number): LogLevel => {
   if (statusCode >= 500) {
@@ -26,28 +154,61 @@ const determineLevel = (statusCode: number): LogLevel => {
   return "info";
 };
 
-const redactValue = (value: unknown, maskKeys: Set<string>, seen: WeakSet<object>): unknown => {
-  if (!value || typeof value !== "object") {
+/**
+ * Truncates a string to fit within `maxLength` total characters, INCLUDING the
+ * trailing ellipsis. Returns the input unchanged when it already fits. Uses
+ * `Array.from(value).slice(0, maxLength - 1).join("") + "…"` so the result
+ * length is exactly `maxLength` Unicode code points for any string longer than
+ * the limit. When `maxLength <= 0` (a degenerate caller-supplied limit),
+ * returns an empty string. When `maxLength === 1`, returns the single
+ * ellipsis character.
+ *
+ * **Unicode contract.** This helper counts UTF-16 *code points* (handles
+ * astral-plane / emoji surrogate pairs like `"😀"` correctly so a truncation
+ * point that lands inside a surrogate pair never produces a lone half-pair).
+ * It does NOT count *grapheme clusters*: a base character followed by one or
+ * more combining marks (`"á" === "á"`, family ZWJ sequences, regional
+ * indicator pairs) is treated as multiple code points, so a truncation
+ * boundary may fall between a base character and its combining mark and
+ * render as a separated form. Use `Intl.Segmenter` (Node 18+) for fully
+ * grapheme-correct slicing if that matters for your data set.
+ */
+const truncateString = (value: string, maxLength: number): string => {
+  if (value.length <= maxLength) {
     return value;
   }
-
-  if (seen.has(value as object)) {
-    return "[Circular]";
+  if (maxLength <= 0) {
+    return "";
   }
-  seen.add(value as object);
-
-  if (Array.isArray(value)) {
-    return value.map((item) => redactValue(item, maskKeys, seen));
+  if (maxLength === 1) {
+    return "…";
   }
-
-  return Object.entries(value as Record<string, unknown>).reduce<Record<string, unknown>>(
-    (acc, [key, val]) => {
-      acc[key] = maskKeys.has(key.toLowerCase()) ? "[REDACTED]" : redactValue(val, maskKeys, seen);
-      return acc;
-    },
-    {},
-  );
+  // `Array.from(string)` iterates by Unicode code point (using the string's
+  // built-in `[Symbol.iterator]`), so an emoji-surrogate-pair like `"😀"` is
+  // treated as a single element instead of being torn in half by a code-unit
+  // `.slice(...)`. The cost is one O(n) walk over the input — acceptable for
+  // log-line truncation where `n` is bounded by `maxBodyLength`.
+  return `${Array.from(value)
+    .slice(0, maxLength - 1)
+    .join("")}…`;
 };
+
+interface TruncatedBodyEnvelope {
+  _truncated: true;
+  _originalLength: number;
+  _preview: string;
+}
+
+/**
+ * Builds the structured envelope returned in place of an over-limit object
+ * body. Preserves valid JSON shape so downstream log shippers can ingest the
+ * payload without special-casing strings vs. objects.
+ */
+const buildTruncatedEnvelope = (serialized: string, maxLength: number): TruncatedBodyEnvelope => ({
+  _truncated: true,
+  _originalLength: serialized.length,
+  _preview: truncateString(serialized, maxLength),
+});
 
 const serializeBody = (body: unknown, maskKeys?: string[], maxLength = DEFAULT_BODY_LIMIT) => {
   if (body === undefined || body === null) {
@@ -61,24 +222,53 @@ const serializeBody = (body: unknown, maskKeys?: string[], maxLength = DEFAULT_B
   );
 
   if (typeof masked === "string") {
-    return masked.length > maxLength ? `${masked.slice(0, maxLength)}…` : masked;
+    return truncateString(masked, maxLength);
   }
 
   try {
     const serialized = JSON.stringify(masked);
     if (serialized.length > maxLength) {
-      return `${serialized.slice(0, maxLength)}…`;
+      return buildTruncatedEnvelope(serialized, maxLength);
     }
     return masked;
   } catch {
     const fallback = String(masked);
-    return fallback.length > maxLength ? `${fallback.slice(0, maxLength)}…` : fallback;
+    return truncateString(fallback, maxLength);
   }
+};
+
+/**
+ * Property names that must NEVER be assigned through `acc[key] = …` when
+ * rebuilding a header bag or walking a `redactPaths` segment. `__proto__`
+ * invokes the prototype setter (mutating the local object's prototype chain
+ * AND, when the path-walker reaches `Object.prototype`, the global prototype
+ * itself). `constructor` / `prototype` are likewise structural fields whose
+ * assignment can corrupt instanceof checks. Mirrors the deny-list inside
+ * `src/redact.ts` for a single source of truth across the package.
+ */
+const FORBIDDEN_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+const applyHeaderMask = (
+  headers: Record<string, unknown>,
+  maskHeaderKeys: ReadonlySet<string> | undefined,
+): Record<string, unknown> => {
+  if (!maskHeaderKeys || maskHeaderKeys.size === 0) {
+    return headers;
+  }
+  return Object.entries(headers).reduce<Record<string, unknown>>((acc, [key, val]) => {
+    // Skip prototype-pollution vectors. See FORBIDDEN_OBJECT_KEYS docstring.
+    if (FORBIDDEN_OBJECT_KEYS.has(key)) {
+      return acc;
+    }
+    acc[key] = maskHeaderKeys.has(key.toLowerCase()) ? REDACTED : val;
+    return acc;
+  }, {});
 };
 
 const normalizeHeaders = (
   headers: Record<string, unknown> | undefined,
   include?: boolean | string[],
+  maskHeaderKeys?: ReadonlySet<string>,
 ) => {
   if (!include) {
     return undefined;
@@ -97,25 +287,37 @@ const normalizeHeaders = (
   }
 
   const normalized = Object.entries(headers).reduce<Record<string, unknown>>((acc, [key, val]) => {
+    // Skip prototype-pollution vectors before normalizing the key. See
+    // FORBIDDEN_OBJECT_KEYS docstring.
+    if (FORBIDDEN_OBJECT_KEYS.has(key)) {
+      return acc;
+    }
     acc[key.toLowerCase()] = val;
     return acc;
   }, {});
 
   if (include === true) {
-    return ensureReturn(normalized);
+    const masked = applyHeaderMask(normalized, maskHeaderKeys);
+    return ensureReturn(masked);
   }
 
-  /* c8 ignore next */
-  const allowList = Array.isArray(include) ? include : [];
-  const filtered = allowList.reduce<Record<string, unknown>>((acc, key) => {
+  // By this point `include` is a non-empty `string[]` — `false`/`undefined`
+  // were filtered out by `if (!include)` above and `true` returned by the
+  // previous block. The static branch `Array.isArray(include) ? … : []` was
+  // dead code and has been removed for honest coverage.
+  const filtered = include.reduce<Record<string, unknown>>((acc, key) => {
     const normalizedKey = key.toLowerCase();
+    // Skip prototype-pollution vectors. See FORBIDDEN_OBJECT_KEYS docstring.
+    if (FORBIDDEN_OBJECT_KEYS.has(normalizedKey)) {
+      return acc;
+    }
     if (normalized[normalizedKey] !== undefined) {
       acc[normalizedKey] = normalized[normalizedKey];
     }
     return acc;
   }, {});
 
-  return ensureReturn(filtered);
+  return ensureReturn(applyHeaderMask(filtered, maskHeaderKeys));
 };
 
 const toNumber = (value: unknown): number | undefined => {
@@ -124,6 +326,149 @@ const toNumber = (value: unknown): number | undefined => {
   }
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : undefined;
+};
+
+/**
+ * Redacts query-string parameters whose names appear in `maskQueryKeys` from a
+ * URL string. Handles both absolute and relative URLs by parsing against a
+ * sentinel base when no scheme is present, then stripping the base back off
+ * before returning. Re-stringification preserves the original parameter order.
+ *
+ * Returns the original URL unchanged when:
+ * - `maskQueryKeys` is undefined or empty.
+ * - The URL has no query component.
+ * - Parsing fails (malformed URL); we never throw on bad input — logging
+ *   should be best-effort and never the cause of a request failure.
+ */
+const redactUrlQuery = (url: string, maskQueryKeys: ReadonlySet<string> | undefined): string => {
+  if (!maskQueryKeys || maskQueryKeys.size === 0 || !url) {
+    return url;
+  }
+  if (!url.includes("?")) {
+    return url;
+  }
+
+  try {
+    // Detect whether the input was an absolute URL so we know whether to strip
+    // the sentinel base from the re-stringified result.
+    const isAbsolute = /^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(url);
+    const parsed = isAbsolute ? new URL(url) : new URL(url, URL_PARSE_SENTINEL_BASE);
+
+    let mutated = false;
+    // Build a fresh USP so we preserve insertion order while editing values.
+    const params = new URLSearchParams();
+    parsed.searchParams.forEach((value, key) => {
+      if (maskQueryKeys.has(key.toLowerCase())) {
+        params.append(key, REDACTED);
+        mutated = true;
+      } else {
+        params.append(key, value);
+      }
+    });
+
+    if (!mutated) {
+      return url;
+    }
+
+    parsed.search = params.toString();
+    if (isAbsolute) {
+      return parsed.toString();
+    }
+
+    // Strip the sentinel base back off so the relative URL keeps its
+    // original form. `parsed.pathname + parsed.search + parsed.hash` is the
+    // correct relative reconstitution.
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return url;
+  }
+};
+
+/**
+ * Surgically redacts a value at the supplied dot-notation path on the entry
+ * object. Missing intermediate keys are a no-op (we never create new sub-paths
+ * just to write `[REDACTED]`). Mutates the passed object in place — callers
+ * should construct the entry first and then apply path redaction once.
+ *
+ * Path examples:
+ * - `body.user.password` → `entry.requestBody.user.password = "[REDACTED]"`
+ *   (the leading `body` is rewritten to `requestBody` to match the public
+ *   field name on `RequestLogEntry`).
+ * - `requestBody.user.password` is also accepted as the explicit form.
+ * - `context.user.token` → `entry.context.user.token = "[REDACTED]"`.
+ */
+const redactEntryPath = (entry: Record<string, unknown>, path: string): void => {
+  if (!path) {
+    return;
+  }
+  const segments = path.split(".").filter(Boolean);
+  if (segments.length === 0) {
+    return;
+  }
+  // Prototype-pollution guard — bail out BEFORE any traversal happens. A
+  // path like `body.__proto__.toString` would otherwise walk into
+  // `Object.prototype.toString` (which IS an own property of
+  // `Object.prototype`, satisfying the `hasOwnProperty` check at the bottom)
+  // and overwrite it with `[REDACTED]`, polluting every object in the
+  // process. The deny-list mirrors the FORBIDDEN_OBJECT_KEYS set used by the
+  // header accumulators and the `redactValue` rebuild — single source of
+  // truth for prototype-pollution hardening across the package.
+  for (const segment of segments) {
+    if (FORBIDDEN_OBJECT_KEYS.has(segment)) {
+      return;
+    }
+  }
+  // Map the user-facing `body` alias to the on-entry `requestBody` field.
+  if (segments[0] === "body") {
+    segments[0] = "requestBody";
+  }
+
+  let cursor: unknown = entry;
+  for (let i = 0; i < segments.length - 1; i += 1) {
+    if (!cursor || typeof cursor !== "object") {
+      return;
+    }
+    cursor = (cursor as Record<string, unknown>)[segments[i]];
+  }
+  if (!cursor || typeof cursor !== "object") {
+    return;
+  }
+  const finalKey = segments[segments.length - 1];
+  const target = cursor as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(target, finalKey)) {
+    return;
+  }
+  target[finalKey] = REDACTED;
+};
+
+/**
+ * Resolves the `maskHeaderKeys` option (default | array | false) to a
+ * lowercased `Set<string>` for fast membership checks, or `undefined` when
+ * masking is disabled.
+ */
+const resolveMaskHeaderKeys = (
+  option: string[] | false | undefined,
+): ReadonlySet<string> | undefined => {
+  if (option === false) {
+    return undefined;
+  }
+  const list = option ?? DEFAULT_MASKED_HEADER_KEYS;
+  return new Set(list.map((key) => key.toLowerCase()));
+};
+
+/**
+ * Resolves the `maskQueryKeys` option (default | array | false) to a
+ * lowercased `Set<string>` for fast membership checks, or `undefined` when
+ * masking is disabled.
+ */
+const resolveMaskQueryKeys = (
+  option: string[] | false | undefined,
+): ReadonlySet<string> | undefined => {
+  if (option === false) {
+    return undefined;
+  }
+  const list = option ?? DEFAULT_MASKED_QUERY_KEYS;
+  return new Set(list.map((key) => key.toLowerCase()));
 };
 
 const buildDefaultMessage = (entry: RequestLogEntry) => {
@@ -182,20 +527,54 @@ const shouldLogForEnvironment = (mode: RequestLoggingMode | undefined): boolean 
 };
 
 /**
- * Creates an Express compatible middleware that logs HTTP requests and responses
- * using the configured Winston logger.
+ * Creates a framework-agnostic HTTP request/response logging middleware that
+ * works with Express, raw Node `http`/`https` servers, and any other adapter
+ * exposing the {@link LoggableRequest} / {@link LoggableResponse} surface.
+ *
+ * The returned middleware logs structured request/response payloads using the
+ * configured Winston logger (or an auto-created scoped logger when none is
+ * provided).
+ *
+ * @example
+ * ```ts
+ * import express from "express";
+ * import { createLogger, createRequestLogger } from "@hiprax/logger";
+ *
+ * const app = express();
+ * const logger = createLogger({ moduleName: "api", level: "http" });
+ *
+ * app.use(
+ *   createRequestLogger({
+ *     logger,
+ *     includeRequestHeaders: true,
+ *     includeRequestBody: true,
+ *     maskBodyKeys: ["password", "token"],
+ *     includeHttpContext: true,
+ *   }),
+ * );
+ *
+ * app.post("/auth/login", (_req, res) => res.json({ ok: true }));
+ * ```
  */
-export const createRequestLogger = (options: RequestLoggerOptions = {}): ExpressMiddleware => {
+export const createRequestLogger = (options: RequestLoggerOptions = {}): LoggableMiddleware => {
+  // Validate option shapes UP FRONT so misconfiguration surfaces synchronously
+  // at middleware-creation time (not on the first request). Validation runs
+  // BEFORE the `loggingEnabled` / `loggingMode` short-circuit so a misconfigured
+  // mask is reported even when the resulting middleware is a pass-through.
+  validateRequestLevelOption(options.level);
+  validateMaskKeysOption("maskBodyKeys", options.maskBodyKeys, false);
+  validateMaskKeysOption("maskHeaderKeys", options.maskHeaderKeys, true);
+  validateMaskKeysOption("maskQueryKeys", options.maskQueryKeys, true);
+
   const { loggingEnabled = true, loggingMode } = options;
   const envAllowsLogging = shouldLogForEnvironment(loggingMode);
 
   if (!loggingEnabled || !envAllowsLogging) {
-    return (_req: Request, _res: Response, next: NextFunction) => next();
+    return (_req: LoggableRequest, _res: LoggableResponse, next: LoggableNext) => next();
   }
 
   const {
     logger = createLogger({
-      /* c8 ignore next */
       moduleName: options.label ? `http/${options.label}` : "http",
     }),
     level,
@@ -207,26 +586,52 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Express
     includeRequestBody,
     maxBodyLength = DEFAULT_BODY_LIMIT,
     maskBodyKeys,
+    maskHeaderKeys,
+    maskQueryKeys,
+    redactPaths,
     includeHttpContext = false,
   } = options;
 
-  return (req: Request, res: Response, next: NextFunction) => {
+  // Pre-resolve the mask sets once at middleware construction time so the
+  // per-request hot path only does Set lookups rather than re-allocating
+  // arrays/sets for every request.
+  const headerMaskSet = resolveMaskHeaderKeys(maskHeaderKeys);
+  const queryMaskSet = resolveMaskQueryKeys(maskQueryKeys);
+  const resolvedRedactPaths = Array.isArray(redactPaths) ? redactPaths : [];
+
+  return (req: LoggableRequest, res: LoggableResponse, next: LoggableNext) => {
     if (skip?.(req, res)) {
       return next();
     }
 
-    const start = process.hrtime.bigint();
+    // Honor an externally-provided start timestamp set by an earlier
+    // instrumentation hook (e.g. the very first piece of middleware on the
+    // stack). The override MUST be a `bigint` produced by
+    // `process.hrtime.bigint()`; any other type is silently ignored to avoid
+    // crashing the request on accidental misuse. The symbol is read with a
+    // typed cast so we do not have to widen `LoggableRequest` to allow
+    // arbitrary keys.
+    const externalStart = (req as unknown as Record<symbol, unknown>)[REQUEST_START_SYMBOL];
+    const start = typeof externalStart === "bigint" ? externalStart : process.hrtime.bigint();
+
     const initialContentLength = toNumber(req.headers["content-length"]);
-    let handled = false;
+
+    // Snapshot `req.body` at middleware ENTRY time so handler-time mutation
+    // (e.g. `req.body = { redacted: true }`) does not change what gets logged.
+    // We take a SHALLOW reference rather than a deep clone: deep cloning every
+    // body for every request is a meaningful per-request cost, and the common
+    // case is whole-pointer reassignment of `req.body`, which a shallow
+    // reference already isolates against. Consumers who mutate properties
+    // INSIDE the body object should redact those keys via `maskBodyKeys` /
+    // `redactPaths` instead. `structuredClone` is not used by default for the
+    // same reason — it is opt-in via user code if they truly need it.
+    const bodySnapshot: unknown = includeRequestBody ? req.body : undefined;
 
     const finalize = (event: RequestLogEvent) => {
-      /* c8 ignore start */
-      if (handled) {
-        return;
-      }
-      /* c8 ignore end */
-      handled = true;
-
+      // No double-fire guard required: `removeListener` is called below for
+      // both events, AND `res.once(...)` is intrinsically one-shot. The
+      // previous defensive `if (handled) return;` block was dead code and has
+      // been removed for honest coverage.
       res.removeListener("finish", finishHandler);
       res.removeListener("close", closeHandler);
 
@@ -237,39 +642,105 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Express
       const resolvedLevel =
         typeof level === "function" ? level(statusCode) : (level ?? determineLevel(statusCode));
 
+      const headerOrUndefined = (name: string): string | undefined => {
+        const raw = req.headers[name];
+        if (Array.isArray(raw)) {
+          return raw.join(", ");
+        }
+        return typeof raw === "string" ? raw : undefined;
+      };
+
+      const lookupHeader = (name: string): string | undefined => {
+        if (typeof req.get === "function") {
+          // `req.get(name) ?? undefined` collapses an explicit `null` return
+          // (some Express subclasses) to `undefined` so the `RequestLogEntry`
+          // optional-string contract is preserved.
+          return req.get(name) ?? undefined;
+        }
+        return headerOrUndefined(name);
+      };
+
+      const responseHeaders = res.getHeaders ? res.getHeaders() : undefined;
+
+      // Resolve and redact the URL we will log. We prefer `originalUrl` (Express
+      // semantics) and fall back to `url` (raw Node). URL redaction strips
+      // sensitive query params (token/key/secret/etc.) per `maskQueryKeys`.
+      const sourceUrl = req.originalUrl ?? req.url ?? "";
+      const loggedUrl = redactUrlQuery(sourceUrl, queryMaskSet);
+
+      // Capture transport-level lifecycle flags BEFORE refining the event.
+      // `responseWritableEnded` indicates whether the response body was fully
+      // written; combined with the raised `event === "close"` it lets us
+      // distinguish a true client abort from a benign post-finish close.
+      // `responseDestroyed` mirrors socket.destroyed for diagnostic context.
+      // `requestAborted` is reported when the request adapter exposes it.
+      const responseWritableEnded =
+        typeof res.writableEnded === "boolean" ? res.writableEnded : undefined;
+      const responseDestroyed = typeof res.destroyed === "boolean" ? res.destroyed : undefined;
+      const requestAborted = typeof req.aborted === "boolean" ? req.aborted : undefined;
+
+      // Refined classification: a `close` event is a true abort ONLY when the
+      // response body was NOT fully written (`!res.writableEnded`). A `close`
+      // after a normal `finish` (HTTP/1 keep-alive socket teardown, HTTP/2
+      // stream end) sets `writableEnded === true` and is benign — it is
+      // logged as `"completed"`. Adapters that do not surface
+      // `writableEnded` (raw mocks, custom transports) treat the close as a
+      // true abort to preserve the previous behavior.
+      const refinedEvent: RequestLogEvent =
+        event === "aborted" && !responseWritableEnded ? "aborted" : "completed";
+
       const entry: RequestLogEntry = {
-        event,
+        event: refinedEvent,
         method: req.method ?? "GET",
-        url: req.originalUrl ?? req.url ?? "",
+        url: loggedUrl,
         statusCode,
         responseTimeMs: Number(durationMs.toFixed(2)),
         contentLength: toNumber(res.getHeader("content-length")) ?? initialContentLength,
         ip: req.ip ?? req.socket?.remoteAddress ?? undefined,
-        userAgent:
-          /* c8 ignore next */
-          typeof req.get === "function"
-            ? (req.get("user-agent") ?? undefined)
-            : (req.headers["user-agent"] as string | string[] | undefined)?.toString(),
-        requestId:
-          /* c8 ignore next */
-          typeof req.get === "function"
-            ? (req.get("x-request-id") ?? undefined)
-            : (req.headers["x-request-id"] as string | string[] | undefined)?.toString(),
+        userAgent: lookupHeader("user-agent"),
+        requestId: lookupHeader("x-request-id"),
       };
 
+      if (responseWritableEnded !== undefined) {
+        entry.responseWritableEnded = responseWritableEnded;
+      }
+      if (responseDestroyed !== undefined) {
+        entry.responseDestroyed = responseDestroyed;
+      }
+      if (requestAborted !== undefined) {
+        entry.requestAborted = requestAborted;
+      }
+
       if (includeRequestBody) {
-        entry.requestBody = serializeBody(req.body, maskBodyKeys, maxBodyLength);
+        // Use the body snapshot taken at middleware entry — see the comment on
+        // `bodySnapshot` above for why we do not deep-clone by default.
+        entry.requestBody = serializeBody(bodySnapshot, maskBodyKeys, maxBodyLength);
       }
 
       entry.requestHeaders = normalizeHeaders(
         req.headers as Record<string, unknown>,
         includeRequestHeaders,
+        headerMaskSet,
       );
-      entry.responseHeaders = normalizeHeaders(res.getHeaders(), includeResponseHeaders);
+      entry.responseHeaders = normalizeHeaders(
+        responseHeaders as Record<string, unknown> | undefined,
+        includeResponseHeaders,
+        headerMaskSet,
+      );
 
       if (enrich) {
-        /* c8 ignore next */
+        // `enrich(...) ?? undefined` collapses a `null` or `undefined` return
+        // value to `undefined` so `entry.context` is never set to `null`.
         entry.context = enrich(req, res, durationMs) ?? undefined;
+      }
+
+      // Surgical path-based redaction — runs LAST so it can override anything
+      // that survived the keyword-based body/header masks. Missing intermediate
+      // segments are a graceful no-op.
+      if (resolvedRedactPaths.length > 0) {
+        resolvedRedactPaths.forEach((path) =>
+          redactEntryPath(entry as unknown as Record<string, unknown>, path),
+        );
       }
 
       const message = messageBuilder(entry);
@@ -302,7 +773,20 @@ export const __requestInternals = {
   redactValue,
   serializeBody,
   normalizeHeaders,
+  applyHeaderMask,
   toNumber,
   buildDefaultMessage,
   shouldLogForEnvironment,
+  truncateString,
+  buildTruncatedEnvelope,
+  redactUrlQuery,
+  redactEntryPath,
+  resolveMaskHeaderKeys,
+  resolveMaskQueryKeys,
+  validateRequestLevelOption,
+  validateMaskKeysOption,
+  isValidLogLevel,
+  VALID_LOG_LEVELS,
+  DEFAULT_MASKED_HEADER_KEYS,
+  DEFAULT_MASKED_QUERY_KEYS,
 };

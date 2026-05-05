@@ -13,7 +13,8 @@
     "declarationMap": true,
     "sourceMap": true,
     "outDir": "dist",
-    "types": ["node", "jest"]
+    "types": ["node", "jest"],
+    "ignoreDeprecations": "6.0"
   },
   "include": ["src", "tests", "jest.config.ts"],
   "exclude": ["dist", "node_modules"]

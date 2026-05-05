@@ -1,6 +1,6 @@
 {
   "name": "@hiprax/logger",
-  "version": "0.7.0",
+  "version": "0.21.3",
   "description": "Fully typed Winston-based logger with rotation, timezone support, and Express middleware",
   "keywords": [
     "logger",
@@ -17,6 +17,7 @@
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
+    "src",
     "README.md",
     "LICENSE"
   ],
@@ -42,33 +43,50 @@
   "scripts": {
     "build": "tsup --config tsup.config.ts",
     "test": "jest --runInBand --coverage",
+    "test:watch": "jest --watch",
     "lint": "eslint src tests",
     "type-check": "tsc --noEmit",
-    "prepare": "npm run build"
+    "clean": "rimraf dist coverage",
+    "format": "prettier --write src tests",
+    "format:check": "prettier --check src tests",
+    "audit:runtime": "npm audit --omit=dev --audit-level=high",
+    "prepublishOnly": "npm run build"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
   },
   "dependencies": {
-    "moment-timezone": "^0.6.0",
-    "winston": "^3.18.3",
+    "moment-timezone": "^0.6.2",
+    "winston": "^3.19.0",
     "winston-daily-rotate-file": "^5.0.0"
   },
+  "peerDependencies": {
+    "express": ">=4 <6"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": true
+    }
+  },
   "devDependencies": {
-    "@eslint/js": "^9.39.3",
-    "@types/express": "^5.0.5",
+    "@eslint/js": "^10.0.1",
+    "@types/express": "^5.0.6",
     "@types/jest": "^30.0.0",
-    "@types/node": "^24.10.1",
-    "@typescript-eslint/eslint-plugin": "^8.46.4",
-    "@typescript-eslint/parser": "^8.46.4",
-    "eslint": "^9.39.1",
+    "@types/node": "^25.6.0",
+    "@typescript-eslint/eslint-plugin": "^8.59.2",
+    "@typescript-eslint/parser": "^8.59.2",
+    "eslint": "^10.3.0",
     "eslint-config-prettier": "^10.1.8",
-    "jest": "^30.2.0",
-    "prettier": "^3.6.2",
-    "ts-jest": "^29.4.5",
+    "eslint-plugin-prettier": "^5.2.1",
+    "fast-check": "^4.7.0",
+    "jest": "^30.3.0",
+    "prettier": "^3.8.3",
+    "rimraf": "^6.0.1",
+    "ts-jest": "^29.4.9",
     "ts-node": "^10.9.2",
     "tsup": "^8.5.1",
-    "typescript": "^5.9.3",
-    "typescript-eslint": "^8.56.0"
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.59.2"
   }
 }
