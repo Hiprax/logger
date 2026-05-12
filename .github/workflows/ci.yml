@@ -67,3 +67,13 @@ jobs:
           path: coverage/
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Upload coverage to Codecov
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '22.x'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info
+          flags: unittests
+          slug: Hiprax/logger
+          fail_ci_if_error: false

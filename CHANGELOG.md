@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### CI (2026-05-12)
+
+- **Codecov coverage upload + badge** (`.github/workflows/ci.yml`, `codecov.yml`, `README.md`): New `codecov/codecov-action@v5` step on the Ubuntu / Node 22 leg of CI uploads `coverage/lcov.info` (Jest emits this by default; `coverageReporters` includes `lcov` out of the box). Authenticated via the `CODECOV_TOKEN` repo secret, tagged with the `unittests` flag, with `fail_ci_if_error: false` so a Codecov outage cannot redden a passing build. A new `codecov.yml` mirrors the Jest `coverageThreshold` (100% on every metric) but marks both the project and patch status checks as `informational: true` — Codecov posts the delta comment and the badge updates, but the Jest gate remains the single blocking source of truth on coverage. The `ignore` list pins coverage reporting to `src/`, matching Jest's `collectCoverageFrom`. New `codecov` badge added to the README header alongside the existing npm / License / CI / CodeQL badges.
+
 ## [0.21.4] - 2026-05-12
 
 ### CI / Release (2026-05-12)
