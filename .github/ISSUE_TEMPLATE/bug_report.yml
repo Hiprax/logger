@@ -1,0 +1,76 @@
+name: Bug report
+description: Report a problem with @hiprax/logger
+title: "[bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. The more concrete the reproduction, the faster it can be fixed.
+  - type: input
+    id: version
+    attributes:
+      label: "@hiprax/logger version"
+      description: "Run `npm ls @hiprax/logger` or check your `package.json`."
+      placeholder: "0.21.4"
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: "Node.js version"
+      description: "Run `node --version`."
+      placeholder: "v22.11.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: "Operating system"
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other (note in description)
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: "Affected surface"
+      options:
+        - createLogger
+        - createRequestLogger (Express middleware)
+        - createNoopLogger
+        - shutdownLogger / shutdownAllLoggers
+        - Types / exports
+        - Other (note in description)
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: "Reproduction"
+      description: "Minimal code that reproduces the bug. Inline snippet or a link to a small repo."
+      render: typescript
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: "Expected behavior"
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: "Actual behavior"
+      description: "Include the full error output / stack trace if applicable."
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: "Additional context"
+      description: "Anything else relevant — transports configured, env vars, container runtime, etc."

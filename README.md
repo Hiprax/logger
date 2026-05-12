@@ -2,9 +2,10 @@
 
 Fully typed, production-grade logging toolkit for Node.js applications. Built on top of Winston with first-class TypeScript support, rotating file transports, timezone mirroring, and an HTTP middleware that outperforms traditional solutions.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![npm version](https://img.shields.io/npm/v/@hiprax/logger)](https://www.npmjs.com/package/@hiprax/logger)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.9.3-blue.svg)](https://www.typescriptlang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/Hiprax/logger/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Hiprax/logger/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/Hiprax/logger/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Hiprax/logger/actions/workflows/codeql.yml)
 [![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
 
 ---
@@ -545,12 +546,19 @@ When `includeHttpContext` is enabled, the structured `RequestLogEntry` is attach
 
 ## Scripts
 
-| Command              | Description                                            |
-| -------------------- | ------------------------------------------------------ |
-| `npm run build`      | Generates dual ESM/CJS bundles plus type declarations. |
-| `npm test`           | Runs Jest with 100% coverage enforcement.              |
-| `npm run lint`       | Runs ESLint across source and test files.              |
-| `npm run type-check` | Runs the TypeScript compiler in check-only mode.       |
+| Command                              | Description                                                                                  |
+| ------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `npm run build`                      | Generates dual ESM/CJS bundles plus type declarations.                                       |
+| `npm test`                           | Runs Jest with 100% coverage enforcement.                                                    |
+| `npm run lint`                       | Runs ESLint across source and test files.                                                    |
+| `npm run type-check`                 | Runs the TypeScript compiler in check-only mode.                                             |
+| `npm run format:check`               | Verifies Prettier formatting is clean.                                                       |
+| `npm run audit:runtime`              | Runs `npm audit` against runtime dependencies only (fails on `high` or above).               |
+| `npm run verify`                     | Runs all five pre-completion gates locally with a clean per-check summary.                   |
+| `npm run branch -- <prefix> <slug>`  | Creates a conventionally-named feature branch from a fresh `origin/main`.                    |
+| `npm run sync`                       | Fast-forwards local `main` and prunes branches whose remote tracking branch was deleted.     |
+| `npm run release:prepare -- <bump>`  | Bumps version, promotes `CHANGELOG [Unreleased]`, commits, pushes a `release/vX.Y.Z` branch. |
+| `npm run release:tag`                | Creates and pushes the `vX.Y.Z` tag — triggers the release workflow (publish + GitHub Release). |
 
 ## Testing & Coverage
 
@@ -599,9 +607,25 @@ narrowly scoped `redactPaths` API.
 
 ## Contributing
 
-1. Clone the repo and install dependencies.
-2. Run `npm test` to ensure the suite passes before submitting changes.
-3. Follow the existing TypeScript, linting, and documentation patterns.
+1. Clone the repo and install dependencies (`npm ci`).
+2. Create a branch using the convention `<prefix>/<slug>` (e.g. `feat/add-thing`, `fix/headers-leak`, `ci/bump-actions`). The helper `npm run branch -- feat add-thing` does this from a fresh `origin/main`.
+3. Make your changes and add or update tests. Coverage is enforced at 100% on every metric.
+4. Run `npm run verify` before opening a PR — it runs the same five gates CI runs.
+5. Update `CHANGELOG.md` under `## [Unreleased]` with a dated entry describing what changed.
+6. Open a PR; the template enumerates the checklist that must pass.
+
+### Release process
+
+Releases are **tag-triggered**: pushing a `vX.Y.Z` tag fires `.github/workflows/release.yml`, which re-runs every gate, verifies the tag matches `package.json` `version`, publishes to npm with [provenance](https://docs.npmjs.com/generating-provenance-statements) via OIDC, and creates a GitHub Release whose body is the matching `CHANGELOG.md` section.
+
+The two-step flow:
+
+```bash
+npm run release:prepare -- patch   # or minor / major
+# Open the printed PR URL, wait for CI green, squash-and-merge.
+npm run sync                       # pull main, drop merged branches
+npm run release:tag                # creates + pushes vX.Y.Z (triggers publish)
+```
 
 ## License
 

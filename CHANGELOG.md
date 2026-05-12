@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+## [0.21.4] - 2026-05-12
+
+### CI / Release (2026-05-12)
+
+- **Tag-triggered npm publish with provenance** (`.github/workflows/release.yml`): New workflow fires on `v*.*.*` tag pushes (and `workflow_dispatch` with a tag input). Runs the full quality gate set (`lint`, `type-check`, `format:check`, `test`, `build`), verifies the tag matches `package.json` `version` (refuses to publish on mismatch), runs `npm pack --dry-run` for tarball sanity, then `npm publish --provenance --access public` over OIDC (no long-lived publish secret on the wire). Finally extracts the matching `## [X.Y.Z]` block from `CHANGELOG.md` and creates a GitHub Release with those notes as the body via `softprops/action-gh-release@v2`. Concurrency is grouped on `release-${{ github.ref }}` with `cancel-in-progress: false` so a release run is never preempted mid-publish. Replaces the previous `publish.yml` which triggered off a manually-published GitHub Release.
+- **Hardened CI workflow** (`.github/workflows/ci.yml`): Matrix expanded to Node `18.x / 20.x / 22.x / 24.x` (Node 24 added) across `ubuntu-latest` and `windows-latest`. Added `permissions: contents: read` (least-privilege), grouped concurrency (`ci-${{ github.ref }}`, cancel-in-progress), and added a `Runtime audit` (`npm run audit:runtime`) + `Verify tarball contents` (`npm pack --dry-run`) step on the Ubuntu / Node 22 leg. Coverage artifact retention remains at 14 days.
+- **CodeQL static analysis** (`.github/workflows/codeql.yml`): New workflow analyzing `javascript-typescript` with the `security-and-quality` query pack. Runs on push to `main`, pull requests targeting `main`, and on a weekly schedule (`0 6 * * 1` UTC). Build mode `none` (no TypeScript build needed for analysis).
+- **Issue + PR templates** (`.github/PULL_REQUEST_TEMPLATE.md`, `.github/ISSUE_TEMPLATE/{bug_report,feature_request,config}.yml`): Bug report template captures package version, Node version, OS, affected surface (createLogger / createRequestLogger / createNoopLogger / shutdown / Types / Other), reproduction (rendered as TypeScript), expected vs actual behavior, and additional context. Feature request template captures problem, proposed solution, alternatives, and context. Blank issues disabled via `config.yml`. PR template enumerates the five-step pre-completion checklist mandated by the project CLAUDE.md.
+- **Release helper scripts** (`scripts/{_lib,verify,release-prepare,release-tag,sync-main,new-branch}.mjs`): Zero-dependency Node scripts that automate the release ritual. `npm run verify` runs all five quality gates with a clean per-check pass/fail summary; `npm run release:prepare -- <bump>` bumps `package.json`, promotes `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` in `CHANGELOG.md`, commits on `release/vX.Y.Z`, and pushes the branch (with PR URL printed for the user); `npm run release:tag` verifies state then creates and pushes the annotated `vX.Y.Z` tag that triggers the release workflow. `npm run sync` fast-forwards `main` and prunes branches whose remote was deleted; `npm run branch -- <prefix> <slug>` creates a conventionally-named feature branch from fresh `origin/main`. Wired into `package.json` `scripts`.
+
+### Dependencies (2026-05-12)
+
+- **All dependencies refreshed to the latest published versions on npm** (`package.json`). All bumps stay within the existing major versions — semver-safe with no migration required, no public-API changes, and no test changes. Every upgrade ran the full pre-completion checklist (build, 251/251 tests + 100% coverage on every metric, lint, type-check, format:check) and `npm audit` continues to report 0 vulnerabilities.
+  - **Runtime:** no changes — `winston@3.19.0`, `winston-daily-rotate-file@5.0.0`, and `moment-timezone@0.6.2` are already on their respective `latest` dist-tags.
+  - **Dev — patch/minor:**
+    - `@types/node` 25.6.0 → 25.7.0
+    - `@typescript-eslint/eslint-plugin` 8.59.2 → 8.59.3
+    - `@typescript-eslint/parser` 8.59.2 → 8.59.3
+    - `typescript-eslint` 8.59.2 → 8.59.3
+    - `eslint-plugin-prettier` 5.2.1 → 5.5.5 (caret range bumped to match installed)
+    - `fast-check` 4.7.0 → 4.8.0
+    - `jest` 30.3.0 → 30.4.2
+    - `rimraf` 6.0.1 → 6.1.3 (caret range bumped to match installed)
+- Reinstalled `node_modules` and refreshed `package-lock.json` from scratch so the lockfile reflects the new resolutions.
+
 ### Dependencies (2026-05-04)
 
 - **All dependencies upgraded to latest versions, including major-version bumps for `typescript`, `eslint`, `@eslint/js`, and `@types/node`** (`package.json`, `tsconfig.json`). Every upgrade ran the full pre-completion checklist (build, test 251/251 + 100% coverage, lint, type-check, format:check) and `npm audit` continues to report 0 vulnerabilities. Backward compatibility preserved — no public API changes, no test changes required.
