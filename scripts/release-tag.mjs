@@ -84,8 +84,17 @@ main(async () => {
 
   const changelog = await readChangelog();
   if (changelog) {
+    // Escape ALL regex metacharacters in pkg.version, not just `.`. In normal
+    // operation pkg.version is plain semver (`X.Y.Z[-prerelease][+build]`),
+    // none of which contains regex metacharacters beyond `.` — but a
+    // hand-edited or otherwise unexpected version string with `+`, `[`, `\`,
+    // etc. would otherwise produce a malformed pattern (or, worse, a pattern
+    // that matches more than intended). Standard
+    // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_expressions#escaping
+    // escape covering `.*+?^${}()|[]\` — silences CodeQL `js/incomplete-sanitization`.
+    const escapedVersion = pkg.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const re = new RegExp(
-      `^## \\[${pkg.version.replace(/\./g, "\\.")}\\][^\\n]*\\n([\\s\\S]*?)(?=^## \\[)`,
+      `^## \\[${escapedVersion}\\][^\\n]*\\n([\\s\\S]*?)(?=^## \\[)`,
       "m",
     );
     const m = re.exec(changelog);

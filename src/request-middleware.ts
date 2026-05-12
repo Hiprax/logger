@@ -405,16 +405,16 @@ const redactEntryPath = (entry: Record<string, unknown>, path: string): void => 
   if (segments.length === 0) {
     return;
   }
-  // Prototype-pollution guard — bail out BEFORE any traversal happens. A
-  // path like `body.__proto__.toString` would otherwise walk into
-  // `Object.prototype.toString` (which IS an own property of
-  // `Object.prototype`, satisfying the `hasOwnProperty` check at the bottom)
-  // and overwrite it with `[REDACTED]`, polluting every object in the
-  // process. The deny-list mirrors the FORBIDDEN_OBJECT_KEYS set used by the
-  // header accumulators and the `redactValue` rebuild — single source of
-  // truth for prototype-pollution hardening across the package.
-  for (const segment of segments) {
-    if (FORBIDDEN_OBJECT_KEYS.has(segment)) {
+  // Prototype-pollution guard, part 1 — INTERMEDIATE segments. A path like
+  // `body.__proto__.toString` would otherwise walk
+  // `cursor[segments[i]]` into `Object.prototype` and then assign on the
+  // (legitimate) final segment, mutating the global prototype. The deny-list
+  // mirrors the FORBIDDEN_OBJECT_KEYS set used by the header accumulators and
+  // the `redactValue` rebuild — single source of truth for prototype-pollution
+  // hardening across the package. (Part 2, the final-segment check, lives
+  // just above the assignment below.)
+  for (let i = 0; i < segments.length - 1; i += 1) {
+    if (FORBIDDEN_OBJECT_KEYS.has(segments[i])) {
       return;
     }
   }
@@ -434,6 +434,15 @@ const redactEntryPath = (entry: Record<string, unknown>, path: string): void => 
     return;
   }
   const finalKey = segments[segments.length - 1];
+  // Prototype-pollution guard, part 2 — FINAL segment. Blocks an assignment
+  // of the form `target.__proto__ = "[REDACTED]"` (which would invoke the
+  // setter and clobber `target`'s prototype chain). This guard runs BEFORE
+  // the `hasOwnProperty` filter so CodeQL's taint flow for
+  // `js/prototype-polluting-assignment` (CWE-1321) can statically prove the
+  // assignment cannot reach a prototype slot.
+  if (FORBIDDEN_OBJECT_KEYS.has(finalKey)) {
+    return;
+  }
   const target = cursor as Record<string, unknown>;
   if (!Object.prototype.hasOwnProperty.call(target, finalKey)) {
     return;

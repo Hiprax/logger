@@ -2424,6 +2424,27 @@ describe("createLogger", () => {
       );
     });
 
+    it("sanitizeSegment handles long runs of hyphens in linear time (ReDoS regression)", () => {
+      // Regression test for the `js/polynomial-redos` (CWE-1333) finding on
+      // the original trailing-hyphen regex `[-]+$`. Even though the production
+      // code collapses runs via `-+/g` BEFORE the anchored strip — making the
+      // attack vector theoretical — this test pins the linear-time invariant
+      // so a future refactor that removes the collapse cannot reintroduce the
+      // polynomial behavior. A genuinely polynomial regex on this 100k-char
+      // input would take minutes (or hang the runner); the safe regex
+      // finishes in single-digit milliseconds.
+      const hostile = `${"-".repeat(100_000)}x`;
+      const start = Date.now();
+      const cleaned = __loggerInternals.sanitizeSegment(hostile);
+      const elapsedMs = Date.now() - start;
+      // Generous bound — the actual run is in the low milliseconds on every
+      // platform; we just want a hard cap that a quadratic regex blows past.
+      expect(elapsedMs).toBeLessThan(1000);
+      // Behavior is unchanged from the pre-fix code: leading hyphen run is
+      // stripped, the trailing `x` is retained.
+      expect(cleaned).toBe("x");
+    });
+
     it("buildLogFilePath always stays under baseDir and never escapes via `..`", () => {
       const baseDir = path.resolve("/tmp/log-base");
       fc.assert(

@@ -1575,6 +1575,30 @@ describe("request middleware internals", () => {
       expect(entry.requestBody).toEqual({ user: { name: "alice" } });
     });
 
+    it("redactEntryPath final-segment guard catches __proto__ as an OWN property on the cursor", () => {
+      // The intermediate-segment guard (part 1) catches forbidden keys at
+      // segments[0..length-2]. This test exercises the FINAL-segment guard
+      // (part 2, the inline check right before the assignment) by feeding a
+      // path whose intermediate segments are all clean and whose final segment
+      // is `__proto__` — AND mounting the assignment target as a
+      // `JSON.parse('{"__proto__": ...}')` object that owns the key directly,
+      // so the `hasOwnProperty` filter would NOT short-circuit on its own.
+      // Without the inline guard the bracket-assignment would invoke the
+      // prototype setter and corrupt the chain.
+      const evil = JSON.parse('{"__proto__": "real"}') as Record<string, unknown>;
+      const entry = { requestBody: { user: evil } } as unknown as Record<string, unknown>;
+      const originalProto = Object.getPrototypeOf(evil);
+
+      redactEntryPath(entry, "requestBody.user.__proto__");
+
+      // The own `__proto__` key on the cursor is left untouched ...
+      expect(Object.getOwnPropertyDescriptor(evil, "__proto__")?.value).toBe("real");
+      // ... and the cursor's actual prototype chain is the original
+      // (`Object.prototype`, not `"[REDACTED]"`).
+      expect(Object.getPrototypeOf(evil)).toBe(originalProto);
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    });
+
     it("serializeBody on a JSON-parsed __proto__ payload does not pollute Object.prototype", () => {
       // `JSON.parse` is the canonical way to construct an object that owns a
       // `__proto__` key (object literals route the assignment through the

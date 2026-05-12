@@ -8,7 +8,6 @@ Fully typed, production-grade logging toolkit for Node.js applications. Built on
 [![CI](https://github.com/Hiprax/logger/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Hiprax/logger/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/Hiprax/logger/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Hiprax/logger/actions/workflows/codeql.yml)
 [![codecov](https://codecov.io/gh/Hiprax/logger/branch/main/graph/badge.svg)](https://codecov.io/gh/Hiprax/logger)
-[![Dependencies](https://img.shields.io/librariesio/release/npm/@hiprax%2Flogger)](https://libraries.io/npm/@hiprax%2Flogger)
 [![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
 
 ---

@@ -321,7 +321,13 @@ const sanitizeSegment = (value: string) => {
     .replace(/\s+/g, "-")
     .replace(/\.+/g, "-")
     .replace(/-+/g, "-")
-    .replace(/^[-]+|[-]+$/g, "")
+    // The preceding `/-+/g` collapse guarantees runs of `-` are already a
+    // single character, so `^-|-$` (without the `+` quantifier) is
+    // semantically equivalent to `^[-]+|[-]+$` here. The non-quantified form
+    // avoids the polynomial-regex pattern CodeQL flags as `js/polynomial-redos`
+    // (CWE-1333) — the engine no longer has to backtrack over candidate
+    // start positions for an anchored `[-]+$` match on inputs with many `-`s.
+    .replace(/^-|-$/g, "")
     .trim();
   return cleaned || "logs";
 };
