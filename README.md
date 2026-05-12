@@ -3,10 +3,12 @@
 Fully typed, production-grade logging toolkit for Node.js applications. Built on top of Winston with first-class TypeScript support, rotating file transports, timezone mirroring, and an HTTP middleware that outperforms traditional solutions.
 
 [![npm version](https://img.shields.io/npm/v/@hiprax/logger)](https://www.npmjs.com/package/@hiprax/logger)
+[![npm provenance](https://img.shields.io/badge/npm-provenance%20attested-blue?logo=npm&logoColor=white)](https://www.npmjs.com/package/@hiprax/logger)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![CI](https://github.com/Hiprax/logger/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Hiprax/logger/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/Hiprax/logger/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Hiprax/logger/actions/workflows/codeql.yml)
 [![codecov](https://codecov.io/gh/Hiprax/logger/branch/main/graph/badge.svg)](https://codecov.io/gh/Hiprax/logger)
+[![Dependencies](https://img.shields.io/librariesio/release/npm/@hiprax%2Flogger)](https://libraries.io/npm/@hiprax%2Flogger)
 [![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
 
 ---
