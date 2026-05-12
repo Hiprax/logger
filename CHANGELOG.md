@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.21.6] - 2026-05-12
+
+### CI / Workflow Hardening (2026-05-12)
+
+- **GitHub Actions versions refreshed to current latest majors across all workflows** (`.github/workflows/ci.yml`, `.github/workflows/release.yml`, `.github/workflows/codeql.yml`). All bumps are Node 24 runtime refreshes with no input/output schema changes — the workflows continue to consume identical YAML inputs and produce identical artifacts, status checks, and release outputs. GitHub-hosted runners have shipped Node 24 support since runner `v2.327.1` (Aug 2025), so the matrix legs (Ubuntu / Windows × Node 18 / 20 / 22 / 24) and the release job all continue to schedule on first-attempt with no runner pinning required. The full pre-completion checklist passes (build, 251/251 tests + 100% coverage on every metric, lint, type-check, format:check) and `npm audit` continues to report 0 vulnerabilities at every audit level. Runtime + dev npm dependencies are already pinned to their respective `latest` dist-tags as of the prior 0.21.5 cut — no `package.json` dep movement in this release; the `package-lock.json` change is the version-line bump only.
+  - `actions/checkout`: `v4` → `v6` (runtime: Node 20 → Node 24; credential persistence moved to a separate file in `v6.0.0`).
+  - `actions/setup-node`: `v4` → `v6` (runtime: Node 20 → Node 24; `v5` introduced opt-in `packageManager`-field auto-detection but we already pass an explicit `cache: "npm"` input, so behavior is unchanged; `v6` narrowed the auto-detect to npm only).
+  - `actions/upload-artifact`: `v4` → `v7` (runtime: Node 20 → Node 24 across `v5`/`v6`; `v7.0.0` migrated the action package to ESM internally and added an opt-in `archive: false` direct-upload mode that we do not use — the default zipped behavior is preserved).
+  - `codecov/codecov-action`: `v5` → `v6` (runtime: Node 20 → Node 24; no input changes — `token`, `files`, `flags`, `slug`, and `fail_ci_if_error` continue to flow through unchanged).
+  - `softprops/action-gh-release`: `v2` → `v3` (runtime: Node 20 → Node 24; the upstream maintainer documents `v3` as a pure runtime cut with no `with:` input changes — `tag_name`, `name`, `body`, `draft`, and `prerelease` continue to flow through unchanged).
+  - `github/codeql-action/{init,analyze}`: `v3` → `v4` (runtime: Node 20 → Node 24; the GitHub Security maintainers schedule `v3` for deprecation in December 2026, so moving to `v4` retires that countdown ahead of the deprecation window — `languages`, `build-mode`, `queries`, and `category` continue to flow through unchanged).
+
+### Dependencies (2026-05-12)
+
+- **npm direct dependencies — no changes required.** Every direct dependency listed in `package.json` was re-checked against its npm `latest` dist-tag and confirmed already-pinned to the current latest: runtime (`winston@3.19.0`, `winston-daily-rotate-file@5.0.0`, `moment-timezone@0.6.2`) plus all 18 devDependencies (`typescript@6.0.3`, `eslint@10.3.0`, `jest@30.4.2`, `ts-jest@29.4.9`, `tsup@8.5.1`, `prettier@3.8.3`, `@types/node@25.7.0`, etc.). `npm update` (which bumps transitive deps to the latest version satisfying each parent's range) produced no lockfile diff. `npm audit` reports 0 vulnerabilities at every audit level.
+
 ## [0.21.5] - 2026-05-12
 
 ### CI / Repo Hardening (2026-05-12)
