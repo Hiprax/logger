@@ -1629,11 +1629,10 @@ describe("request middleware internals", () => {
     // iterator instead, so an emoji is kept whole or skipped entirely —
     // never torn in half.
     //
-    // For `truncateString("ab😀😀", 4)`: maxLength=4, so the helper takes
-    // `Array.from("ab😀😀").slice(0, 3)` = `['a', 'b', '😀']`, joins it, and
-    // appends `…` — yielding `"ab😀…"` (4 code points; the first emoji is
-    // preserved intact). Critically, the result must NOT contain a lone
-    // surrogate (the regression the audit flagged).
+    // For `truncateString("ab😀😀", 4)`: maxLength=4, so the bounded for...of
+    // collects 3 code points = `['a', 'b', '😀']` then appends `…` —
+    // yielding `"ab😀…"` (4 code points; the first emoji is preserved
+    // intact). Critically, the result must NOT contain a lone surrogate.
     const truncated = truncateString("ab😀😀", 4);
     expect(truncated).toBe("ab😀…");
     // Defensive guard: no lone surrogate in the output. `\uD83D` is the high
@@ -1642,9 +1641,9 @@ describe("request middleware internals", () => {
     expect(truncated).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
 
     // With `maxLength=5` (still less than the 6-code-unit `value.length`,
-    // so the early-exit does not fire), the helper takes 4 code points:
-    // `['a', 'b', '😀', '😀']` joined + `…` = `"ab😀😀…"`. Both emojis are
-    // kept whole — the truncation strictly trims from the end.
+    // so the early-exit does not fire), the for...of collects 4 code points:
+    // `['a', 'b', '😀', '😀']` then appends `…` = `"ab😀😀…"`. Both emojis
+    // are kept whole — the truncation strictly trims from the end.
     expect(truncateString("ab😀😀", 5)).toBe("ab😀😀…");
 
     // No truncation needed when the input fits the limit (measured in CODE
@@ -1662,9 +1661,74 @@ describe("request middleware internals", () => {
     // consumers who need grapheme-correct slicing should reach for
     // `Intl.Segmenter`.
     const composed = `ábc`; // 4 code points, displays as "ábc"
-    // maxLength=2 → result is `…` after 1 code point: `"…"` is 1 char.
-    // The implementation: `Array.from(...).slice(0, 1).join("") + "…"` → `"a…"`
+    // maxLength=2 → for...of collects 1 code point then appends `…` → `"a…"`.
     expect(truncateString(composed, 2)).toBe("a…");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 6 — truncateString O(maxLength) bounded for...of (Task 6.2)
+  // ---------------------------------------------------------------------------
+
+  describe("truncateString (Phase 6 — bounded for...of parity)", () => {
+    // Reference implementation preserved from before Phase 6: the old
+    // Array.from-based semantics. Used to verify the new for...of loop
+    // produces byte-identical output for every input class.
+    const arrayFromTruncate = (value: string, maxLength: number): string => {
+      if (value.length <= maxLength) {
+        return value;
+      }
+      if (maxLength <= 0) {
+        return "";
+      }
+      if (maxLength === 1) {
+        return "…";
+      }
+      return `${Array.from(value)
+        .slice(0, maxLength - 1)
+        .join("")}…`;
+    };
+
+    it("produces identical output to Array.from semantics for ASCII strings at several maxLengths", () => {
+      const s = "abcdefghijklmnopqrstuvwxyz"; // 26 chars, all single code points
+      for (const ml of [0, 1, 2, 5, 13, 26, 27]) {
+        expect(truncateString(s, ml)).toBe(arrayFromTruncate(s, ml));
+      }
+    });
+
+    it("produces identical output to Array.from semantics for emoji strings at several maxLengths", () => {
+      // "😀" encodes as a UTF-16 surrogate pair (2 code units, 1 code point).
+      // The string has 1000 code points but 2000 code units, so no early-exit
+      // fires for the maxLengths tested here.
+      const s = "😀".repeat(1000); // 1000 × "😀"
+      for (const ml of [0, 1, 2, 3, 5, 10, 50]) {
+        expect(truncateString(s, ml)).toBe(arrayFromTruncate(s, ml));
+      }
+    });
+
+    it("produces identical output to Array.from semantics for mixed ASCII+emoji strings", () => {
+      // Alternating ASCII + emoji: 8 code points, 12 code units.
+      const s = "a😀b😀c😀d😀";
+      for (const ml of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15]) {
+        expect(truncateString(s, ml)).toBe(arrayFromTruncate(s, ml));
+      }
+    });
+
+    it("completes in bounded time on a >=100 kB string (O(maxLength) regression guard)", () => {
+      // An O(input-length) regression (e.g. reverting to Array.from) would
+      // make this call proportionally slower as input grows. With 200 kB input
+      // and maxLength=50, an O(n) pass walks 200 000 chars; O(maxLength) walks
+      // only 50. The 200 ms ceiling is deliberately generous: even on slow CI
+      // the bounded loop should complete in microseconds.
+      const hugeInput = "x".repeat(200_000); // ~200 kB ASCII
+      const maxLen = 50;
+      const start = performance.now();
+      const result = truncateString(hugeInput, maxLen);
+      const elapsed = performance.now() - start;
+      expect(elapsed).toBeLessThan(200);
+      // Sanity-check the output is still correct.
+      expect(result.length).toBe(maxLen);
+      expect(result.endsWith("…")).toBe(true);
+    });
   });
 
   it("buildTruncatedEnvelope reports original length and a fixed-size preview", () => {

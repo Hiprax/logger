@@ -179,8 +179,7 @@ const determineLevel = (statusCode: number): LogLevel => {
 
 /**
  * Truncates a string to fit within `maxLength` total characters, INCLUDING the
- * trailing ellipsis. Returns the input unchanged when it already fits. Uses
- * `Array.from(value).slice(0, maxLength - 1).join("") + "…"` so the result
+ * trailing ellipsis. Returns the input unchanged when it already fits. Result
  * length is exactly `maxLength` Unicode code points for any string longer than
  * the limit. When `maxLength <= 0` (a degenerate caller-supplied limit),
  * returns an empty string. When `maxLength === 1`, returns the single
@@ -206,14 +205,21 @@ const truncateString = (value: string, maxLength: number): string => {
   if (maxLength === 1) {
     return "…";
   }
-  // `Array.from(string)` iterates by Unicode code point (using the string's
-  // built-in `[Symbol.iterator]`), so an emoji-surrogate-pair like `"😀"` is
-  // treated as a single element instead of being torn in half by a code-unit
-  // `.slice(...)`. The cost is one O(n) walk over the input — acceptable for
-  // log-line truncation where `n` is bounded by `maxBodyLength`.
-  return `${Array.from(value)
-    .slice(0, maxLength - 1)
-    .join("")}…`;
+  // Bounded for...of: stops after collecting maxLength - 1 code points so the
+  // cost is O(maxLength) rather than O(input length). `for...of` over a string
+  // iterates by Unicode code point (the same iterator `Array.from` uses), so
+  // emoji surrogate pairs like `"😀"` are never torn in half at a boundary.
+  let result = "";
+  let count = 0;
+  const limit = maxLength - 1;
+  for (const codePoint of value) {
+    if (count >= limit) {
+      break;
+    }
+    result += codePoint;
+    count++;
+  }
+  return `${result}…`;
 };
 
 interface TruncatedBodyEnvelope {
