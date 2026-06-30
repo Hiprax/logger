@@ -1428,7 +1428,7 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5000;
  */
 const shutdownPromises = new WeakMap<winston.Logger, Promise<void>>();
 
-interface ShutdownOptions {
+export interface ShutdownOptions {
   /** Maximum time (in ms) to wait for every transport to flush. Default 5000. */
   timeoutMs?: number;
 }

@@ -239,16 +239,27 @@ const buildTruncatedEnvelope = (serialized: string, maxLength: number): Truncate
   _preview: truncateString(serialized, maxLength),
 });
 
-const serializeBody = (body: unknown, maskKeys?: string[], maxLength = DEFAULT_BODY_LIMIT) => {
+const serializeBody = (
+  body: unknown,
+  maskKeys?: string[] | ReadonlySet<string>,
+  maxLength = DEFAULT_BODY_LIMIT,
+) => {
   if (body === undefined || body === null) {
     return undefined;
   }
 
-  const masked = redactValue(
-    body,
-    new Set((maskKeys ?? []).map((key) => key.toLowerCase())),
-    new WeakSet(),
-  );
+  // Accept either a pre-resolved Set (passed from the construction-time hot
+  // path) or a plain array (used by __requestInternals direct test calls).
+  // `Array.isArray` is the discriminant — it narrows `maskKeys` to `string[]`
+  // in the true branch so `.map()` type-checks cleanly. In the else branch the
+  // value is `ReadonlySet<string> | undefined`; we cast to `Set<string>` (all
+  // ReadonlySet values are Set instances at runtime) and fall back to an empty
+  // Set for the undefined case.
+  const maskSet: Set<string> = Array.isArray(maskKeys)
+    ? new Set(maskKeys.map((key) => key.toLowerCase()))
+    : ((maskKeys as Set<string> | undefined) ?? new Set<string>());
+
+  const masked = redactValue(body, maskSet, new WeakSet());
 
   if (typeof masked === "string") {
     return truncateString(masked, maxLength);
@@ -637,6 +648,13 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
   // arrays/sets for every request.
   const headerMaskSet = resolveMaskHeaderKeys(maskHeaderKeys);
   const queryMaskSet = resolveMaskQueryKeys(maskQueryKeys);
+  // Pre-resolve the body mask set alongside headerMaskSet/queryMaskSet.
+  // An undefined or empty maskBodyKeys collapses to undefined so serializeBody
+  // builds an empty Set only on the internal (array-based) test path.
+  const bodyMaskSet: ReadonlySet<string> | undefined =
+    Array.isArray(maskBodyKeys) && maskBodyKeys.length > 0
+      ? new Set(maskBodyKeys.map((key) => key.toLowerCase()))
+      : undefined;
   const resolvedRedactPaths = Array.isArray(redactPaths) ? redactPaths : [];
 
   return (req: LoggableRequest, res: LoggableResponse, next: LoggableNext) => {
@@ -758,7 +776,9 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
         if (includeRequestBody) {
           // Use the body snapshot taken at middleware entry — see the comment on
           // `bodySnapshot` above for why we do not deep-clone by default.
-          entry.requestBody = serializeBody(bodySnapshot, maskBodyKeys, maxBodyLength);
+          // Pass the pre-resolved Set (built once at construction time) instead
+          // of the raw array so this hot path allocates no new Set per request.
+          entry.requestBody = serializeBody(bodySnapshot, bodyMaskSet, maxBodyLength);
         }
 
         entry.requestHeaders = normalizeHeaders(

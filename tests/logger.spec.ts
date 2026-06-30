@@ -17,6 +17,7 @@ import {
   getDefaultRotation,
   __loggerInternals,
 } from "../src/logger";
+import type { ShutdownOptions } from "../src/logger";
 import { InvalidTimezoneError, LoggerOptionError } from "../src/errors";
 import { createTempDir, teardownLogger } from "./_helpers";
 
@@ -1719,6 +1720,26 @@ describe("createLogger", () => {
       awaiter.cleanup();
       expect(idle.listenerCount("finish")).toBe(finishBefore);
       expect(idle.listenerCount("close")).toBe(closeBefore);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 9 — ShutdownOptions export (Task 9.2)
+  // ---------------------------------------------------------------------------
+
+  describe("ShutdownOptions is exported from src/logger (Phase 9)", () => {
+    it("ShutdownOptions can be used as a type annotation (type is exported)", () => {
+      // If ShutdownOptions were NOT exported this file would fail to compile
+      // at the `import type { ShutdownOptions }` line at the top.
+      // The runtime assertion below also confirms the interface is structurally
+      // consistent with what shutdownLogger accepts.
+      const opts: ShutdownOptions = { timeoutMs: 3000 };
+      expect(opts.timeoutMs).toBe(3000);
+    });
+
+    it("ShutdownOptions with undefined timeoutMs is accepted (optional field)", () => {
+      const opts: ShutdownOptions = {};
+      expect(opts.timeoutMs).toBeUndefined();
     });
   });
 

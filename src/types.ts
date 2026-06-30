@@ -468,7 +468,7 @@ export interface RequestLoggerOptions {
     req: LoggableRequest,
     res: LoggableResponse,
     durationMs: number,
-  ) => Record<string, unknown>;
+  ) => Record<string, unknown> | null | undefined;
   /**
    * When true, includes request headers. Provide an allow list to control which keys to emit.
    */

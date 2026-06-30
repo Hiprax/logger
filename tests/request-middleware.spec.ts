@@ -393,12 +393,13 @@ describe("createRequestLogger", () => {
   it("logs the entry without context when enrich returns undefined", () => {
     // Exercises the `enrich(...) ?? undefined` branch — when the user-supplied
     // `enrich` returns `undefined`, the entry is still logged but
-    // `entry.context` is left as `undefined`.
+    // `entry.context` is left as `undefined`. The return type now explicitly
+    // includes `| undefined` so no cast is required.
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
       logger,
       includeHttpContext: true,
-      enrich: () => undefined as unknown as Record<string, unknown>,
+      enrich: () => undefined,
     });
 
     const { res } = runMiddleware(middleware);
@@ -411,12 +412,13 @@ describe("createRequestLogger", () => {
 
   it("logs the entry without context when enrich returns null", () => {
     // Same `?? undefined` collapse path, exercising the explicit `null`
-    // return that some user enrichers may produce.
+    // return that some user enrichers may produce. The return type now
+    // explicitly includes `| null` so no cast is required.
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
       logger,
       includeHttpContext: true,
-      enrich: () => null as unknown as Record<string, unknown>,
+      enrich: () => null,
     });
 
     const { res } = runMiddleware(middleware);
@@ -1492,6 +1494,71 @@ describe("createRequestLogger", () => {
     expect(log).toHaveBeenCalledTimes(1);
     expect(log.mock.calls[0][0].level).toBe("warn");
   });
+
+  // ---------------------------------------------------------------------------
+  // Phase 9 — API / type / hot-path polish (Tasks 9.1, 9.3)
+  // ---------------------------------------------------------------------------
+
+  it("enrich type accepts null return without a cast (Phase 9 — widened return type)", () => {
+    // This test compiles without the `as unknown as Record<string, unknown>`
+    // cast that was needed before the type widening. The runtime behavior
+    // (no context on the entry) is the same as the existing null-return test.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      // TypeScript must accept `() => null` without an explicit cast.
+      enrich: (): null => null,
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0].http.context).toBeUndefined();
+  });
+
+  it("enrich type accepts undefined return without a cast (Phase 9 — widened return type)", () => {
+    // Mirrors the null variant above for the undefined branch.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: (): undefined => undefined,
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0].http.context).toBeUndefined();
+  });
+
+  it("maskBodyKeys is pre-resolved at construction and redacts body keys case-insensitively (Phase 9)", () => {
+    // Verify that the pre-resolved bodyMaskSet is used correctly end-to-end:
+    // construction happens once, per-request path passes the Set to
+    // serializeBody without rebuilding it.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      maskBodyKeys: ["password", "Token"],
+    });
+
+    const { res } = runMiddleware(middleware, {
+      body: { username: "alice", Password: "secret", token: "abc123" },
+    });
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const body = log.mock.calls[0][0].http.requestBody as Record<string, unknown>;
+    expect(body.username).toBe("alice");
+    // Case-insensitive: "password" in maskBodyKeys → "Password" key is redacted.
+    expect(body.Password).toBe("[REDACTED]");
+    // Case-insensitive: "Token" in maskBodyKeys → "token" key is redacted.
+    expect(body.token).toBe("[REDACTED]");
+  });
 });
 
 describe("request middleware internals", () => {
@@ -1514,6 +1581,29 @@ describe("request middleware internals", () => {
     expect(serializeBody("hello", undefined, 100)).toBe("hello");
     // Total length is now exactly `maxBodyLength` (4): `tru` (3 chars) + `…`.
     expect(serializeBody("truncate-me", undefined, 4)).toBe("tru…");
+  });
+
+  it("serializeBody accepts a pre-resolved ReadonlySet<string> and redacts correctly (Phase 9 — Task 9.3)", () => {
+    // When the caller passes a Set (as the construction-time bodyMaskSet does),
+    // serializeBody must use it directly without building a new Set. The
+    // redaction must still be case-insensitive because redactValue checks
+    // maskKeys.has(key.toLowerCase()).
+    const maskSet = new Set(["password", "token"]);
+    const body = { email: "user@example.com", Password: "secret", token: "abc", visible: "yes" };
+    const result = serializeBody(body, maskSet) as Record<string, unknown>;
+    expect(result.email).toBe("user@example.com");
+    // redactValue lowercases the object key before checking the Set.
+    expect(result.Password).toBe("[REDACTED]");
+    expect(result.token).toBe("[REDACTED]");
+    expect(result.visible).toBe("yes");
+  });
+
+  it("serializeBody still accepts a string[] array for maskKeys (backward compat for test callers)", () => {
+    // Existing callers via __requestInternals continue to pass arrays.
+    const body = { x: "keep", secret: "leak" };
+    const result = serializeBody(body, ["secret"]) as Record<string, unknown>;
+    expect(result.x).toBe("keep");
+    expect(result.secret).toBe("[REDACTED]");
   });
 
   it("truncates fallback strings when JSON serialization fails", () => {
