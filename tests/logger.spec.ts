@@ -104,6 +104,32 @@ describe("createLogger", () => {
     teardownLogger(logger);
   });
 
+  it("normalizes an uppercase maxFiles day suffix to lowercase before the transport (F8)", () => {
+    // `file-stream-rotator` (the engine behind `winston-daily-rotate-file`)
+    // detects the day suffix case-SENSITIVELY (`max_logs.toString().substr(-1)
+    // === 'd'`), while `MAX_FILES_PATTERN` and the public JSDoc both document
+    // `"14D"` as accepted "14 days" input. Without normalization, "14D" would
+    // pass validation but silently behave as a 14-FILE retention window
+    // instead of 14 days. Both the module-scoped and the global rotating-file
+    // transport must receive the normalized lowercase value.
+    const root = createTempDir();
+    const logger = createLogger({
+      logDirectory: root,
+      includeConsole: false,
+      rotation: { maxFiles: "14D" },
+      globalRotation: { maxFiles: "30D" },
+    });
+
+    const rotating = logger.transports.filter(
+      (transport): transport is DailyRotateFile => transport instanceof DailyRotateFile,
+    );
+
+    expect(rotating).toHaveLength(2);
+    expect(rotating[0].options.maxFiles).toBe("14d");
+    expect(rotating[1].options.maxFiles).toBe("30d");
+    teardownLogger(logger);
+  });
+
   it("supports extra timezones and renders enriched messages", () => {
     const root = createTempDir();
     const messages: string[] = [];
@@ -833,6 +859,72 @@ describe("createLogger", () => {
       teardownLogger(first);
     });
 
+    it("does not warn when rotation.maxFiles differs only by day-suffix case (F8)", () => {
+      // "14d" and "14D" normalize to the same transport-facing value, so the
+      // registry signature must treat them as equal — otherwise this would be
+      // a false-positive conflict warning for two functionally identical
+      // configs.
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({ ...baseOpts(root), rotation: { maxFiles: "14d" } });
+      const second = createLogger({ ...baseOpts(root), rotation: { maxFiles: "14D" } });
+
+      expect(second).toBe(first);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("warns when maskMetaKeys differs and returns the cached instance (F9)", () => {
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({ ...baseOpts(root), maskMetaKeys: ["password"] });
+      const second = createLogger({ ...baseOpts(root), maskMetaKeys: ["token"] });
+
+      expect(second).toBe(first);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const message = String(warnSpy.mock.calls[0][0]);
+      expect(message).toContain("conflicting options");
+      expect(message).toContain("maskMetaKeys");
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("does not warn when maskMetaKeys differs only by order or case (F9)", () => {
+      // ["Password", "TOKEN"] and ["token", "password"] normalize to the same
+      // lowercased+sorted signature, so this must NOT be a false-positive
+      // conflict warning for two functionally identical redaction configs.
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({ ...baseOpts(root), maskMetaKeys: ["Password", "TOKEN"] });
+      const second = createLogger({ ...baseOpts(root), maskMetaKeys: ["token", "password"] });
+
+      expect(second).toBe(first);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("does not warn when the same non-empty maskMetaKeys array is passed twice (F9)", () => {
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({ ...baseOpts(root), maskMetaKeys: ["password", "token"] });
+      const second = createLogger({ ...baseOpts(root), maskMetaKeys: ["password", "token"] });
+
+      expect(second).toBe(first);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
     it("does not warn a second time when the same mismatched options recur", () => {
       const root = createTempDir();
       const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -1438,6 +1530,9 @@ describe("createLogger", () => {
         globalRotation: { maxSize: "20m", maxFiles: "14d" },
         escapeMessageNewlines: false,
         format: "pretty" as const,
+        maskMetaKeys: [] as string[],
+        colorize: { level: true, message: true },
+        captureUncaught: true,
       };
       const a = __loggerInternals.buildOptionsSignature({
         ...base,
@@ -1448,6 +1543,37 @@ describe("createLogger", () => {
         extraTimezones: ["America/New_York", "Europe/London"],
       });
       expect(a).toBe(b);
+    });
+
+    it("buildOptionsSignature includes maskMetaKeys/colorize/captureUncaught and sorts+lowercases maskMetaKeys (F9)", () => {
+      const base = {
+        level: "info" as const,
+        consoleLevel: "info" as const,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        globalModuleName: "all-logs",
+        extraTimezones: [] as string[],
+        rotation: { maxSize: "20m", maxFiles: "14d" },
+        globalRotation: { maxSize: "20m", maxFiles: "14d" },
+        escapeMessageNewlines: false,
+        format: "pretty" as const,
+        colorize: { level: true, message: true },
+        captureUncaught: true,
+      };
+      const a = __loggerInternals.buildOptionsSignature({
+        ...base,
+        maskMetaKeys: ["password", "Token"],
+      });
+      const b = __loggerInternals.buildOptionsSignature({
+        ...base,
+        maskMetaKeys: ["TOKEN", "Password"],
+      });
+
+      expect(a).toBe(b);
+      expect(a).toContain('"maskMetaKeys":["password","token"]');
+      expect(a).toContain('"colorize":{"level":true,"message":true}');
+      expect(a).toContain('"captureUncaught":true');
     });
 
     it("diffSignatures lists divergent top-level keys", () => {
@@ -1543,6 +1669,7 @@ describe("createLogger", () => {
       logger.info("flush me");
 
       await expect(shutdownLogger(logger)).resolves.toBeUndefined();
+      teardownLogger(logger);
     });
 
     it("rejects with a timeout error when a transport never finishes", async () => {
@@ -1573,6 +1700,7 @@ describe("createLogger", () => {
       await expect(shutdownLogger(logger, { timeoutMs: 50 })).rejects.toThrow(
         /shutdownLogger timed out after 50ms/,
       );
+      teardownLogger(logger);
     });
 
     it("is idempotent — calling shutdownLogger twice does not throw", async () => {
@@ -1597,6 +1725,7 @@ describe("createLogger", () => {
       expect(second).toBe(first);
       await expect(first).resolves.toBeUndefined();
       await expect(shutdownLogger(logger)).resolves.toBeUndefined();
+      teardownLogger(logger);
     });
 
     it("shutdownAllLoggers shuts down every cached logger", async () => {
@@ -1632,6 +1761,70 @@ describe("createLogger", () => {
       expect(a).not.toBe(b);
 
       await expect(shutdownAllLoggers()).resolves.toBeUndefined();
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    // -------------------------------------------------------------------------
+    // Phase 7 — shutdownAllLoggers partial-timeout rejection + independence
+    // (Task 7.1, closes F10)
+    // -------------------------------------------------------------------------
+
+    it("shutdownAllLoggers rejects when one logger stalls, while the healthy logger flushes independently (Phase 7)", async () => {
+      // Same StalledTransport pattern as the single-logger timeout test above,
+      // registered alongside a normal Stream-backed logger so BOTH land in the
+      // module-level registry that shutdownAllLoggers() walks via Promise.all.
+      class StalledAllTransport extends Transport {
+        public name = "stalled-all";
+        public log = jest.fn((_info: unknown, callback?: () => void) => callback?.());
+        public _final = (_callback: (err?: Error | null) => void): void => {
+          // Intentionally never invoke the callback — this transport never
+          // reaches the `finish` state, so its shutdownLogger() call must time
+          // out at the 50ms deadline below.
+        };
+      }
+      const stalled = new StalledAllTransport();
+      const stream = new PassThrough();
+
+      const healthy = createLogger({
+        moduleName: "shutdown-all-healthy",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      const broken = createLogger({
+        moduleName: "shutdown-all-broken",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [stalled as unknown as winston.transport],
+      });
+      // Sanity: both got cached as distinct registry entries.
+      expect(healthy).not.toBe(broken);
+
+      // shutdownAllLoggers() is `Promise.all(...)` under the hood — it MUST
+      // reject as soon as the broken logger's own 50ms timeout fires. This
+      // pins the documented "can reject / timeout is independent per logger"
+      // contract so a future `Promise.allSettled` refactor can't silently
+      // flip it while staying green.
+      await expect(shutdownAllLoggers({ timeoutMs: 50 })).rejects.toThrow(
+        /shutdownLogger timed out after 50ms/,
+      );
+
+      // Independence proof: shutdownAllLoggers() issued the healthy logger's
+      // OWN shutdownLogger() call internally, and that call already resolved
+      // (the Stream transport flushes well within 50ms) — its resolved
+      // promise is cached in the per-logger WeakMap. A fresh call here MUST
+      // resolve immediately from that cached entry rather than reissuing
+      // logger.end() (which would hang: the Stream's `finish` event already
+      // fired once and a Writable does not re-emit it on a second `end()`).
+      // If shutdownAllLoggers had been refactored to discard per-logger state
+      // on rejection, this call would hang until the default 5000ms timeout
+      // instead of resolving immediately.
+      await expect(shutdownLogger(healthy)).resolves.toBeUndefined();
+      teardownLogger(healthy);
+      teardownLogger(broken);
     });
 
     it("removes finish/close listeners after a timeout-rejected shutdown", async () => {
@@ -1691,6 +1884,7 @@ describe("createLogger", () => {
       await expect(shutdownLogger(logger, { timeoutMs: 50 })).rejects.toThrow(
         /shutdownLogger timed out after 50ms/,
       );
+      teardownLogger(logger);
     });
 
     it("awaitTransportFlush exposes a cleanup() that detaches both listeners", () => {
@@ -1759,6 +1953,7 @@ describe("createLogger", () => {
       // (This simulates the transport eventually completing its flush.)
       stalled.emit("finish");
       await expect(second).resolves.toBeUndefined();
+      teardownLogger(logger);
     });
 
     it("successful shutdown remains idempotent: second and third calls return the same promise (Phase 10)", async () => {
@@ -1787,6 +1982,7 @@ describe("createLogger", () => {
       const third = shutdownLogger(logger);
       expect(third).toBe(first);
       await expect(third).resolves.toBeUndefined();
+      teardownLogger(logger);
     });
 
     it("concurrent same-tick calls share one in-flight promise (Phase 10)", async () => {
@@ -1813,6 +2009,7 @@ describe("createLogger", () => {
       expect(p3).toBe(p1);
 
       await expect(Promise.all([p1, p2, p3])).resolves.toEqual([undefined, undefined, undefined]);
+      teardownLogger(logger);
     });
   });
 
@@ -2169,6 +2366,72 @@ describe("createLogger", () => {
       expect(rendered).toContain('"token": "abc123"');
       expect(rendered).toContain('"email": "u@example.com"');
       expect(rendered).not.toContain("[REDACTED]");
+    });
+
+    // -----------------------------------------------------------------------
+    // Phase 1 — Leak-safe deep redaction: end-to-end class-instance masking
+    // -----------------------------------------------------------------------
+
+    it("pretty mode: redacts a masked key stored on a class-instance metadata value", () => {
+      // F1 fix: the downstream JSON.stringify in the printf formatter enumerates
+      // own enumerable keys of class instances, so without the fix a secret
+      // stored as `instance.password` would leak into the log line even when
+      // `password ∈ maskMetaKeys`.
+      class UserMeta {
+        constructor(
+          public readonly email: string,
+          public readonly password: string,
+        ) {}
+      }
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-class-pretty",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      logger.info("Login", new UserMeta("alice@example.com", "topsecret"));
+      teardownLogger(logger);
+      const rendered = chunks.join("");
+
+      expect(rendered).not.toContain("topsecret");
+      expect(rendered).toContain("[REDACTED]");
+      expect(rendered).toContain("alice@example.com");
+    });
+
+    it("json mode: redacts a masked key stored on a class-instance metadata value", () => {
+      class UserMeta {
+        constructor(
+          public readonly email: string,
+          public readonly password: string,
+        ) {}
+      }
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-class-json",
+        format: "json",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      logger.info("Login", new UserMeta("alice@example.com", "topsecret"));
+      teardownLogger(logger);
+      const output = chunks.join("").trim();
+
+      expect(output).not.toContain("topsecret");
+      expect(output).toContain("[REDACTED]");
+      // Must still be valid JSON.
+      const parsed = JSON.parse(output) as Record<string, unknown>;
+      expect(parsed.password).toBe("[REDACTED]");
+      expect(parsed.email).toBe("alice@example.com");
     });
   });
 
@@ -2661,6 +2924,17 @@ describe("createLogger", () => {
       ).not.toThrow();
     });
 
+    it("normalizeMaxFiles lowercases a string day suffix regardless of input case (F8)", () => {
+      expect(__loggerInternals.normalizeMaxFiles("14D")).toBe("14d");
+      expect(__loggerInternals.normalizeMaxFiles("14d")).toBe("14d");
+      // Bare numeric counts have no suffix to normalize but still round-trip.
+      expect(__loggerInternals.normalizeMaxFiles("30")).toBe("30");
+    });
+
+    it("normalizeMaxFiles passes a non-string value through unchanged", () => {
+      expect(__loggerInternals.normalizeMaxFiles(undefined)).toBeUndefined();
+    });
+
     it("isValidLogLevel returns true for valid levels and false otherwise", () => {
       expect(__loggerInternals.isValidLogLevel("info")).toBe(true);
       expect(__loggerInternals.isValidLogLevel("silly")).toBe(true);
@@ -3088,6 +3362,71 @@ describe("createLogger", () => {
 
       expect(clockCalls).toBe(1);
     });
+
+    // -------------------------------------------------------------------------
+    // Phase 7 — JSON-mode circular references end-to-end (Task 7.2, closes F12)
+    // -------------------------------------------------------------------------
+
+    it("json mode WITH maskMetaKeys redacts a circular metadata object via buildMetaRedactor's WeakSet (Phase 7)", () => {
+      // `circular` is passed AS the metadata object, so winston merges its own
+      // enumerable keys directly onto `info` — `info.self === circular` and
+      // `circular.self === circular` form a genuine cycle. With a non-empty
+      // `maskMetaKeys`, `buildMetaRedactor` runs the shared `redactValue(...)`
+      // over every metadata key BEFORE `winston.format.json()` ever sees the
+      // object, so the cycle is resolved into the literal string "[Circular]"
+      // by OUR WeakSet-based detection (src/redact.ts), not by
+      // safe-stable-stringify's own handling (exercised by the sibling test
+      // below, without maskMetaKeys).
+      const circular: Record<string, unknown> = { keep: 1 };
+      circular.self = circular;
+
+      let output = "";
+      expect(() => {
+        output = renderJsonLine(
+          "json-circular-masked",
+          (logger) => {
+            logger.info("circular", circular);
+          },
+          { maskMetaKeys: ["password"] },
+        );
+      }).not.toThrow();
+
+      const line = output.trim();
+      expect(() => JSON.parse(line)).not.toThrow();
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+
+      expect(line).toContain('"[Circular]"');
+      expect(parsed.keep).toBe(1);
+      expect(parsed.self).toEqual({ keep: 1, self: "[Circular]" });
+    });
+
+    it("json mode WITHOUT maskMetaKeys handles a circular metadata object via winston.format.json()'s safe-stable-stringify (Phase 7)", () => {
+      // Same circular payload, but `maskMetaKeys` is omitted entirely so
+      // `buildMetaRedactor` takes its documented no-op pass-through branch
+      // (early return on `!maskMetaKeys || maskMetaKeys.size === 0`). The raw,
+      // still-circular `info` object reaches `winston.format.json()` untouched,
+      // so this exercises `safe-stable-stringify`'s OWN circular-reference
+      // handling — its default `circularValue` is also the literal
+      // "[Circular]" (confirmed in node_modules/safe-stable-stringify/index.js),
+      // so the two code paths are expected to produce equivalent output.
+      const circular: Record<string, unknown> = { keep: 1 };
+      circular.self = circular;
+
+      let output = "";
+      expect(() => {
+        output = renderJsonLine("json-circular-unmasked", (logger) => {
+          logger.info("circular", circular);
+        });
+      }).not.toThrow();
+
+      const line = output.trim();
+      expect(() => JSON.parse(line)).not.toThrow();
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+
+      expect(line).toContain('"[Circular]"');
+      expect(parsed.keep).toBe(1);
+      expect(parsed.self).toEqual({ keep: 1, self: "[Circular]" });
+    });
   });
 
   describe("createNoopLogger", () => {
@@ -3189,6 +3528,62 @@ describe("createLogger", () => {
         loggingMode: "always",
       });
       expect(typeof middleware).toBe("function");
+    });
+
+    it("is not thenable — then/catch/finally are undefined (F2)", () => {
+      const logger = createNoopLogger() as unknown as Record<string, unknown>;
+      expect(typeof logger["then"]).toBe("undefined");
+      expect(typeof logger["catch"]).toBe("undefined");
+      expect(typeof logger["finally"]).toBe("undefined");
+    });
+
+    it("await createNoopLogger() resolves to the logger without hanging (F2)", async () => {
+      const logger = createNoopLogger();
+      // Race the await against a deadline. If then were a function the
+      // resolution would never be called and the timer would win.
+      const DEADLINE_MS = 500;
+      const result = await Promise.race([
+        new Promise<typeof logger>((resolve) => {
+          // nextTick ensures this fires on the next iteration — fast enough
+          // to beat the deadline unless the engine is following a thenable.
+          process.nextTick(() => resolve(logger));
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("await hung — createNoopLogger() appears thenable")),
+            DEADLINE_MS,
+          ),
+        ),
+      ]);
+      expect(result).toBe(logger);
+    });
+
+    it("unknown-method chain returns the no-op logger for forward-compat (F3)", () => {
+      const logger = createNoopLogger();
+      const rec = logger as unknown as Record<string, (...args: unknown[]) => unknown>;
+      // The return value of any unknown method must be the logger itself
+      // so callers can chain: logger.someFuture().info("x")
+      const ret = rec.someFutureWinstonMethod();
+      expect(ret).toBe(logger);
+      // Full chain: someFuture().info("x") must not throw
+      const chained = rec.someFutureWinstonMethod2() as typeof logger;
+      expect(() => chained.info("chained")).not.toThrow();
+    });
+
+    it("JSON.stringify returns a valid object and keeps the field in a wrapper (F4)", () => {
+      const logger = createNoopLogger();
+      const serialized = JSON.stringify(logger);
+      // Must produce a string, not undefined
+      expect(typeof serialized).toBe("string");
+      const parsed = JSON.parse(serialized as string) as Record<string, unknown>;
+      expect(parsed.type).toBe("@hiprax/logger");
+      expect(parsed.level).toBe("silent");
+      expect(parsed.transports).toBe(0);
+      // Must not be silently dropped when embedded in a wrapper object
+      const wrapped = JSON.stringify({ logger });
+      const parsedWrapped = JSON.parse(wrapped) as { logger: Record<string, unknown> };
+      expect(parsedWrapped.logger).toBeDefined();
+      expect(parsedWrapped.logger.level).toBe("silent");
     });
   });
 

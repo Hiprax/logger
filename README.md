@@ -16,6 +16,7 @@ Fully typed, production-grade logging toolkit for Node.js applications. Built on
 
 - [Features](#features)
 - [Installation](#installation)
+- [TypeScript Module Resolution](#typescript-module-resolution)
 - [Quick Start](#quick-start)
 - [API](#api)
   - [createLogger](#createloggeroptions-loggeroptions)
@@ -56,6 +57,21 @@ npm install @hiprax/logger
 ```
 
 > The package ships with precompiled dual builds (`.mjs` for ESM, `.cjs` for CommonJS). No transpilation is required in consuming projects.
+
+## TypeScript Module Resolution
+
+The `exports` map declares **per-condition** type declarations so both module systems resolve a `.d.ts` file that actually matches their runtime shape:
+
+```json
+"exports": {
+  ".": {
+    "import": { "types": "./dist/index.d.ts", "default": "./dist/index.mjs" },
+    "require": { "types": "./dist/index.d.cts", "default": "./dist/index.cjs" }
+  }
+}
+```
+
+Under `"moduleResolution": "node16"` or `"nodenext"` (the TypeScript settings that mirror Node's real ESM/CJS dual-resolution behavior), `require("@hiprax/logger")` resolves the CommonJS-shaped `dist/index.d.cts` declaration and `import ... from "@hiprax/logger"` resolves the ESM `dist/index.d.ts` declaration — both are emitted by `npm run build`. Previously the package only published a single top-level `types` field pointing at the ESM declaration, which made CJS consumers under `node16`/`nodenext` fail to compile with `TS1479 ("the current file is a CommonJS module... cannot be imported")`. Projects using older `moduleResolution` settings (`"node"`, `"bundler"`) are unaffected — they continue to resolve via the legacy top-level `types` field.
 
 ## Quick Start
 
@@ -100,7 +116,7 @@ Creates a fully configured Winston logger with safe defaults, rotating files, UT
 | `clock`                | `() => Date`          | `() => new Date()`      | Optional clock injection point used by the timestamp formatter. The clock is consulted at log-call time (not flush time), so async transports / queued writes / back-pressured streams cannot skew the rendered timestamp. Primarily intended for deterministic tests; production code should leave this option unset. |
 | `captureUncaught`      | `boolean`             | `true`                  | When `true`, sets `handleExceptions: true` AND `handleRejections: true` on whichever transport(s) exist — preferring file transports so the trace is persisted. Falls back to the Console transport when no file transports are enabled, then to `additionalTransports` when neither console nor files are enabled. When `false`, no transport is given exception/rejection handling. **Note:** the underlying winston logger always uses `exitOnError: false`, so once an uncaught exception is routed through the configured transport(s) the process is **NOT** terminated — install your own `process.on("uncaughtException", () => process.exit(1))` handler if you want a fatal exception to crash the process. |
 | `colorize`             | `boolean \| { message?: boolean; level?: boolean; all?: boolean }` | `{ level: true, message: true }` | Controls ANSI colorization of the console transport. `false` disables colorization entirely; `true` colors both the `[LEVEL]` token and the message body; an object honors `level` / `message` flags independently, with `all: true` overriding both. File transports are never colorized. |
-| `maskMetaKeys`         | `string[]`            | `[]`                    | Metadata keys whose values are replaced with `[REDACTED]` before serialization. Matched **case-insensitively** and applied **deeply** (arrays + nested objects). Targets the metadata object passed as the second-or-later argument to `logger.info(...)` / `logger.warn(...)` / etc. — for example, `logger.info("Login", { password: "topsecret" })` with `maskMetaKeys: ["password"]` writes `"password": "[REDACTED]"`. Empty by default for backward compatibility. The redaction runs in BOTH file and console pipelines. |
+| `maskMetaKeys`         | `string[]`            | `[]`                    | Metadata keys whose values are replaced with `[REDACTED]` before serialization. Matched **case-insensitively** and applied **deeply** (arrays + nested objects, including the enumerable own fields of class/`Error` instances). Targets the metadata object passed as the second-or-later argument to `logger.info(...)` / `logger.warn(...)` / etc. — for example, `logger.info("Login", { password: "topsecret" })` with `maskMetaKeys: ["password"]` writes `"password": "[REDACTED]"`. Empty by default for backward compatibility. The redaction runs in BOTH file and console pipelines. **Redaction boundary:** values that define their own `toJSON()` (`Date`, `URL`, custom serializable classes) or carry no enumerable own keys (`Map`, `Set`, `RegExp`) are serialized via that method/built-in and are **not** key-redacted — normalize to a plain object first if those need masking. |
 | `format`               | `"pretty" \| "json"`  | `"pretty"`              | Output format for BOTH the file pipeline and the console pipeline. `"pretty"` (default) emits the existing human-readable printf form. `"json"` emits one JSON object per line (NDJSON / JSON-Lines) suitable for log shippers like Datadog, Loki, ELK, Splunk, and Vector — see [JSON Output for Log Shippers](#json-output-for-log-shippers) below. |
 | `escapeMessageNewlines` | `boolean`            | `false`                 | When `true`, replaces `\n` / `\r` in string messages with the visible escape sequences `\\n` / `\\r` BEFORE the printf renders the line. Mitigates log-injection forging via untrusted user input — see [Security Notes](#security-notes). |
 
@@ -271,7 +287,7 @@ The override MUST be a `bigint` produced by `process.hrtime.bigint()`. Any other
 | `includeRequestHeaders`  | `boolean \| string[]`                               | `false`                               | `true` for all headers, or an array of allowed header names.                              |
 | `includeResponseHeaders` | `boolean \| string[]`                               | `false`                               | Same as above for response headers.                                                       |
 | `includeRequestBody`     | `boolean`                                           | `false`                               | Logs parsed request body (with redaction support).                                        |
-| `maskBodyKeys`           | `string[]`                                          | `[]`                                  | Keys replaced with `[REDACTED]`. Applies deeply and case-insensitively, including arrays. |
+| `maskBodyKeys`           | `string[]`                                          | `[]`                                  | Keys replaced with `[REDACTED]`. Applies deeply and case-insensitively, including arrays and the enumerable own fields of class/`Error` instances. Values with a custom `toJSON()` (`Date`, `URL`) or no enumerable keys (`Map`, `Set`) pass through un-redacted — use `redactPaths` for those. |
 | `maskHeaderKeys`         | `string[] \| false`                                 | safe defaults (see below)             | Header values to redact in BOTH request and response headers (case-insensitive). Pass `false` to opt out. |
 | `maskQueryKeys`          | `string[] \| false`                                 | safe defaults (see below)             | Query-string param values to redact in `req.url` / `req.originalUrl` (case-insensitive). Pass `false` to opt out. |
 | `redactPaths`            | `string[]`                                          | `[]`                                  | Dot-paths into the resolved entry for surgical redaction (e.g. `["body.user.password"]`). Must be an array of strings; a non-array (e.g. the bare string `"body.password"`) throws `RequestLoggerOptionError({ code: "INVALID_MASK" })`. |
@@ -582,14 +598,14 @@ narrowly scoped `redactPaths` API.
 - All filesystem interactions are sandboxed to the configured log directory.
 - Module names are sanitized to prevent path traversal (dangerous characters are replaced with hyphens).
 - Timezones are validated against the Moment timezone database before use.
-- **Body redaction (`maskBodyKeys`)**: opt-in array. Replaces matching keys with `[REDACTED]` recursively in nested objects and arrays. Matched case-insensitively. Circular references are safely handled (replaced with `[Circular]`).
+- **Body redaction (`maskBodyKeys`)**: opt-in array. Replaces matching keys with `[REDACTED]` recursively in nested objects and arrays, including the enumerable own fields of class/`Error` instances. Matched case-insensitively. Circular references are safely handled (replaced with `[Circular]`). **Redaction boundary:** values with a custom `toJSON()` (`Date`, `URL`) or zero enumerable keys (`Map`, `Set`, `RegExp`) are passed through by the serializer untouched — use `redactPaths` to target those surgically.
 - **Header redaction (`maskHeaderKeys`)**: applied to BOTH request and response headers AFTER the `includeRequestHeaders` / `includeResponseHeaders` allow-list filter. Default mask list (opt-out by passing `false`):
   - `authorization`
   - `cookie`
   - `set-cookie`
   - `x-api-key`
   - `proxy-authorization`
-- **URL query redaction (`maskQueryKeys`)**: parses the logged `req.originalUrl` / `req.url` with `URLSearchParams`, replaces matching parameter values with `[REDACTED]`, and re-stringifies. Handles both absolute and relative URLs. Default mask list (opt-out by passing `false`):
+- **URL query redaction (`maskQueryKeys`)**: edits the logged `req.originalUrl` / `req.url` query string **in place** — it locates each `key=value` pair in the raw query and replaces only a matched parameter's value with the literal `[REDACTED]`, leaving every other byte untouched. Sibling-parameter encoding (`%20`, `%5B`/`%5D`, `%2B`), the `//host` authority of protocol-relative URLs, the scheme/host of absolute URLs, and the URL fragment are all preserved exactly; parameters are never re-ordered or re-encoded, and the function never throws. Handles both absolute and relative URLs. Default mask list (opt-out by passing `false`):
   - `token`, `access_token`
   - `api_key`, `apikey`, `key`
   - `code` (covers OAuth callback codes)

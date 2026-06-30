@@ -10,19 +10,32 @@
  * - Walks arrays, recursing into each element.
  * - For PLAIN objects (created via `{}` / `Object.create(null)`), replaces
  *   values whose key (lowercased) is in `maskKeys` with the literal string
- *   `"[REDACTED]"`. Other values are recursed into.
- * - For NON-PLAIN objects (built-in classes like `Date`, `Map`, `Set`,
- *   `RegExp`, `URL`, `Error`, `Buffer`, `Promise`, typed arrays, custom class
- *   instances, etc.) the value is returned AS-IS. The previous implementation
- *   walked these via `Object.entries`, which returns `[]` for built-ins whose
- *   data lives behind non-enumerable accessors (`Date#getTime`,
- *   `Map#entries`, `Buffer#toString`, the `RegExp` source/flags getters,
- *   etc.), silently rebuilding them as the empty object `{}`. The "is plain
- *   object" guard is the standard
- *   `Object.getPrototypeOf(value) === Object.prototype || === null` check —
- *   anything else passes through untouched so timestamps / IDs as `Map` /
- *   sets of tags / regex patterns / `URL` instances reach the log line with
- *   their original shape intact.
+ *   `"[REDACTED]"`. Other values are recursed into. Always returns a fresh
+ *   plain object so callers that rely on `out !== input` identity are not
+ *   affected.
+ * - For NON-PLAIN objects the handling depends on whether the instance
+ *   carries key-addressable secrets in its own enumerable fields:
+ *   - **Pass-through built-ins** — returned AS-IS (same reference, NOT added
+ *     to `seen`) when any of the following is true:
+ *     - The value defines a custom `toJSON` method (`Date`, `URL`, `Buffer`,
+ *       moment, etc. — the serializer will call `toJSON` and the result is a
+ *       plain value that cannot be key-redacted here).
+ *     - The value is an `ArrayBuffer` view (typed arrays, `DataView`,
+ *       `Buffer`) — data lives in the underlying memory, not in enumerable
+ *     own keys.
+ *     - The value has zero enumerable own string keys (`Map`, `Set`, `RegExp`,
+ *       `Promise`, a vanilla `Error` with no extra props) — no key can match.
+ *     Not adding these to `seen` fixes a latent bug where the same built-in
+ *     referenced by two keys (e.g. `{ a: date, b: date }`) would yield
+ *     `"[Circular]"` on the second occurrence.
+ *   - **Data-bearing instances** (class DTOs, `Error` subclasses with
+ *     enumerable props) — walked via their own enumerable string keys. Keys
+ *     whose lowercased form is in `maskKeys` are replaced with `"[REDACTED]"`;
+ *     others are recursed into. Returns the **original by identity** when
+ *     nothing changed (no key matched and every recursed child is `===` its
+ *     original). Returns a fresh **plain** object only when a redaction
+ *     actually occurred; downstream is always JSON serialization, so a plain
+ *     rebuild is output-equivalent.
  * - Detects circular references via a per-call `WeakSet` and writes the
  *   literal string `"[Circular]"` in their place — the function never throws
  *   on a self-referencing object.
@@ -35,8 +48,15 @@
  *   object so downstream `JSON.stringify`, `for-in`, and `Object.entries`
  *   consumers behave identically to pre-hardening.
  *
- * The result is always a fresh object/array (or the original built-in value);
- * the input is never mutated.
+ * **Redaction boundary (limitation).** Values that define their own `toJSON()`
+ * (including `Date`, `URL`, and any class with a custom serializer) are
+ * returned by identity and NOT key-redacted — the downstream serializer will
+ * invoke `toJSON` and the resulting primitive bypasses key inspection. Use
+ * `redactPaths` for surgical path-based replacement of such values, or
+ * normalize them to a plain object before passing to the logger.
+ *
+ * The result is always a fresh object/array (or the original value when no
+ * redaction is needed); the input is never mutated.
  */
 export const REDACTED = "[REDACTED]";
 
@@ -59,29 +79,59 @@ export const redactValue = (
     return value;
   }
 
-  if (seen.has(value as object)) {
-    return "[Circular]";
-  }
-  seen.add(value as object);
-
   if (Array.isArray(value)) {
+    if (seen.has(value as object)) return "[Circular]";
+    seen.add(value as object);
     return value.map((item) => redactValue(item, maskKeys, seen));
   }
 
-  // "Is plain object" guard. Built-in classes (`Date`, `Map`, `Set`,
-  // `RegExp`, `URL`, `Error`, `Buffer`, `Promise`, typed arrays, custom
-  // class instances) expose their data through non-enumerable accessors —
-  // `Object.entries(...)` returns `[]` for them and the rebuild below would
-  // silently produce `{}`. The standard "is plain object" check (prototype
-  // is `Object.prototype` OR `null`) lets the recursion proceed for plain
-  // objects only; everything else passes through untouched so timestamps,
-  // maps, sets, regex patterns, URLs, and Error instances reach the log line
-  // with their original shape and `toJSON` / `Symbol.toPrimitive` behavior
-  // intact.
   const proto = Object.getPrototypeOf(value);
-  if (proto !== null && proto !== Object.prototype) {
-    return value;
+  const isPlain = proto === null || proto === Object.prototype;
+
+  if (!isPlain) {
+    // Non-plain object (class instance, Error subclass, built-in, etc.)
+    //
+    // Pass built-ins through by identity WITHOUT adding to `seen`. This fixes
+    // a latent bug where the same Date/URL/etc. referenced by two keys in an
+    // outer plain object would yield "[Circular]" on the second reference.
+    const hasToJSON = typeof (value as Record<string, unknown>).toJSON === "function";
+    if (hasToJSON || ArrayBuffer.isView(value) || Object.keys(value as object).length === 0) {
+      return value;
+    }
+
+    // Data-bearing instance (class DTO, Error subclass with enumerable props).
+    // Walk own enumerable string keys, redact matched ones, recurse into the
+    // rest. Return the original by identity when nothing changed so the
+    // documented pass-through for instances holding no masked key is preserved.
+    if (seen.has(value as object)) return "[Circular]";
+    seen.add(value as object);
+
+    const ownKeys = Object.keys(value as Record<string, unknown>);
+    let changed = false;
+    const result: Record<string, unknown> = {};
+    for (const key of ownKeys) {
+      if (FORBIDDEN_KEYS.has(key)) {
+        changed = true; // dropping a forbidden key is a structural change
+        continue;
+      }
+      const original = (value as Record<string, unknown>)[key];
+      if (maskKeys.has(key.toLowerCase())) {
+        result[key] = REDACTED;
+        changed = true;
+      } else {
+        const recursed = redactValue(original, maskKeys, seen);
+        result[key] = recursed;
+        if (recursed !== original) changed = true;
+      }
+    }
+
+    return changed ? result : value;
   }
+
+  // Plain object branch — always rebuilds a fresh plain object so callers that
+  // rely on `out !== input` identity continue to work.
+  if (seen.has(value as object)) return "[Circular]";
+  seen.add(value as object);
 
   return Object.entries(value as Record<string, unknown>).reduce<Record<string, unknown>>(
     (acc, [key, val]) => {

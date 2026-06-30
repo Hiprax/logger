@@ -38,8 +38,11 @@ const VALID_LOG_LEVELS = Object.freeze([
  *   — `getMaxSize("20mb")` returns `null` and rotation is silently disabled.
  * - {@link MAX_FILES_PATTERN} — `^\d+d?$` (case-insensitive). Matches bare
  *   numeric file counts (`"7"`, `"500"`) and day-suffixed retention windows
- *   (`"14d"`, `"30d"`). Size suffixes are NOT accepted — `parseInt("20m")`
- *   silently coerces to `20` and the rotation interprets it as "20 files".
+ *   (`"14d"`, `"30d"`, `"14D"`). Size suffixes are NOT accepted — `parseInt("20m")`
+ *   silently coerces to `20` and the rotation interprets it as "20 files". An
+ *   uppercase-`D` day suffix is accepted here and then lowercased by
+ *   {@link normalizeMaxFiles} before reaching `winston-daily-rotate-file`,
+ *   whose upstream parser checks the suffix case-sensitively.
  */
 const MAX_SIZE_PATTERN = /^(?:0\.)?\d+[kmg]$/i;
 const MAX_FILES_PATTERN = /^\d+d?$/i;
@@ -133,6 +136,23 @@ const validateRotationStrategy = (label: string, rotation: RotationStrategy | un
   validateRotationField(`${label}.maxSize`, rotation.maxSize, MAX_SIZE_PATTERN);
   validateRotationField(`${label}.maxFiles`, rotation.maxFiles, MAX_FILES_PATTERN);
 };
+
+/**
+ * Lowercases a string `maxFiles` value before it reaches
+ * `winston-daily-rotate-file`. {@link MAX_FILES_PATTERN} (and the public
+ * `RotationStrategy.maxFiles` JSDoc) document the day suffix as
+ * case-insensitive — `"14D"` is accepted as "14 days" — but the upstream
+ * `file-stream-rotator` parser checks for the suffix with a case-SENSITIVE
+ * `max_logs.toString().substr(-1) === 'd'`. Left un-normalized, `"14D"`
+ * passes validation yet silently falls through to upstream's file-COUNT
+ * branch (kept as 14 files, not pruned by age) — the opposite of what the
+ * docs promise. Normalizing here (rather than rejecting uppercase `D` at
+ * validation time) keeps every previously-accepted value working, matching
+ * how upstream already lowercases the sibling `maxSize` suffix internally.
+ * Non-string values (`undefined`) pass through unchanged.
+ */
+const normalizeMaxFiles = (maxFiles: string | undefined): string | undefined =>
+  typeof maxFiles === "string" ? maxFiles.toLowerCase() : maxFiles;
 
 const TIMESTAMP_FORMAT = "YYYY-MM-DD HH:mm:ss";
 const DEFAULT_LOG_DIR = path.resolve(process.cwd(), "logs");
@@ -279,7 +299,11 @@ export const getDefaultRotation = (): RotationStrategy => ({
  * options that affect runtime behavior: `level`, `consoleLevel`,
  * `includeConsole`, `includeFile`, `includeGlobalFile`, `globalModuleName`,
  * `extraTimezones` (sorted to be order-independent), `rotation`,
- * `globalRotation`. Does NOT include `additionalTransports` — function/class
+ * `globalRotation`, `escapeMessageNewlines`, `format`, `maskMetaKeys`
+ * (lowercased + sorted to be order-independent — security-relevant, so a
+ * silently-dropped redaction config must surface as a conflict), `colorize`
+ * (the *resolved* `{level, message}` flags, not the raw option shape), and
+ * `captureUncaught`. Does NOT include `additionalTransports` — function/class
  * instances are not stably comparable; the registry tracks their count
  * separately and the warning surfaces it as a caveat.
  */
@@ -295,6 +319,9 @@ const buildOptionsSignature = (resolved: {
   globalRotation: RotationStrategy;
   escapeMessageNewlines: boolean;
   format: "pretty" | "json";
+  maskMetaKeys: string[];
+  colorize: { level: boolean; message: boolean };
+  captureUncaught: boolean;
 }): string => {
   return JSON.stringify({
     level: resolved.level,
@@ -308,6 +335,9 @@ const buildOptionsSignature = (resolved: {
     globalRotation: resolved.globalRotation,
     escapeMessageNewlines: resolved.escapeMessageNewlines,
     format: resolved.format,
+    maskMetaKeys: [...resolved.maskMetaKeys].map((key) => key.toLowerCase()).sort(),
+    colorize: resolved.colorize,
+    captureUncaught: resolved.captureUncaught,
   });
 };
 
@@ -641,7 +671,7 @@ const buildRotateTransport = (options: {
     filename: options.filename,
     datePattern: rotation.datePattern,
     maxSize: rotation.maxSize,
-    maxFiles: rotation.maxFiles,
+    maxFiles: normalizeMaxFiles(rotation.maxFiles),
     zippedArchive: rotation.zippedArchive,
     level: options.level,
     handleExceptions: options.handleExceptions,
@@ -823,11 +853,26 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
   const resolvedLogDirectory = resolveLogDirectory(logDirectory);
   const registryKey = buildRegistryKey(moduleName, resolvedLogDirectory);
 
+  // Normalize `maxFiles` the SAME way `buildRotateTransport` does before it
+  // feeds the registry signature below — otherwise two calls that are
+  // functionally identical post-normalization (`"14d"` vs `"14D"`) would hash
+  // to different signatures and trip a false-positive conflict warning.
   const resolvedRotation: RotationStrategy = { ...defaultRotation, ...rotation };
+  resolvedRotation.maxFiles = normalizeMaxFiles(resolvedRotation.maxFiles);
   const resolvedGlobalRotation: RotationStrategy = {
     ...defaultRotation,
     ...(globalRotation ?? rotation),
   };
+  resolvedGlobalRotation.maxFiles = normalizeMaxFiles(resolvedGlobalRotation.maxFiles);
+
+  // Resolve the colorize option to per-flag booleans BEFORE the cache lookup
+  // (and the options signature it feeds) so a divergent `colorize` between two
+  // createLogger() calls on the same key is caught by the conflict warning
+  // below instead of being silently dropped. The flags are resolved
+  // unconditionally — the same `colorizeFlags` value is reused further down
+  // for both the `pretty` branch (used inline) and the `json` branch (which
+  // ignores them — JSON output never gets colorized regardless).
+  const colorizeFlags = resolveColorizeFlags(colorize);
 
   const optionsSignature = buildOptionsSignature({
     level,
@@ -841,6 +886,9 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     globalRotation: resolvedGlobalRotation,
     escapeMessageNewlines,
     format,
+    maskMetaKeys,
+    colorize: colorizeFlags,
+    captureUncaught,
   });
 
   const cached = loggerRegistry.get(registryKey);
@@ -892,14 +940,6 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     maskMetaKeys.length > 0
       ? new Set<string>(maskMetaKeys.map((key) => key.toLowerCase()))
       : undefined;
-  // Resolve the colorize option to per-flag booleans. `level: true` causes
-  // the printf below to wrap `[LEVEL]` in ANSI codes via a standalone
-  // colorizer instance; `message: true` adds winston's standard
-  // `colorize({ message: true })` transform to the console pipeline. The
-  // colorize flags are resolved unconditionally so the value is available
-  // for both the `pretty` branch (used inline) and the `json` branch (which
-  // ignores them — JSON output never gets colorized regardless).
-  const colorizeFlags = resolveColorizeFlags(colorize);
 
   let sharedFormat: winston.Logform.Format;
   let consoleFormat: winston.Logform.Format;
@@ -1356,7 +1396,6 @@ export const createNoopLogger = (): winston.Logger => {
   if (cachedNoopLogger) {
     return cachedNoopLogger;
   }
-  const noop = (..._args: unknown[]): unknown => undefined;
   // Backing object exposes the well-known surface as own properties so
   // `Reflect.has(target, "info")` (used by inspectors and the request
   // middleware's typecheck) returns `true`. The Proxy below catches anything
@@ -1367,6 +1406,8 @@ export const createNoopLogger = (): winston.Logger => {
     level: "silent",
     transports: Object.freeze([]),
     silent: true,
+    // Stable serialization — the unknown-method fallback would produce a circular result.
+    toJSON: () => ({ type: "@hiprax/logger", level: "silent", transports: 0 }),
   };
 
   const noopLogger: winston.Logger = new Proxy(target, {
@@ -1406,10 +1447,18 @@ export const createNoopLogger = (): winston.Logger => {
         bag[propStr] = fn;
         return fn;
       }
-      // 6. Anything else — return a chainable no-op so even unknown winston
+      // 6. Deny-list — same set the real logger proxy uses: Promise
+      //    machinery (then/catch/finally), framework probes ($$typeof,
+      //    nodeType), and engine introspection props. Blocking these keeps
+      //    the no-op logger non-thenable and prevents it from being mistaken
+      //    for a Vue/React component, a Jest mock, or a callable function.
+      if (DENIED_PROXY_PROPS.has(propStr)) {
+        return undefined;
+      }
+      // 7. Anything else — return a chainable no-op so even unknown winston
       //    methods do not throw. This makes the no-op logger forward-
       //    compatible with future winston versions.
-      return noop;
+      return (..._args: unknown[]) => noopLogger;
     },
   }) as unknown as winston.Logger;
 
@@ -1640,6 +1689,7 @@ export const __loggerInternals = {
   validateLogLevelOption,
   validateRotationStrategy,
   validateRotationField,
+  normalizeMaxFiles,
   validateFormatOption,
   validateMaskMetaKeysOption,
   isValidLogLevel,

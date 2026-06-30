@@ -1852,21 +1852,21 @@ describe("request middleware internals", () => {
     );
   });
 
-  it("redactUrlQuery returns the input unchanged when URL parsing fails", () => {
+  it("redactUrlQuery redacts query params in URLs with malformed hosts (no URL-parse dependency)", () => {
     const mask = new Set(["token"]);
-    // `http://[invalid?...` triggers a real `URL` parse failure (`ERR_INVALID_URL`)
-    // because the unclosed IPv6 bracket runs into the query separator. The
-    // helper must catch the throw and return the input unchanged so logging is
-    // never the cause of a request failure.
-    const malformed = "http://[invalid?token=abc";
-    expect(redactUrlQuery(malformed, mask)).toBe(malformed);
+    // The in-place implementation never invokes `new URL()`, so a malformed
+    // host (unclosed IPv6 bracket) does not prevent query-param redaction.
+    // Sensitive params are still redacted; the rest of the URL is left verbatim.
+    expect(redactUrlQuery("http://[invalid?token=abc", mask)).toBe(
+      "http://[invalid?token=[REDACTED]",
+    );
   });
 
   it("redactUrlQuery emits the literal [REDACTED] sentinel (not %5BREDACTED%5D) for relative URLs", () => {
-    // URLSearchParams.toString() percent-encodes `[` → `%5B` and `]` → `%5D`.
-    // Without the post-processing `.replace(/%5B/gi,"[").replace(/%5D/gi,"]")`
-    // the logged URL would show `token=%5BREDACTED%5D` instead of the literal
-    // sentinel used everywhere else in the package, breaking log monitoring.
+    // The in-place implementation writes the REDACTED constant directly into
+    // the raw query string, so the brackets in `[REDACTED]` are never
+    // percent-encoded — we never call URLSearchParams.toString() which would
+    // produce `token=%5BREDACTED%5D`.
     const mask = new Set(["token", "api_key"]);
     const result = redactUrlQuery("/auth/login?token=secret&keep=me&api_key=sk-1", mask);
     expect(result).toContain("[REDACTED]");
@@ -1887,6 +1887,87 @@ describe("request middleware internals", () => {
     expect(result).toBe(
       "https://api.example.com/v1/resource?secret=[REDACTED]&token=[REDACTED]&safe=ok",
     );
+  });
+
+  it("redactUrlQuery preserves sibling-param encoding (%20, %5B/%5D, %2B) on non-masked params", () => {
+    const mask = new Set(["token"]);
+    // None of these encoding sequences are present in the masked value — they
+    // are in a *sibling* param. The in-place edit must leave them byte-for-byte
+    // unchanged (the old URLSearchParams round-trip decoded %20→+ etc.).
+    expect(redactUrlQuery("/p?q=hello%20world&token=abc", mask)).toBe(
+      "/p?q=hello%20world&token=[REDACTED]",
+    );
+    expect(redactUrlQuery("/p?name=arr%5Bidx%5D&token=x", mask)).toBe(
+      "/p?name=arr%5Bidx%5D&token=[REDACTED]",
+    );
+    expect(redactUrlQuery("/p?q=foo%2Bbar&token=abc", mask)).toBe(
+      "/p?q=foo%2Bbar&token=[REDACTED]",
+    );
+  });
+
+  it("redactUrlQuery preserves the //host authority of protocol-relative URLs", () => {
+    const mask = new Set(["token"]);
+    // The old `parsed.pathname + parsed.search + parsed.hash` reconstruction
+    // silently dropped the `//host` authority for `//host/path?…` inputs.
+    // The in-place edit preserves every byte before the first `?`.
+    expect(redactUrlQuery("//host/path?token=abc&q=1", mask)).toBe(
+      "//host/path?token=[REDACTED]&q=1",
+    );
+  });
+
+  it("redactUrlQuery preserves sibling-param encoding in absolute URLs", () => {
+    const mask = new Set(["token"]);
+    expect(redactUrlQuery("https://h/p?token=abc&q=hello%20world", mask)).toBe(
+      "https://h/p?token=[REDACTED]&q=hello%20world",
+    );
+  });
+
+  it("redactUrlQuery redacts all occurrences of a repeated masked key", () => {
+    const mask = new Set(["token"]);
+    expect(redactUrlQuery("/p?token=a&token=b&keep=1", mask)).toBe(
+      "/p?token=[REDACTED]&token=[REDACTED]&keep=1",
+    );
+  });
+
+  it("redactUrlQuery preserves all occurrences of a repeated non-masked key", () => {
+    const mask = new Set(["token"]);
+    expect(redactUrlQuery("/p?ids=1&ids=2&token=x", mask)).toBe("/p?ids=1&ids=2&token=[REDACTED]");
+  });
+
+  it("redactUrlQuery handles bracket-array params verbatim (arr[] kept, masked params redacted)", () => {
+    const mask = new Set(["token"]);
+    // `arr[]` is a common PHP/Rails convention for array query params.
+    // The in-place edit decodes the key to compare, so `arr[]` ≠ `token` and
+    // stays untouched, while `token` is still redacted.
+    expect(redactUrlQuery("/p?arr[]=1&arr[]=2&token=x", mask)).toBe(
+      "/p?arr[]=1&arr[]=2&token=[REDACTED]",
+    );
+  });
+
+  it("redactUrlQuery preserves the URL fragment verbatim after editing the query", () => {
+    const mask = new Set(["token"]);
+    // Fragment (`#section`) must be peeled off before splitting on `?` and
+    // re-appended verbatim — it is never part of the query string.
+    expect(redactUrlQuery("/p?token=abc#section", mask)).toBe("/p?token=[REDACTED]#section");
+    // Fragment with no masked params → identity (original string returned).
+    expect(redactUrlQuery("/p?keep=me#anchor", mask)).toBe("/p?keep=me#anchor");
+  });
+
+  it("redactUrlQuery passes bare flag params (no `=` sign) through unchanged", () => {
+    const mask = new Set(["token"]);
+    // A flag like `?debug` has no `=` so there is nothing to mask.
+    expect(redactUrlQuery("/p?flag&token=abc", mask)).toBe("/p?flag&token=[REDACTED]");
+    // All bare flags → nothing to mask at all.
+    const maskNone = new Set(["token"]);
+    expect(redactUrlQuery("/p?flagonly", maskNone)).toBe("/p?flagonly");
+  });
+
+  it("redactUrlQuery skips pairs with malformed percent-encoding in the key", () => {
+    const mask = new Set(["token"]);
+    // `%GG` is not valid percent-encoding — decodeURIComponent throws URIError.
+    // The inner catch must leave the malformed pair untouched while still
+    // redacting the subsequent well-formed masked key.
+    expect(redactUrlQuery("/p?%GG=x&token=abc", mask)).toBe("/p?%GG=x&token=[REDACTED]");
   });
 
   it("redactEntryPath redacts a top-level path", () => {
@@ -2299,6 +2380,187 @@ describe("request middleware internals", () => {
       expect(out.url).toBe(url);
       expect(out.err).toBe(err);
       expect(out.buf).toBe(buf);
+    });
+
+    // -------------------------------------------------------------------------
+    // Phase 1 — Leak-safe deep redaction: class/Error instance masking
+    // -------------------------------------------------------------------------
+
+    it("redacts a masked own key on a class instance (data-bearing branch)", () => {
+      class Credentials {
+        constructor(
+          public readonly username: string,
+          public readonly password: string,
+        ) {}
+      }
+      const input = new Credentials("alice", "s3cr3t");
+      const mask = new Set(["password"]);
+      const out = redactValue(input, mask, new WeakSet()) as Record<string, unknown>;
+      // password is masked → fresh plain object returned
+      expect(out).not.toBe(input);
+      expect(out.password).toBe("[REDACTED]");
+      expect(out.username).toBe("alice");
+    });
+
+    it("redacts a masked own key nested inside a plain object that holds a class instance", () => {
+      class Token {
+        constructor(
+          public readonly value: string,
+          public readonly label: string,
+        ) {}
+      }
+      const tok = new Token("secret-token", "api");
+      const body = { meta: { auth: tok, tag: "ok" } };
+      const mask = new Set(["value"]);
+      const out = redactValue(body, mask, new WeakSet()) as {
+        meta: { auth: Record<string, unknown>; tag: string };
+      };
+      // The outer plain object is rebuilt; the inner class instance is also
+      // walked because it contains a masked key.
+      expect(out.meta.auth).not.toBe(tok);
+      expect(out.meta.auth.value).toBe("[REDACTED]");
+      expect(out.meta.auth.label).toBe("api");
+      expect(out.meta.tag).toBe("ok");
+    });
+
+    it("redacts a masked enumerable prop on an Error subclass", () => {
+      class AppError extends Error {
+        public token: string;
+        constructor(message: string, token: string) {
+          super(message);
+          this.name = "AppError";
+          this.token = token; // own enumerable key
+        }
+      }
+      const err = new AppError("auth failed", "bearer-xyz");
+      const mask = new Set(["token"]);
+      const out = redactValue(err, mask, new WeakSet()) as Record<string, unknown>;
+      // token is enumerable and masked → fresh plain object
+      expect(out).not.toBe(err);
+      expect(out.token).toBe("[REDACTED]");
+      // name was not masked and is enumerable on this subclass
+      expect(out.name).toBe("AppError");
+    });
+
+    it("returns a class instance by identity when the mask is non-empty but no key matches", () => {
+      class Payload {
+        constructor(public readonly data: string) {}
+      }
+      const input = new Payload("hello");
+      const mask = new Set(["password", "token"]); // non-empty but no match
+      const out = redactValue(input, mask, new WeakSet());
+      // Nothing changed → original returned by identity
+      expect(out).toBe(input);
+      expect((out as Payload).data).toBe("hello");
+    });
+
+    it("passes through a class instance that defines toJSON even when a key matches (documented limitation)", () => {
+      class Timestamped {
+        public readonly password = "secret";
+        toJSON() {
+          return { customized: true };
+        }
+      }
+      const input = new Timestamped();
+      const mask = new Set(["password"]);
+      const out = redactValue(input, mask, new WeakSet());
+      // hasToJSON === true → pass-through, no key walk; this is the documented
+      // limitation: use `redactPaths` or normalize to a plain object instead.
+      expect(out).toBe(input);
+    });
+
+    it("does NOT yield [Circular] when the same built-in is referenced by two keys", () => {
+      // Before the fix, seen.add(date) ran before the non-plain check, so the
+      // second reference to the same Date returned "[Circular]".
+      const d = new Date("2024-01-01T00:00:00.000Z");
+      const body = { start: d, end: d };
+      const out = redactValue(body, empty, new WeakSet()) as Record<string, unknown>;
+      // Both keys must carry the original Date instance, not "[Circular]".
+      expect(out.start).toBe(d);
+      expect(out.end).toBe(d);
+      expect(out.start).not.toBe("[Circular]");
+      expect(out.end).not.toBe("[Circular]");
+    });
+
+    it("serializeBody redacts a masked key on a class-instance request body", () => {
+      // End-to-end fix for F1: the downstream JSON.stringify enumerates own
+      // keys of class instances, so secrets stored as instance fields leaked
+      // even when the key was in maskBodyKeys. This test pins the fix.
+      class LoginBody {
+        constructor(
+          public readonly username: string,
+          public readonly password: string,
+        ) {}
+      }
+      const body = new LoginBody("alice", "s3cr3t");
+      const out = serializeBody(body, ["password"]) as Record<string, unknown>;
+      expect(out.password).toBe("[REDACTED]");
+      expect(out.username).toBe("alice");
+      // The raw secret string must NOT appear in any serialized form.
+      expect(JSON.stringify(out)).not.toContain("s3cr3t");
+    });
+
+    it("data-bearing instance: FORBIDDEN_KEYS are skipped during the walk (defense-in-depth)", () => {
+      // Exercises lines 119-121: the case where a class instance has an own
+      // enumerable key whose name is in FORBIDDEN_KEYS (__proto__, constructor,
+      // prototype). Object.assign copies own-enumerable properties — including
+      // 'constructor' from an object literal — onto the target instance.
+      class SafeDto {
+        public safe: string;
+        constructor(safe: string) {
+          this.safe = safe;
+        }
+      }
+      // Create an instance whose own enumerable keys include 'constructor'
+      // (a FORBIDDEN_KEY). This is an adversarial/prototype-pollution scenario.
+      const instance = Object.assign(Object.create(SafeDto.prototype) as SafeDto, {
+        safe: "data",
+        constructor: "evil" as unknown, // own enumerable FORBIDDEN_KEY
+      });
+
+      const mask = new Set(["safe"]);
+      const out = redactValue(instance, mask, new WeakSet()) as Record<string, unknown>;
+
+      // 'constructor' was skipped (dropped) → not an OWN property on the output.
+      expect(Object.prototype.hasOwnProperty.call(out, "constructor")).toBe(false);
+      // 'safe' was masked.
+      expect(out.safe).toBe("[REDACTED]");
+      // changed === true (masked key + forbidden key skipped) → fresh plain object.
+      expect(out).not.toBe(instance);
+    });
+
+    it("data-bearing instance with a circular self-reference emits [Circular]", () => {
+      // Exercises the seen.has() branch inside the data-bearing instance path
+      // (distinct from the plain-object circular path exercised by other tests).
+      class Node {
+        public self?: Node;
+        public label: string;
+        constructor(label: string) {
+          this.label = label;
+        }
+      }
+      const n = new Node("root");
+      n.self = n; // circular: n.self === n
+
+      const mask = new Set<string>();
+      const out = redactValue(n, mask, new WeakSet()) as Record<string, unknown>;
+
+      // The self-reference must be replaced with "[Circular]" without throwing.
+      expect(out.self).toBe("[Circular]");
+      expect(out.label).toBe("root");
+    });
+
+    it("circular array containing itself emits [Circular] without throwing", () => {
+      // Exercises the seen.has() branch inside the Array.isArray path (line 83).
+      // An array that holds a reference to itself must be handled gracefully.
+      const arr: unknown[] = [];
+      arr.push(arr); // arr[0] === arr — circular
+
+      const mask = new Set<string>();
+      const out = redactValue(arr, mask, new WeakSet()) as unknown[];
+
+      // The nested self-reference is replaced with "[Circular]".
+      expect(out[0]).toBe("[Circular]");
     });
   });
 });
