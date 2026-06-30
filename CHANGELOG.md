@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`finalize()` in `createRequestLogger` now wraps all logging work in a try/catch** (`src/request-middleware.ts`): A throwing `enrich` callback, `messageBuilder`, function-form `level`, or `logger.log` call previously propagated out of the `res` `finish`/`close` event listener, causing an `uncaughtException` and a process crash — violating the package's "logging is never the cause of a request failure" invariant. The `res.removeListener(...)` calls run unconditionally before the try block so the double-fire guard always cleans up; on catch, a single bare `console.error` records the failure (mirroring `attachTransportErrorHandler` in `src/logger.ts`) without going through the logger itself (to avoid recursion). Non-Error thrown values are stringified via `String(err)`. Four new tests in `tests/request-middleware.spec.ts` assert that each throw site (`enrich`, `messageBuilder`, `logger.log`, function-form `level`) produces no propagated exception and exactly one `console.error` call.
+
 ## [0.21.9] - 2026-06-30
 
 ### Security / Dependencies (2026-06-30)

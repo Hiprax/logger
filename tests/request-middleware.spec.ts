@@ -1239,6 +1239,101 @@ describe("createRequestLogger", () => {
     // And as a sanity check: the request DID get mutated.
     expect((req as { body: unknown }).body).toEqual({ redacted: true });
   });
+
+  // ---------------------------------------------------------------------------
+  // Phase 1 — finalize() never-crash hardening (Task 1.2)
+  // ---------------------------------------------------------------------------
+
+  it("does not propagate when enrich throws, and writes one console.error", () => {
+    const { logger, log } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      enrich: () => {
+        throw new Error("enrich boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toContain("@hiprax/logger request logger failed");
+  });
+
+  it("does not propagate when messageBuilder throws, and writes one console.error", () => {
+    const { logger, log } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      messageBuilder: () => {
+        throw new Error("messageBuilder boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toContain("@hiprax/logger request logger failed");
+  });
+
+  it("does not propagate when logger.log throws, and writes one console.error", () => {
+    const { logger, log } = createMockLogger();
+    log.mockImplementation(() => {
+      throw "log string throw";
+    });
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({ logger });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toContain("log string throw");
+  });
+
+  it("does not propagate when a function-form level throws, and writes one console.error", () => {
+    const { logger, log } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      level: (_statusCode: number) => {
+        throw new Error("level boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toContain("@hiprax/logger request logger failed");
+  });
+
+  it("catch block falls back to GET and empty string when method and URL fields are absent", () => {
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      enrich: () => {
+        throw new Error("enrich boom fallback");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, {
+      method: undefined as unknown as string,
+      originalUrl: undefined as unknown as string,
+      url: undefined as unknown as string,
+    });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toMatch(/GET .* enrich boom fallback/);
+  });
 });
 
 describe("request middleware internals", () => {

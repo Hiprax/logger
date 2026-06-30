@@ -644,135 +644,126 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
       res.removeListener("finish", finishHandler);
       res.removeListener("close", closeHandler);
 
-      try {
-        const durationNs = Number(process.hrtime.bigint() - start);
-        const durationMs = durationNs / 1_000_000;
+      const durationNs = Number(process.hrtime.bigint() - start);
+      const durationMs = durationNs / 1_000_000;
 
-        const statusCode = res.statusCode ?? 0;
-        const resolvedLevel =
-          typeof level === "function" ? level(statusCode) : (level ?? determineLevel(statusCode));
+      const statusCode = res.statusCode ?? 0;
+      const resolvedLevel =
+        typeof level === "function" ? level(statusCode) : (level ?? determineLevel(statusCode));
 
-        const headerOrUndefined = (name: string): string | undefined => {
-          const raw = req.headers[name];
-          if (Array.isArray(raw)) {
-            return raw.join(", ");
-          }
-          return typeof raw === "string" ? raw : undefined;
-        };
-
-        const lookupHeader = (name: string): string | undefined => {
-          if (typeof req.get === "function") {
-            // `req.get(name) ?? undefined` collapses an explicit `null` return
-            // (some Express subclasses) to `undefined` so the `RequestLogEntry`
-            // optional-string contract is preserved.
-            return req.get(name) ?? undefined;
-          }
-          return headerOrUndefined(name);
-        };
-
-        const responseHeaders = res.getHeaders ? res.getHeaders() : undefined;
-
-        // Resolve and redact the URL we will log. We prefer `originalUrl` (Express
-        // semantics) and fall back to `url` (raw Node). URL redaction strips
-        // sensitive query params (token/key/secret/etc.) per `maskQueryKeys`.
-        const sourceUrl = req.originalUrl ?? req.url ?? "";
-        const loggedUrl = redactUrlQuery(sourceUrl, queryMaskSet);
-
-        // Capture transport-level lifecycle flags BEFORE refining the event.
-        // `responseWritableEnded` indicates whether the response body was fully
-        // written; combined with the raised `event === "close"` it lets us
-        // distinguish a true client abort from a benign post-finish close.
-        // `responseDestroyed` mirrors socket.destroyed for diagnostic context.
-        // `requestAborted` is reported when the request adapter exposes it.
-        const responseWritableEnded =
-          typeof res.writableEnded === "boolean" ? res.writableEnded : undefined;
-        const responseDestroyed = typeof res.destroyed === "boolean" ? res.destroyed : undefined;
-        const requestAborted = typeof req.aborted === "boolean" ? req.aborted : undefined;
-
-        // Refined classification: a `close` event is a true abort ONLY when the
-        // response body was NOT fully written (`!res.writableEnded`). A `close`
-        // after a normal `finish` (HTTP/1 keep-alive socket teardown, HTTP/2
-        // stream end) sets `writableEnded === true` and is benign — it is
-        // logged as `"completed"`. Adapters that do not surface
-        // `writableEnded` (raw mocks, custom transports) treat the close as a
-        // true abort to preserve the previous behavior.
-        const refinedEvent: RequestLogEvent =
-          event === "aborted" && !responseWritableEnded ? "aborted" : "completed";
-
-        const entry: RequestLogEntry = {
-          event: refinedEvent,
-          method: req.method ?? "GET",
-          url: loggedUrl,
-          statusCode,
-          responseTimeMs: Number(durationMs.toFixed(2)),
-          contentLength: toNumber(res.getHeader("content-length")) ?? initialContentLength,
-          ip: req.ip ?? req.socket?.remoteAddress ?? undefined,
-          userAgent: lookupHeader("user-agent"),
-          requestId: lookupHeader("x-request-id"),
-        };
-
-        if (responseWritableEnded !== undefined) {
-          entry.responseWritableEnded = responseWritableEnded;
+      const headerOrUndefined = (name: string): string | undefined => {
+        const raw = req.headers[name];
+        if (Array.isArray(raw)) {
+          return raw.join(", ");
         }
-        if (responseDestroyed !== undefined) {
-          entry.responseDestroyed = responseDestroyed;
+        return typeof raw === "string" ? raw : undefined;
+      };
+
+      const lookupHeader = (name: string): string | undefined => {
+        if (typeof req.get === "function") {
+          // `req.get(name) ?? undefined` collapses an explicit `null` return
+          // (some Express subclasses) to `undefined` so the `RequestLogEntry`
+          // optional-string contract is preserved.
+          return req.get(name) ?? undefined;
         }
-        if (requestAborted !== undefined) {
-          entry.requestAborted = requestAborted;
-        }
+        return headerOrUndefined(name);
+      };
 
-        if (includeRequestBody) {
-          // Use the body snapshot taken at middleware entry — see the comment on
-          // `bodySnapshot` above for why we do not deep-clone by default.
-          entry.requestBody = serializeBody(bodySnapshot, maskBodyKeys, maxBodyLength);
-        }
+      const responseHeaders = res.getHeaders ? res.getHeaders() : undefined;
 
-        entry.requestHeaders = normalizeHeaders(
-          req.headers as Record<string, unknown>,
-          includeRequestHeaders,
-          headerMaskSet,
-        );
-        entry.responseHeaders = normalizeHeaders(
-          responseHeaders as Record<string, unknown> | undefined,
-          includeResponseHeaders,
-          headerMaskSet,
-        );
+      // Resolve and redact the URL we will log. We prefer `originalUrl` (Express
+      // semantics) and fall back to `url` (raw Node). URL redaction strips
+      // sensitive query params (token/key/secret/etc.) per `maskQueryKeys`.
+      const sourceUrl = req.originalUrl ?? req.url ?? "";
+      const loggedUrl = redactUrlQuery(sourceUrl, queryMaskSet);
 
-        if (enrich) {
-          // `enrich(...) ?? undefined` collapses a `null` or `undefined` return
-          // value to `undefined` so `entry.context` is never set to `null`.
-          entry.context = enrich(req, res, durationMs) ?? undefined;
-        }
+      // Capture transport-level lifecycle flags BEFORE refining the event.
+      // `responseWritableEnded` indicates whether the response body was fully
+      // written; combined with the raised `event === "close"` it lets us
+      // distinguish a true client abort from a benign post-finish close.
+      // `responseDestroyed` mirrors socket.destroyed for diagnostic context.
+      // `requestAborted` is reported when the request adapter exposes it.
+      const responseWritableEnded =
+        typeof res.writableEnded === "boolean" ? res.writableEnded : undefined;
+      const responseDestroyed = typeof res.destroyed === "boolean" ? res.destroyed : undefined;
+      const requestAborted = typeof req.aborted === "boolean" ? req.aborted : undefined;
 
-        // Surgical path-based redaction — runs LAST so it can override anything
-        // that survived the keyword-based body/header masks. Missing intermediate
-        // segments are a graceful no-op.
-        if (resolvedRedactPaths.length > 0) {
-          resolvedRedactPaths.forEach((path) =>
-            redactEntryPath(entry as unknown as Record<string, unknown>, path),
-          );
-        }
+      // Refined classification: a `close` event is a true abort ONLY when the
+      // response body was NOT fully written (`!res.writableEnded`). A `close`
+      // after a normal `finish` (HTTP/1 keep-alive socket teardown, HTTP/2
+      // stream end) sets `writableEnded === true` and is benign — it is
+      // logged as `"completed"`. Adapters that do not surface
+      // `writableEnded` (raw mocks, custom transports) treat the close as a
+      // true abort to preserve the previous behavior.
+      const refinedEvent: RequestLogEvent =
+        event === "aborted" && !responseWritableEnded ? "aborted" : "completed";
 
-        const message = messageBuilder(entry);
+      const entry: RequestLogEntry = {
+        event: refinedEvent,
+        method: req.method ?? "GET",
+        url: loggedUrl,
+        statusCode,
+        responseTimeMs: Number(durationMs.toFixed(2)),
+        contentLength: toNumber(res.getHeader("content-length")) ?? initialContentLength,
+        ip: req.ip ?? req.socket?.remoteAddress ?? undefined,
+        userAgent: lookupHeader("user-agent"),
+        requestId: lookupHeader("x-request-id"),
+      };
 
-        const logEntry: winston.LogEntry & { http?: RequestLogEntry } = {
-          level: resolvedLevel,
-          message,
-        };
+      if (responseWritableEnded !== undefined) {
+        entry.responseWritableEnded = responseWritableEnded;
+      }
+      if (responseDestroyed !== undefined) {
+        entry.responseDestroyed = responseDestroyed;
+      }
+      if (requestAborted !== undefined) {
+        entry.requestAborted = requestAborted;
+      }
 
-        if (includeHttpContext) {
-          logEntry.http = entry;
-        }
+      if (includeRequestBody) {
+        // Use the body snapshot taken at middleware entry — see the comment on
+        // `bodySnapshot` above for why we do not deep-clone by default.
+        entry.requestBody = serializeBody(bodySnapshot, maskBodyKeys, maxBodyLength);
+      }
 
-        logger.log(logEntry);
-      } catch (err) {
-        const method = req.method ?? "GET";
-        const reqUrl = req.originalUrl ?? req.url ?? "";
-        const reason = err instanceof Error ? err.message : String(err);
-        console.error(
-          `@hiprax/logger request logger failed while logging ${method} ${reqUrl}: ${reason}`,
+      entry.requestHeaders = normalizeHeaders(
+        req.headers as Record<string, unknown>,
+        includeRequestHeaders,
+        headerMaskSet,
+      );
+      entry.responseHeaders = normalizeHeaders(
+        responseHeaders as Record<string, unknown> | undefined,
+        includeResponseHeaders,
+        headerMaskSet,
+      );
+
+      if (enrich) {
+        // `enrich(...) ?? undefined` collapses a `null` or `undefined` return
+        // value to `undefined` so `entry.context` is never set to `null`.
+        entry.context = enrich(req, res, durationMs) ?? undefined;
+      }
+
+      // Surgical path-based redaction — runs LAST so it can override anything
+      // that survived the keyword-based body/header masks. Missing intermediate
+      // segments are a graceful no-op.
+      if (resolvedRedactPaths.length > 0) {
+        resolvedRedactPaths.forEach((path) =>
+          redactEntryPath(entry as unknown as Record<string, unknown>, path),
         );
       }
+
+      const message = messageBuilder(entry);
+
+      const logEntry: winston.LogEntry & { http?: RequestLogEntry } = {
+        level: resolvedLevel,
+        message,
+      };
+
+      if (includeHttpContext) {
+        logEntry.http = entry;
+      }
+
+      logger.log(logEntry);
     };
 
     const finishHandler = () => finalize("completed");
