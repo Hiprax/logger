@@ -17,6 +17,7 @@ import {
   getDefaultRotation,
   __loggerInternals,
 } from "../src/logger";
+import type { ShutdownOptions } from "../src/logger";
 import { InvalidTimezoneError, LoggerOptionError } from "../src/errors";
 import { createTempDir, teardownLogger } from "./_helpers";
 
@@ -1351,6 +1352,53 @@ describe("createLogger", () => {
       expect(output).not.toContain("\x1b");
     });
 
+    it("formatMessage renders undefined message as the literal 'undefined', not a blank line", () => {
+      // JSON.stringify(undefined) returns the JS value `undefined` (not the
+      // string "undefined"), so without the `?? String(info.message)` fallback
+      // `rawMessage` was `undefined` and the formatter emitted a blank line.
+      const formatter = __loggerInternals.formatMessage(
+        { label: "test", timezones: [] },
+        { includeTimestamps: false },
+      );
+      const info = formatter.transform({ level: "info", message: undefined } as any);
+      const output = Reflect.get(
+        info as Record<PropertyKey, unknown>,
+        Symbol.for("message"),
+      ) as string;
+      // The rendered output must include the literal word "undefined".
+      expect(output).toContain("undefined");
+      // The message line must not be blank (trimmed non-empty after stripping the
+      // "[INFO] (test)" prefix line).
+      const lines = output
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+      expect(lines.some((l) => l === "undefined")).toBe(true);
+    });
+
+    it("formatMessage renders a function message via String() fallback, not a blank line", () => {
+      // JSON.stringify(() => 42) also returns JS `undefined`; the fallback
+      // String(info.message) converts the function to its source representation.
+      const formatter = __loggerInternals.formatMessage(
+        { label: "test", timezones: [] },
+        { includeTimestamps: false },
+      );
+      const fn = () => 42;
+      const info = formatter.transform({ level: "info", message: fn } as any);
+      const output = Reflect.get(
+        info as Record<PropertyKey, unknown>,
+        Symbol.for("message"),
+      ) as string;
+      // The output must not be just the level/label header with a trailing blank —
+      // String(fn) yields a non-empty source representation.
+      const lines = output
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+      // At minimum: "[INFO] (test)" + the stringified function body.
+      expect(lines.length).toBeGreaterThanOrEqual(2);
+    });
+
     it("resolveLogDirectory falls back to path.resolve when the dir does not exist", () => {
       const ghost = path.join(os.tmpdir(), `adv-logger-ghost-${Date.now()}`);
       const resolved = __loggerInternals.resolveLogDirectory(ghost);
@@ -1672,6 +1720,119 @@ describe("createLogger", () => {
       awaiter.cleanup();
       expect(idle.listenerCount("finish")).toBe(finishBefore);
       expect(idle.listenerCount("close")).toBe(closeBefore);
+    });
+
+    // -------------------------------------------------------------------------
+    // Phase 10 — shutdownLogger retry-after-timeout (Task 10.2)
+    // -------------------------------------------------------------------------
+
+    it("retry-after-timeout: evicts WeakMap entry so a later call can retry (Phase 10)", async () => {
+      // A transport that stalls in `_final` and never emits `finish`/`close` on
+      // its own — ensuring the first shutdown always times out.
+      class StalledRetryTransport extends Transport {
+        public name = "stalled-retry-p10";
+        public log = jest.fn((_info: unknown, callback?: () => void) => callback?.());
+        public _final = (_callback: (err?: Error | null) => void): void => {
+          // Intentionally never invokes the callback.
+        };
+      }
+      const stalled = new StalledRetryTransport();
+
+      const logger = createLogger({
+        moduleName: "shutdown-retry-p10",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [stalled as unknown as winston.transport],
+      });
+
+      // First call: small timeout → must reject.
+      const first = shutdownLogger(logger, { timeoutMs: 20 });
+      await expect(first).rejects.toThrow(/shutdownLogger timed out after 20ms/);
+
+      // After the rejection the WeakMap entry must be evicted.
+      // The second call must return a BRAND-NEW promise, not the cached rejection.
+      const second = shutdownLogger(logger, { timeoutMs: 2000 });
+      expect(second).not.toBe(first);
+
+      // Manually emit "finish" so the second call's fresh awaiter resolves.
+      // (This simulates the transport eventually completing its flush.)
+      stalled.emit("finish");
+      await expect(second).resolves.toBeUndefined();
+    });
+
+    it("successful shutdown remains idempotent: second and third calls return the same promise (Phase 10)", async () => {
+      // The Proxy wrapping makes jest.spyOn(logger, "end") unreliable (the get
+      // trap returns value.bind(target), not the raw spy). Idempotency is proven
+      // by promise identity: if a second logger.end() were issued, shutdownLogger
+      // would create a new Promise.race and return a different object.
+      const stream = new PassThrough();
+      const logger = createLogger({
+        moduleName: "shutdown-idempotent-end-p10",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      const first = shutdownLogger(logger);
+      const second = shutdownLogger(logger);
+
+      // Must be the exact same promise object — no new end()/race() on repeat call.
+      expect(second).toBe(first);
+
+      await expect(first).resolves.toBeUndefined();
+
+      // A call after resolution also returns the cached resolved promise.
+      const third = shutdownLogger(logger);
+      expect(third).toBe(first);
+      await expect(third).resolves.toBeUndefined();
+    });
+
+    it("concurrent same-tick calls share one in-flight promise (Phase 10)", async () => {
+      // Three synchronous calls in the same event-loop turn. Only the first can
+      // miss the WeakMap (it's empty); the second and third see the entry the
+      // first installed and return the same promise. Promise callbacks are
+      // deferred to the microtask queue, so none of the three calls can observe
+      // a settled state before returning.
+      const stream = new PassThrough();
+      const logger = createLogger({
+        moduleName: "shutdown-concurrent-p10",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      const p1 = shutdownLogger(logger);
+      const p2 = shutdownLogger(logger);
+      const p3 = shutdownLogger(logger);
+
+      // All three must be the identical promise object.
+      expect(p2).toBe(p1);
+      expect(p3).toBe(p1);
+
+      await expect(Promise.all([p1, p2, p3])).resolves.toEqual([undefined, undefined, undefined]);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 9 — ShutdownOptions export (Task 9.2)
+  // ---------------------------------------------------------------------------
+
+  describe("ShutdownOptions is exported from src/logger (Phase 9)", () => {
+    it("ShutdownOptions can be used as a type annotation (type is exported)", () => {
+      // If ShutdownOptions were NOT exported this file would fail to compile
+      // at the `import type { ShutdownOptions }` line at the top.
+      // The runtime assertion below also confirms the interface is structurally
+      // consistent with what shutdownLogger accepts.
+      const opts: ShutdownOptions = { timeoutMs: 3000 };
+      expect(opts.timeoutMs).toBe(3000);
+    });
+
+    it("ShutdownOptions with undefined timeoutMs is accepted (optional field)", () => {
+      const opts: ShutdownOptions = {};
+      expect(opts.timeoutMs).toBeUndefined();
     });
   });
 
@@ -2368,6 +2529,117 @@ describe("createLogger", () => {
 
       spy.mockRestore();
     });
+
+    it("throws LoggerOptionError({ code: 'INVALID_MASK' }) when maskMetaKeys is a bare string", () => {
+      let caught: unknown;
+      try {
+        createLogger({
+          maskMetaKeys: "password" as unknown as string[],
+          includeConsole: false,
+          includeFile: false,
+          includeGlobalFile: false,
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+      expect((caught as LoggerOptionError).message).toContain("maskMetaKeys");
+    });
+
+    it("throws LoggerOptionError({ code: 'INVALID_MASK' }) when maskMetaKeys is null", () => {
+      let caught: unknown;
+      try {
+        createLogger({
+          maskMetaKeys: null as unknown as string[],
+          includeConsole: false,
+          includeFile: false,
+          includeGlobalFile: false,
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+      expect((caught as LoggerOptionError).message).toContain("maskMetaKeys");
+    });
+
+    it("throws LoggerOptionError({ code: 'INVALID_MASK' }) when maskMetaKeys contains a non-string entry", () => {
+      let caught: unknown;
+      try {
+        createLogger({
+          maskMetaKeys: ["password", 42] as unknown as string[],
+          includeConsole: false,
+          includeFile: false,
+          includeGlobalFile: false,
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+      expect((caught as LoggerOptionError).message).toContain("maskMetaKeys");
+      expect((caught as LoggerOptionError).message).toContain("index 1");
+    });
+
+    it("throws INVALID_MASK even when a logger is already cached for the same key", () => {
+      const root = createTempDir();
+      // Prime the cache with a valid logger.
+      const first = createLogger({
+        moduleName: "mask-cache-test",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+      });
+      teardownLogger(first);
+
+      // A second call with bad maskMetaKeys must still throw even though the
+      // registry already has an entry for this moduleName + logDirectory.
+      let caught: unknown;
+      try {
+        createLogger({
+          moduleName: "mask-cache-test",
+          logDirectory: root,
+          maskMetaKeys: "leaked" as unknown as string[],
+          includeConsole: false,
+          includeFile: false,
+          includeGlobalFile: false,
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+    });
+
+    it("accepts a valid string[] maskMetaKeys without throwing", () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "mask-valid",
+        logDirectory: root,
+        maskMetaKeys: ["password", "token"],
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+      });
+      expect(logger).toBeDefined();
+      teardownLogger(logger);
+    });
+
+    it("accepts undefined maskMetaKeys without throwing (treated as [])", () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "mask-undefined",
+        logDirectory: root,
+        maskMetaKeys: undefined,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+      });
+      expect(logger).toBeDefined();
+      teardownLogger(logger);
+    });
   });
 
   describe("internals — option validators", () => {
@@ -2395,6 +2667,54 @@ describe("createLogger", () => {
       expect(__loggerInternals.isValidLogLevel("noisy")).toBe(false);
       expect(__loggerInternals.isValidLogLevel(42)).toBe(false);
       expect(__loggerInternals.isValidLogLevel(undefined)).toBe(false);
+    });
+
+    it("validateMaskMetaKeysOption is a no-op for undefined", () => {
+      expect(() => __loggerInternals.validateMaskMetaKeysOption(undefined)).not.toThrow();
+    });
+
+    it("validateMaskMetaKeysOption accepts an empty array", () => {
+      expect(() => __loggerInternals.validateMaskMetaKeysOption([])).not.toThrow();
+    });
+
+    it("validateMaskMetaKeysOption accepts a string[] without throwing", () => {
+      expect(() =>
+        __loggerInternals.validateMaskMetaKeysOption(["password", "token"]),
+      ).not.toThrow();
+    });
+
+    it("validateMaskMetaKeysOption throws INVALID_MASK for a bare string", () => {
+      let caught: unknown;
+      try {
+        __loggerInternals.validateMaskMetaKeysOption("password");
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+    });
+
+    it("validateMaskMetaKeysOption throws INVALID_MASK for null", () => {
+      let caught: unknown;
+      try {
+        __loggerInternals.validateMaskMetaKeysOption(null);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+    });
+
+    it("validateMaskMetaKeysOption throws INVALID_MASK for an array with a non-string entry", () => {
+      let caught: unknown;
+      try {
+        __loggerInternals.validateMaskMetaKeysOption(["ok", 99]);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+      expect((caught as LoggerOptionError).message).toContain("index 1");
     });
   });
 
@@ -2645,6 +2965,128 @@ describe("createLogger", () => {
       // Reserved keys retain their original values.
       expect(transformed.timestamp).toBe("2026-05-04 00:00:00");
       expect(transformed.stack).toBe("Error: ...");
+    });
+
+    it("json mode calls clock() exactly once per log line regardless of transport count", () => {
+      // Each call returns a distinct Date (seconds = call index) so a double
+      // invocation is detectable: the second timestamp would have a different
+      // seconds digit than the first.
+      let clockCalls = 0;
+      const clock = (): Date => {
+        clockCalls++;
+        const d = new Date("2030-01-01T00:00:00Z");
+        d.setSeconds(clockCalls);
+        return d;
+      };
+
+      const stream = new PassThrough();
+      const logger = createLogger({
+        moduleName: "json-clock-once",
+        format: "json",
+        includeConsole: true,
+        includeFile: false,
+        includeGlobalFile: false,
+        clock,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      logger.info("ping");
+      teardownLogger(logger);
+
+      // The Console transport's per-transport format must NOT re-run
+      // timestampCapture — the logger-level format already captured the
+      // timestamp via the single clock() call. A second call would produce a
+      // different timestamp on the console JSON line than on the file line.
+      expect(clockCalls).toBe(1);
+    });
+
+    it("json mode console format preserves the timestamp written by the logger-level format", () => {
+      // Drives both format pipelines manually — the same way Winston does it
+      // internally: logger-level format first, then the Console transport's
+      // per-transport format on a shallow clone of the transformed info.
+      // This bypasses stream-timing concerns and directly asserts the format
+      // composition contract: the Console format must NOT call clock() again
+      // or overwrite info.timestamp.
+      const fixedDate = new Date("2030-06-15T12:34:56Z");
+      const clock = () => fixedDate;
+
+      const logger = createLogger({
+        moduleName: "json-ts-fmt",
+        format: "json",
+        includeConsole: true,
+        includeFile: false,
+        includeGlobalFile: false,
+        clock,
+      });
+
+      const loggerLevelFormat = (logger as unknown as { format: winston.Logform.Format }).format;
+      const consoleTransport = logger.transports.find(
+        (t) => t instanceof winston.transports.Console,
+      );
+      const consoleTransportFormat = (
+        consoleTransport as unknown as { format: winston.Logform.Format }
+      ).format;
+
+      const syntheticInfo = {
+        level: "info",
+        message: "hello",
+        [Symbol.for("level")]: "info",
+      };
+
+      // Step 1 — logger-level format: runs timestampCapture → sets info.timestamp
+      const afterLogger = loggerLevelFormat.transform({ ...syntheticInfo } as any);
+      expect(afterLogger).not.toBe(false);
+
+      // Step 2 — Console transport format: runs on a clone of the Step 1 result,
+      // mirroring Winston's `Object.assign({}, info)` clone before per-transport
+      // format execution. Must NOT re-run timestampCapture.
+      const afterConsole = consoleTransportFormat.transform({
+        ...(afterLogger as Record<string, unknown>),
+      } as any);
+      expect(afterConsole).not.toBe(false);
+
+      teardownLogger(logger);
+
+      const loggerJson = JSON.parse(
+        Reflect.get(afterLogger as Record<PropertyKey, unknown>, Symbol.for("message")) as string,
+      ) as Record<string, unknown>;
+
+      const consoleJson = JSON.parse(
+        Reflect.get(afterConsole as Record<PropertyKey, unknown>, Symbol.for("message")) as string,
+      ) as Record<string, unknown>;
+
+      // The console format must carry the timestamp already written by the
+      // logger-level format, not a new clock() read that would differ.
+      expect(loggerJson.timestamp).toBe("2030-06-15 12:34:56");
+      expect(consoleJson.timestamp).toBe("2030-06-15 12:34:56");
+      expect(consoleJson.timestamp).toBe(loggerJson.timestamp);
+    });
+
+    it("pretty mode calls clock() exactly once per log line (regression guard)", () => {
+      // Confirms the pretty-mode pipeline was already single-capture and that
+      // the json-mode fix did not accidentally regress the pretty branch.
+      let clockCalls = 0;
+      const clock = (): Date => {
+        clockCalls++;
+        const d = new Date("2030-01-01T00:00:00Z");
+        d.setSeconds(clockCalls);
+        return d;
+      };
+
+      const stream = new PassThrough();
+      const logger = createLogger({
+        moduleName: "pretty-clock-once",
+        includeConsole: true,
+        includeFile: false,
+        includeGlobalFile: false,
+        clock,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      logger.info("ping");
+      teardownLogger(logger);
+
+      expect(clockCalls).toBe(1);
     });
   });
 

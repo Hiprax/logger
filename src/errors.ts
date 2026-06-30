@@ -40,12 +40,17 @@ export class InvalidTimezoneError extends Error {
  *   The original filesystem error is wrapped via the `cause` option (Node 16+).
  * - `INVALID_FORMAT` — `format` is not in the documented `"pretty" | "json"`
  *   union (e.g. typo'd as `"JSON"` or `"plain"`).
+ * - `INVALID_MASK` — `maskMetaKeys` is not an array of strings. A bare string
+ *   (the natural typo `maskMetaKeys: "password"` instead of
+ *   `["password"]`), `null`, or an array containing a non-string entry all
+ *   throw this code. `undefined` is accepted and treated as `[]`.
  */
 export type LoggerOptionErrorCode =
   | "INVALID_LEVEL"
   | "INVALID_ROTATION"
   | "LOG_DIRECTORY_UNWRITABLE"
-  | "INVALID_FORMAT";
+  | "INVALID_FORMAT"
+  | "INVALID_MASK";
 
 /**
  * Structured option-validation error thrown by `createLogger()` when the
@@ -102,11 +107,14 @@ export class LoggerOptionError extends Error {
  *
  * - `INVALID_LEVEL` — `level` is not in the npm-levels union (when supplied as
  *   a string; function-form `level` is not validated up front).
- * - `INVALID_MASK` — `maskBodyKeys`, `maskHeaderKeys`, or `maskQueryKeys` is
- *   not an array of strings (the `false` opt-out for the header/query masks is
- *   still accepted; only malformed array forms throw).
+ * - `INVALID_MASK` — `maskBodyKeys`, `maskHeaderKeys`, `maskQueryKeys`, or
+ *   `redactPaths` is not an array of strings (the `false` opt-out for the
+ *   header/query masks is still accepted; only malformed array forms throw).
+ * - `INVALID_BODY_LIMIT` — `maxBodyLength` is not a positive number or
+ *   `Infinity`. `NaN`, `0`, negative values, and non-number types all throw
+ *   this code. `undefined` is accepted and falls back to the default of `3000`.
  */
-export type RequestLoggerOptionErrorCode = "INVALID_LEVEL" | "INVALID_MASK";
+export type RequestLoggerOptionErrorCode = "INVALID_LEVEL" | "INVALID_MASK" | "INVALID_BODY_LIMIT";
 
 /**
  * Structured option-validation error thrown by `createRequestLogger()` when

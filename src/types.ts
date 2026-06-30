@@ -468,7 +468,7 @@ export interface RequestLoggerOptions {
     req: LoggableRequest,
     res: LoggableResponse,
     durationMs: number,
-  ) => Record<string, unknown>;
+  ) => Record<string, unknown> | null | undefined;
   /**
    * When true, includes request headers. Provide an allow list to control which keys to emit.
    */
@@ -482,7 +482,14 @@ export interface RequestLoggerOptions {
    */
   includeRequestBody?: boolean;
   /**
-   * Max serialized body length to guard against huge payloads.
+   * Caps serialized body size to guard against log-flood attacks from huge
+   * payloads. Defaults to `3000` (characters).
+   *
+   * Must be a **positive number** or `Infinity` when supplied. `Infinity`
+   * disables truncation entirely (body is always logged in full). `NaN`, `0`,
+   * negative values, and non-number types throw
+   * `RequestLoggerOptionError({ code: "INVALID_BODY_LIMIT" })` synchronously
+   * at middleware-creation time.
    */
   maxBodyLength?: number;
   /**
@@ -520,6 +527,12 @@ export interface RequestLoggerOptions {
    * `["body.user.password"]` — note that `body.*` resolves against the
    * captured `requestBody` object). Missing intermediate keys are handled
    * gracefully (no-op).
+   *
+   * Must be an array of strings (or `undefined`). A non-array value (e.g. the
+   * typo `"body.password"` instead of `["body.password"]`) throws
+   * `RequestLoggerOptionError({ code: "INVALID_MASK" })` at middleware-creation
+   * time so the misconfiguration surfaces immediately rather than silently
+   * failing to redact the intended secret.
    *
    * Defaults to `[]`.
    */

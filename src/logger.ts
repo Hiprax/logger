@@ -79,6 +79,34 @@ const validateFormatOption = (value: unknown): void => {
   }
 };
 
+/**
+ * Validates `maskMetaKeys` up front — before the cache lookup — so a bad
+ * value always throws a structured {@link LoggerOptionError} even when a
+ * logger is already cached for the same `moduleName` + `logDirectory`. A bare
+ * string (the natural typo `"password"` instead of `["password"]`), `null`,
+ * or an array containing a non-string entry all throw `INVALID_MASK`.
+ * `undefined` is accepted and treated as the default `[]`.
+ */
+const validateMaskMetaKeysOption = (value: unknown): void => {
+  if (value === undefined) {
+    return;
+  }
+  if (!Array.isArray(value)) {
+    throw new LoggerOptionError(
+      "INVALID_MASK",
+      `Invalid \`maskMetaKeys\` option: expected an array of strings, but received ${typeof value}.`,
+    );
+  }
+  for (let i = 0; i < value.length; i++) {
+    if (typeof value[i] !== "string") {
+      throw new LoggerOptionError(
+        "INVALID_MASK",
+        `Invalid \`maskMetaKeys\` option: entry at index ${i} must be a string (got ${typeof value[i]}).`,
+      );
+    }
+  }
+};
+
 const validateRotationField = (label: string, value: unknown, pattern: RegExp): void => {
   if (value === undefined) {
     return;
@@ -531,7 +559,7 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
         ? info.message
         : typeof info.message === "bigint"
           ? info.message.toString()
-          : JSON.stringify(info.message, bigintSafeReplacer, 2);
+          : (JSON.stringify(info.message, bigintSafeReplacer, 2) ?? String(info.message));
     // When `escapeMessageNewlines` is on AND the original message was a string,
     // rewrite embedded `\r` / `\n` to their visible escape sequences so a
     // user-supplied payload like `"alice\n[ERROR] (admin)\nfake event"` cannot
@@ -764,6 +792,11 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
   validateLogLevelOption("consoleLevel", consoleLevel);
   validateFormatOption(format);
 
+  // Validate `maskMetaKeys` BEFORE the cache lookup so a non-array or an
+  // array-with-non-string entry throws a structured LoggerOptionError even
+  // when a logger is already cached for the same module + directory.
+  validateMaskMetaKeysOption(maskMetaKeys as unknown);
+
   // Validate `rotation` and `globalRotation` shapes (lenient regex on
   // `maxSize`/`maxFiles`) BEFORE the cache lookup. Rejects garbage values like
   // `"abc"` while accepting `"20m"`, `"500"`, `"14d"`, etc.
@@ -878,16 +911,28 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     // Error instances to `{ message, stack, ...rest }` so the stack survives
     // the JSON serialization; `buildMetaRedactor` runs the shared deep
     // redaction over caller-supplied metadata BEFORE `json()` serializes —
-    // so secrets never reach the line. The console pipeline gets the SAME
-    // raw JSON (no colorize) so a consumer piping `stdout` to a shipper
-    // sees byte-identical payloads on every transport.
+    // so secrets never reach the line.
+    //
+    // The Console transport receives a SEPARATE format chain that intentionally
+    // omits `timestampCapture`. Winston applies the logger-level `sharedFormat`
+    // first (writing `info.timestamp` via the single `clock()` call), then
+    // pipes a shallow clone of the transformed info to each transport's own
+    // format. If the Console transport's format also included `timestampCapture`,
+    // `clock()` would fire a second time and overwrite `info.timestamp` with a
+    // new value — making the console JSON timestamp diverge from the file JSON
+    // timestamp. Omitting it here means `json()` serializes the timestamp that
+    // was already captured at log-call time, keeping all outputs identical.
     sharedFormat = winston.format.combine(
       timestampCapture,
       winston.format.errors({ stack: true }),
       buildMetaRedactor(maskMetaKeySet),
       winston.format.json(),
     );
-    consoleFormat = sharedFormat;
+    consoleFormat = winston.format.combine(
+      winston.format.errors({ stack: true }),
+      buildMetaRedactor(maskMetaKeySet),
+      winston.format.json(),
+    );
   } else {
     // Pretty branch — preserves the existing human-readable printf output
     // for backward compatibility. The timestamp capture runs FIRST so
@@ -1383,7 +1428,7 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5000;
  */
 const shutdownPromises = new WeakMap<winston.Logger, Promise<void>>();
 
-interface ShutdownOptions {
+export interface ShutdownOptions {
   /** Maximum time (in ms) to wait for every transport to flush. Default 5000. */
   timeoutMs?: number;
 }
@@ -1442,10 +1487,20 @@ const awaitTransportFlush = (
  * has flushed, or rejects with a clear timeout error after `timeoutMs` ms
  * (default 5000).
  *
- * Idempotent: calling `shutdownLogger(logger)` a second time returns the same
- * promise as the first call. After a successful shutdown the logger should be
- * considered closed — further `logger.info(...)` calls may silently no-op or
- * throw depending on the underlying transport state.
+ * **Idempotent for successful shutdowns:** a second call after the first
+ * resolves returns the same cached resolved promise — `logger.end()` is never
+ * issued a second time.
+ *
+ * **Retryable after a timeout:** a timed-out shutdown evicts its cached promise
+ * so a subsequent call can retry the flush with a fresh `timeoutMs`. This
+ * allows callers to escalate: call first with a short deadline, catch the
+ * timeout, then call again with a longer one. Concurrent same-tick calls still
+ * share one in-flight promise regardless of which `timeoutMs` value reaches the
+ * `WeakMap` first.
+ *
+ * After a successful shutdown the logger should be considered closed — further
+ * `logger.info(...)` calls may silently no-op or throw depending on the
+ * underlying transport state.
  *
  * @example
  * ```ts
@@ -1510,17 +1565,33 @@ export const shutdownLogger = (
     timeoutHandle.unref?.();
   });
 
-  const promise = Promise.race([flushAll, timeout]).finally(() => {
-    if (timeoutHandle !== undefined) {
-      clearTimeout(timeoutHandle);
-    }
-    // Detach every per-transport listener pair regardless of which side of the
-    // race won. On the success path `settle()` already removed them (and a
-    // second `removeListener` for an absent handler is a documented no-op), so
-    // this is safe to call unconditionally; on the timeout path this is the
-    // ONLY place the listeners get removed, so it is load-bearing.
-    awaiters.forEach((awaiter) => awaiter.cleanup());
-  });
+  const promise = Promise.race([flushAll, timeout])
+    .catch((err) => {
+      // On rejection (timeout), evict the WeakMap so a subsequent call can
+      // retry the flush with a fresh timeout. Successful shutdowns are NOT
+      // evicted — their cached resolved promise is the idempotent "already
+      // done" signal. The identity check is defensive: in single-threaded JS
+      // no code can run between the rejection microtask and this `.catch()`
+      // handler, so the stored entry will always be `promise`. The guard exists
+      // so that if this function is ever refactored to be partially async (e.g.
+      // an `await` is introduced before the `set`), a retry that managed to
+      // install a newer entry first would not be accidentally evicted here.
+      if (shutdownPromises.get(logger) === promise) {
+        shutdownPromises.delete(logger);
+      }
+      throw err;
+    })
+    .finally(() => {
+      if (timeoutHandle !== undefined) {
+        clearTimeout(timeoutHandle);
+      }
+      // Detach every per-transport listener pair regardless of which side of
+      // the race won. On the success path `settle()` already removed them (and
+      // a second `removeListener` for an absent handler is a documented no-op),
+      // so this is safe to call unconditionally; on the timeout path this is
+      // the ONLY place the listeners get removed, so it is load-bearing.
+      awaiters.forEach((awaiter) => awaiter.cleanup());
+    });
 
   shutdownPromises.set(logger, promise);
   return promise;
@@ -1570,6 +1641,7 @@ export const __loggerInternals = {
   validateRotationStrategy,
   validateRotationField,
   validateFormatOption,
+  validateMaskMetaKeysOption,
   isValidLogLevel,
   ensureDirectory,
   bigintSafeReplacer,

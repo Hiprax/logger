@@ -7,6 +7,7 @@ export {
   defaultRotation,
   getDefaultRotation,
 } from "./logger";
+export type { ShutdownOptions } from "./logger";
 export { createRequestLogger, REQUEST_START_SYMBOL } from "./request-middleware";
 export { InvalidTimezoneError, LoggerOptionError, RequestLoggerOptionError } from "./errors";
 export type { LoggerOptionErrorCode, RequestLoggerOptionErrorCode } from "./errors";

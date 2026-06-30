@@ -7,7 +7,7 @@ import {
 import * as loggerModule from "../src/logger";
 import { resetLoggerRegistry } from "../src/logger";
 import { RequestLoggerOptionError } from "../src/errors";
-import type { LoggableRequest, LoggableResponse, LoggableNext } from "../src/types";
+import type { LoggableRequest, LoggableResponse, LoggableNext, LogLevel } from "../src/types";
 import { createMockLogger, MockRequest, runMiddleware, withEnv } from "./_helpers";
 
 describe("createRequestLogger", () => {
@@ -393,12 +393,13 @@ describe("createRequestLogger", () => {
   it("logs the entry without context when enrich returns undefined", () => {
     // Exercises the `enrich(...) ?? undefined` branch — when the user-supplied
     // `enrich` returns `undefined`, the entry is still logged but
-    // `entry.context` is left as `undefined`.
+    // `entry.context` is left as `undefined`. The return type now explicitly
+    // includes `| undefined` so no cast is required.
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
       logger,
       includeHttpContext: true,
-      enrich: () => undefined as unknown as Record<string, unknown>,
+      enrich: () => undefined,
     });
 
     const { res } = runMiddleware(middleware);
@@ -411,12 +412,13 @@ describe("createRequestLogger", () => {
 
   it("logs the entry without context when enrich returns null", () => {
     // Same `?? undefined` collapse path, exercising the explicit `null`
-    // return that some user enrichers may produce.
+    // return that some user enrichers may produce. The return type now
+    // explicitly includes `| null` so no cast is required.
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
       logger,
       includeHttpContext: true,
-      enrich: () => null as unknown as Record<string, unknown>,
+      enrich: () => null,
     });
 
     const { res } = runMiddleware(middleware);
@@ -713,7 +715,7 @@ describe("createRequestLogger", () => {
     res.emit("finish");
 
     const payload = log.mock.calls[0][0];
-    expect(payload.http.url).toBe("/auth/login?token=%5BREDACTED%5D&keep=me");
+    expect(payload.http.url).toBe("/auth/login?token=[REDACTED]&keep=me");
   });
 
   it("redacts originalUrl alongside url when originalUrl differs from url", () => {
@@ -729,7 +731,7 @@ describe("createRequestLogger", () => {
     res.emit("finish");
 
     const payload = log.mock.calls[0][0];
-    expect(payload.http.url).toBe("/auth/login?token=%5BREDACTED%5D&keep=me");
+    expect(payload.http.url).toBe("/auth/login?token=[REDACTED]&keep=me");
   });
 
   it("supports custom maskQueryKeys arrays (case-insensitive)", () => {
@@ -746,7 +748,7 @@ describe("createRequestLogger", () => {
     res.emit("finish");
 
     const payload = log.mock.calls[0][0];
-    expect(payload.http.url).toBe("/path?SessionId=%5BREDACTED%5D&token=keep");
+    expect(payload.http.url).toBe("/path?SessionId=[REDACTED]&token=keep");
   });
 
   it("disables query masking entirely when maskQueryKeys is false", () => {
@@ -1199,6 +1201,115 @@ describe("createRequestLogger", () => {
       ).toThrow(RequestLoggerOptionError);
     });
 
+    it("throws RequestLoggerOptionError({ code: 'INVALID_BODY_LIMIT' }) for NaN", () => {
+      let caught: unknown;
+      try {
+        createRequestLogger({ maxBodyLength: NaN });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(RequestLoggerOptionError);
+      expect((caught as RequestLoggerOptionError).code).toBe("INVALID_BODY_LIMIT");
+      expect((caught as RequestLoggerOptionError).message).toContain("maxBodyLength");
+    });
+
+    it("throws RequestLoggerOptionError({ code: 'INVALID_BODY_LIMIT' }) for 0", () => {
+      let caught: unknown;
+      try {
+        createRequestLogger({ maxBodyLength: 0 });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(RequestLoggerOptionError);
+      expect((caught as RequestLoggerOptionError).code).toBe("INVALID_BODY_LIMIT");
+      expect((caught as RequestLoggerOptionError).message).toContain("maxBodyLength");
+    });
+
+    it("throws RequestLoggerOptionError({ code: 'INVALID_BODY_LIMIT' }) for a negative value", () => {
+      let caught: unknown;
+      try {
+        createRequestLogger({ maxBodyLength: -5 });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(RequestLoggerOptionError);
+      expect((caught as RequestLoggerOptionError).code).toBe("INVALID_BODY_LIMIT");
+      expect((caught as RequestLoggerOptionError).message).toContain("maxBodyLength");
+    });
+
+    it("throws RequestLoggerOptionError({ code: 'INVALID_BODY_LIMIT' }) for a non-number type", () => {
+      let caught: unknown;
+      try {
+        createRequestLogger({ maxBodyLength: "100" as unknown as number });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(RequestLoggerOptionError);
+      expect((caught as RequestLoggerOptionError).code).toBe("INVALID_BODY_LIMIT");
+      expect((caught as RequestLoggerOptionError).message).toContain("maxBodyLength");
+    });
+
+    it("accepts a valid positive maxBodyLength without throwing", () => {
+      const { logger } = createMockLogger();
+      expect(() => createRequestLogger({ logger, maxBodyLength: 5000 })).not.toThrow();
+    });
+
+    it("accepts Infinity as maxBodyLength and never truncates the body", () => {
+      const { logger, log } = createMockLogger();
+      const body = "x".repeat(4000);
+      const middleware = createRequestLogger({
+        logger,
+        includeRequestBody: true,
+        includeHttpContext: true,
+        maxBodyLength: Infinity,
+      });
+
+      const { res } = runMiddleware(middleware, { body });
+      res.emit("finish");
+
+      const payload = log.mock.calls[0][0];
+      expect(typeof payload.http.requestBody).toBe("string");
+      expect(payload.http.requestBody).toBe(body);
+      expect((payload.http.requestBody as string).length).toBe(4000);
+    });
+
+    it("throws RequestLoggerOptionError({ code: 'INVALID_MASK' }) when redactPaths is a string instead of array", () => {
+      let caught: unknown;
+      try {
+        createRequestLogger({ redactPaths: "body.password" as unknown as string[] });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(RequestLoggerOptionError);
+      expect((caught as RequestLoggerOptionError).code).toBe("INVALID_MASK");
+      expect((caught as RequestLoggerOptionError).message).toContain("redactPaths");
+    });
+
+    it("throws RequestLoggerOptionError({ code: 'INVALID_MASK' }) when a redactPaths entry is not a string", () => {
+      let caught: unknown;
+      try {
+        createRequestLogger({ redactPaths: ["body.user.password", 42 as unknown as string] });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(RequestLoggerOptionError);
+      expect((caught as RequestLoggerOptionError).code).toBe("INVALID_MASK");
+      expect((caught as RequestLoggerOptionError).message).toContain("redactPaths");
+      expect((caught as RequestLoggerOptionError).message).toContain("index 1");
+    });
+
+    it("accepts redactPaths: undefined without throwing", () => {
+      const { logger } = createMockLogger();
+      expect(() => createRequestLogger({ logger, redactPaths: undefined })).not.toThrow();
+    });
+
+    it("accepts a valid string[] for redactPaths without throwing", () => {
+      const { logger } = createMockLogger();
+      expect(() =>
+        createRequestLogger({ logger, redactPaths: ["body.user.password", "context.token"] }),
+      ).not.toThrow();
+    });
+
     it("RequestLoggerOptionError without a cause leaves `cause` as undefined", () => {
       const err = new RequestLoggerOptionError("INVALID_LEVEL", "no cause");
       expect(err.code).toBe("INVALID_LEVEL");
@@ -1239,6 +1350,215 @@ describe("createRequestLogger", () => {
     // And as a sanity check: the request DID get mutated.
     expect((req as { body: unknown }).body).toEqual({ redacted: true });
   });
+
+  // ---------------------------------------------------------------------------
+  // Phase 1 — finalize() never-crash hardening (Task 1.2)
+  // ---------------------------------------------------------------------------
+
+  it("does not propagate when enrich throws, and writes one console.error", () => {
+    const { logger, log } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      enrich: () => {
+        throw new Error("enrich boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toContain("@hiprax/logger request logger failed");
+  });
+
+  it("does not propagate when messageBuilder throws, and writes one console.error", () => {
+    const { logger, log } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      messageBuilder: () => {
+        throw new Error("messageBuilder boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toContain("@hiprax/logger request logger failed");
+  });
+
+  it("does not propagate when logger.log throws, and writes one console.error", () => {
+    const { logger, log } = createMockLogger();
+    log.mockImplementation(() => {
+      throw "log string throw";
+    });
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({ logger });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toContain("log string throw");
+  });
+
+  it("does not propagate when a function-form level throws, and writes one console.error", () => {
+    const { logger, log } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      level: (_statusCode: number) => {
+        throw new Error("level boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toContain("@hiprax/logger request logger failed");
+  });
+
+  it("catch block falls back to GET and empty string when method and URL fields are absent", () => {
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      enrich: () => {
+        throw new Error("enrich boom fallback");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, {
+      method: undefined as unknown as string,
+      originalUrl: undefined as unknown as string,
+      url: undefined as unknown as string,
+    });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toMatch(/GET .* enrich boom fallback/);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 2 — function-form level validated at request time (Task 2.3)
+  // ---------------------------------------------------------------------------
+
+  it("function-form level returning an invalid string logs at the status-derived level (2xx → info)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      level: () => "not-a-level" as unknown as LogLevel,
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.statusCode = 200;
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0].level).toBe("info");
+  });
+
+  it("function-form level returning undefined logs at the status-derived level (5xx → error)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      level: () => undefined as unknown as LogLevel,
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.statusCode = 500;
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0].level).toBe("error");
+  });
+
+  it("function-form level returning undefined logs at the status-derived level (4xx → warn)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      level: () => undefined as unknown as LogLevel,
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.statusCode = 404;
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0].level).toBe("warn");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 9 — API / type / hot-path polish (Tasks 9.1, 9.3)
+  // ---------------------------------------------------------------------------
+
+  it("enrich type accepts null return without a cast (Phase 9 — widened return type)", () => {
+    // This test compiles without the `as unknown as Record<string, unknown>`
+    // cast that was needed before the type widening. The runtime behavior
+    // (no context on the entry) is the same as the existing null-return test.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      // TypeScript must accept `() => null` without an explicit cast.
+      enrich: (): null => null,
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0].http.context).toBeUndefined();
+  });
+
+  it("enrich type accepts undefined return without a cast (Phase 9 — widened return type)", () => {
+    // Mirrors the null variant above for the undefined branch.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: (): undefined => undefined,
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0].http.context).toBeUndefined();
+  });
+
+  it("maskBodyKeys is pre-resolved at construction and redacts body keys case-insensitively (Phase 9)", () => {
+    // Verify that the pre-resolved bodyMaskSet is used correctly end-to-end:
+    // construction happens once, per-request path passes the Set to
+    // serializeBody without rebuilding it.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      maskBodyKeys: ["password", "Token"],
+    });
+
+    const { res } = runMiddleware(middleware, {
+      body: { username: "alice", Password: "secret", token: "abc123" },
+    });
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const body = log.mock.calls[0][0].http.requestBody as Record<string, unknown>;
+    expect(body.username).toBe("alice");
+    // Case-insensitive: "password" in maskBodyKeys → "Password" key is redacted.
+    expect(body.Password).toBe("[REDACTED]");
+    // Case-insensitive: "Token" in maskBodyKeys → "token" key is redacted.
+    expect(body.token).toBe("[REDACTED]");
+  });
 });
 
 describe("request middleware internals", () => {
@@ -1261,6 +1581,29 @@ describe("request middleware internals", () => {
     expect(serializeBody("hello", undefined, 100)).toBe("hello");
     // Total length is now exactly `maxBodyLength` (4): `tru` (3 chars) + `…`.
     expect(serializeBody("truncate-me", undefined, 4)).toBe("tru…");
+  });
+
+  it("serializeBody accepts a pre-resolved ReadonlySet<string> and redacts correctly (Phase 9 — Task 9.3)", () => {
+    // When the caller passes a Set (as the construction-time bodyMaskSet does),
+    // serializeBody must use it directly without building a new Set. The
+    // redaction must still be case-insensitive because redactValue checks
+    // maskKeys.has(key.toLowerCase()).
+    const maskSet = new Set(["password", "token"]);
+    const body = { email: "user@example.com", Password: "secret", token: "abc", visible: "yes" };
+    const result = serializeBody(body, maskSet) as Record<string, unknown>;
+    expect(result.email).toBe("user@example.com");
+    // redactValue lowercases the object key before checking the Set.
+    expect(result.Password).toBe("[REDACTED]");
+    expect(result.token).toBe("[REDACTED]");
+    expect(result.visible).toBe("yes");
+  });
+
+  it("serializeBody still accepts a string[] array for maskKeys (backward compat for test callers)", () => {
+    // Existing callers via __requestInternals continue to pass arrays.
+    const body = { x: "keep", secret: "leak" };
+    const result = serializeBody(body, ["secret"]) as Record<string, unknown>;
+    expect(result.x).toBe("keep");
+    expect(result.secret).toBe("[REDACTED]");
   });
 
   it("truncates fallback strings when JSON serialization fails", () => {
@@ -1376,11 +1719,10 @@ describe("request middleware internals", () => {
     // iterator instead, so an emoji is kept whole or skipped entirely —
     // never torn in half.
     //
-    // For `truncateString("ab😀😀", 4)`: maxLength=4, so the helper takes
-    // `Array.from("ab😀😀").slice(0, 3)` = `['a', 'b', '😀']`, joins it, and
-    // appends `…` — yielding `"ab😀…"` (4 code points; the first emoji is
-    // preserved intact). Critically, the result must NOT contain a lone
-    // surrogate (the regression the audit flagged).
+    // For `truncateString("ab😀😀", 4)`: maxLength=4, so the bounded for...of
+    // collects 3 code points = `['a', 'b', '😀']` then appends `…` —
+    // yielding `"ab😀…"` (4 code points; the first emoji is preserved
+    // intact). Critically, the result must NOT contain a lone surrogate.
     const truncated = truncateString("ab😀😀", 4);
     expect(truncated).toBe("ab😀…");
     // Defensive guard: no lone surrogate in the output. `\uD83D` is the high
@@ -1389,9 +1731,9 @@ describe("request middleware internals", () => {
     expect(truncated).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
 
     // With `maxLength=5` (still less than the 6-code-unit `value.length`,
-    // so the early-exit does not fire), the helper takes 4 code points:
-    // `['a', 'b', '😀', '😀']` joined + `…` = `"ab😀😀…"`. Both emojis are
-    // kept whole — the truncation strictly trims from the end.
+    // so the early-exit does not fire), the for...of collects 4 code points:
+    // `['a', 'b', '😀', '😀']` then appends `…` = `"ab😀😀…"`. Both emojis
+    // are kept whole — the truncation strictly trims from the end.
     expect(truncateString("ab😀😀", 5)).toBe("ab😀😀…");
 
     // No truncation needed when the input fits the limit (measured in CODE
@@ -1409,9 +1751,74 @@ describe("request middleware internals", () => {
     // consumers who need grapheme-correct slicing should reach for
     // `Intl.Segmenter`.
     const composed = `ábc`; // 4 code points, displays as "ábc"
-    // maxLength=2 → result is `…` after 1 code point: `"…"` is 1 char.
-    // The implementation: `Array.from(...).slice(0, 1).join("") + "…"` → `"a…"`
+    // maxLength=2 → for...of collects 1 code point then appends `…` → `"a…"`.
     expect(truncateString(composed, 2)).toBe("a…");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 6 — truncateString O(maxLength) bounded for...of (Task 6.2)
+  // ---------------------------------------------------------------------------
+
+  describe("truncateString (Phase 6 — bounded for...of parity)", () => {
+    // Reference implementation preserved from before Phase 6: the old
+    // Array.from-based semantics. Used to verify the new for...of loop
+    // produces byte-identical output for every input class.
+    const arrayFromTruncate = (value: string, maxLength: number): string => {
+      if (value.length <= maxLength) {
+        return value;
+      }
+      if (maxLength <= 0) {
+        return "";
+      }
+      if (maxLength === 1) {
+        return "…";
+      }
+      return `${Array.from(value)
+        .slice(0, maxLength - 1)
+        .join("")}…`;
+    };
+
+    it("produces identical output to Array.from semantics for ASCII strings at several maxLengths", () => {
+      const s = "abcdefghijklmnopqrstuvwxyz"; // 26 chars, all single code points
+      for (const ml of [0, 1, 2, 5, 13, 26, 27]) {
+        expect(truncateString(s, ml)).toBe(arrayFromTruncate(s, ml));
+      }
+    });
+
+    it("produces identical output to Array.from semantics for emoji strings at several maxLengths", () => {
+      // "😀" encodes as a UTF-16 surrogate pair (2 code units, 1 code point).
+      // The string has 1000 code points but 2000 code units, so no early-exit
+      // fires for the maxLengths tested here.
+      const s = "😀".repeat(1000); // 1000 × "😀"
+      for (const ml of [0, 1, 2, 3, 5, 10, 50]) {
+        expect(truncateString(s, ml)).toBe(arrayFromTruncate(s, ml));
+      }
+    });
+
+    it("produces identical output to Array.from semantics for mixed ASCII+emoji strings", () => {
+      // Alternating ASCII + emoji: 8 code points, 12 code units.
+      const s = "a😀b😀c😀d😀";
+      for (const ml of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15]) {
+        expect(truncateString(s, ml)).toBe(arrayFromTruncate(s, ml));
+      }
+    });
+
+    it("completes in bounded time on a >=100 kB string (O(maxLength) regression guard)", () => {
+      // An O(input-length) regression (e.g. reverting to Array.from) would
+      // make this call proportionally slower as input grows. With 200 kB input
+      // and maxLength=50, an O(n) pass walks 200 000 chars; O(maxLength) walks
+      // only 50. The 200 ms ceiling is deliberately generous: even on slow CI
+      // the bounded loop should complete in microseconds.
+      const hugeInput = "x".repeat(200_000); // ~200 kB ASCII
+      const maxLen = 50;
+      const start = performance.now();
+      const result = truncateString(hugeInput, maxLen);
+      const elapsed = performance.now() - start;
+      expect(elapsed).toBeLessThan(200);
+      // Sanity-check the output is still correct.
+      expect(result.length).toBe(maxLen);
+      expect(result.endsWith("…")).toBe(true);
+    });
   });
 
   it("buildTruncatedEnvelope reports original length and a fixed-size preview", () => {
@@ -1439,11 +1846,9 @@ describe("request middleware internals", () => {
 
   it("redactUrlQuery rewrites both absolute and relative URL query strings", () => {
     const mask = new Set(["token", "secret"]);
-    expect(redactUrlQuery("/path?token=abc&keep=me", mask)).toBe(
-      "/path?token=%5BREDACTED%5D&keep=me",
-    );
+    expect(redactUrlQuery("/path?token=abc&keep=me", mask)).toBe("/path?token=[REDACTED]&keep=me");
     expect(redactUrlQuery("https://api.example.com/path?secret=sk-1&safe=ok", mask)).toBe(
-      "https://api.example.com/path?secret=%5BREDACTED%5D&safe=ok",
+      "https://api.example.com/path?secret=[REDACTED]&safe=ok",
     );
   });
 
@@ -1455,6 +1860,33 @@ describe("request middleware internals", () => {
     // never the cause of a request failure.
     const malformed = "http://[invalid?token=abc";
     expect(redactUrlQuery(malformed, mask)).toBe(malformed);
+  });
+
+  it("redactUrlQuery emits the literal [REDACTED] sentinel (not %5BREDACTED%5D) for relative URLs", () => {
+    // URLSearchParams.toString() percent-encodes `[` → `%5B` and `]` → `%5D`.
+    // Without the post-processing `.replace(/%5B/gi,"[").replace(/%5D/gi,"]")`
+    // the logged URL would show `token=%5BREDACTED%5D` instead of the literal
+    // sentinel used everywhere else in the package, breaking log monitoring.
+    const mask = new Set(["token", "api_key"]);
+    const result = redactUrlQuery("/auth/login?token=secret&keep=me&api_key=sk-1", mask);
+    expect(result).toContain("[REDACTED]");
+    expect(result).not.toContain("%5B");
+    expect(result).not.toContain("%5D");
+    expect(result).toBe("/auth/login?token=[REDACTED]&keep=me&api_key=[REDACTED]");
+  });
+
+  it("redactUrlQuery emits the literal [REDACTED] sentinel (not %5BREDACTED%5D) for absolute URLs", () => {
+    const mask = new Set(["secret", "token"]);
+    const result = redactUrlQuery(
+      "https://api.example.com/v1/resource?secret=top&token=abc&safe=ok",
+      mask,
+    );
+    expect(result).toContain("[REDACTED]");
+    expect(result).not.toContain("%5B");
+    expect(result).not.toContain("%5D");
+    expect(result).toBe(
+      "https://api.example.com/v1/resource?secret=[REDACTED]&token=[REDACTED]&safe=ok",
+    );
   });
 
   it("redactEntryPath redacts a top-level path", () => {

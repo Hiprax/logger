@@ -34,8 +34,10 @@ const isValidLogLevel = (value: unknown): value is LogLevel =>
 
 /**
  * Validates the static-string form of `RequestLoggerOptions.level`. The
- * function-form (`(statusCode) => LogLevel`) is NOT validated here — the
- * function's return value is checked at request time by the middleware itself.
+ * function-form (`(statusCode) => LogLevel`) is accepted here without
+ * up-front validation — its return value is validated at request time inside
+ * `finalize()`: an invalid or `undefined` return falls back to
+ * `determineLevel(statusCode)` so the log line is never silently dropped.
  */
 const validateRequestLevelOption = (value: unknown): void => {
   if (value === undefined || typeof value === "function") {
@@ -79,6 +81,27 @@ const validateMaskKeysOption = (label: string, value: unknown, allowFalse: boole
     throw new RequestLoggerOptionError(
       "INVALID_MASK",
       `Invalid \`${label}\` option: every entry must be a string. Entry at index ${badIndex} is ${typeof value[badIndex]}.`,
+    );
+  }
+};
+
+/**
+ * Validates `RequestLoggerOptions.maxBodyLength`. Accepts `undefined` (falls
+ * back to `DEFAULT_BODY_LIMIT`). Otherwise requires a number that is not `NaN`
+ * and is `> 0` — this rejects `0`, negatives, and non-numbers while preserving
+ * `Infinity` as "unlimited" (body is never truncated). Throws
+ * `RequestLoggerOptionError({ code: "INVALID_BODY_LIMIT" })` on bad input.
+ */
+const validateMaxBodyLength = (value: unknown): void => {
+  if (value === undefined) {
+    return;
+  }
+  if (typeof value !== "number" || isNaN(value) || value <= 0) {
+    throw new RequestLoggerOptionError(
+      "INVALID_BODY_LIMIT",
+      `Invalid \`maxBodyLength\` option: expected a positive number or Infinity, got ${
+        typeof value === "number" ? value : JSON.stringify(value)
+      }.`,
     );
   }
 };
@@ -156,8 +179,7 @@ const determineLevel = (statusCode: number): LogLevel => {
 
 /**
  * Truncates a string to fit within `maxLength` total characters, INCLUDING the
- * trailing ellipsis. Returns the input unchanged when it already fits. Uses
- * `Array.from(value).slice(0, maxLength - 1).join("") + "…"` so the result
+ * trailing ellipsis. Returns the input unchanged when it already fits. Result
  * length is exactly `maxLength` Unicode code points for any string longer than
  * the limit. When `maxLength <= 0` (a degenerate caller-supplied limit),
  * returns an empty string. When `maxLength === 1`, returns the single
@@ -183,14 +205,21 @@ const truncateString = (value: string, maxLength: number): string => {
   if (maxLength === 1) {
     return "…";
   }
-  // `Array.from(string)` iterates by Unicode code point (using the string's
-  // built-in `[Symbol.iterator]`), so an emoji-surrogate-pair like `"😀"` is
-  // treated as a single element instead of being torn in half by a code-unit
-  // `.slice(...)`. The cost is one O(n) walk over the input — acceptable for
-  // log-line truncation where `n` is bounded by `maxBodyLength`.
-  return `${Array.from(value)
-    .slice(0, maxLength - 1)
-    .join("")}…`;
+  // Bounded for...of: stops after collecting maxLength - 1 code points so the
+  // cost is O(maxLength) rather than O(input length). `for...of` over a string
+  // iterates by Unicode code point (the same iterator `Array.from` uses), so
+  // emoji surrogate pairs like `"😀"` are never torn in half at a boundary.
+  let result = "";
+  let count = 0;
+  const limit = maxLength - 1;
+  for (const codePoint of value) {
+    if (count >= limit) {
+      break;
+    }
+    result += codePoint;
+    count++;
+  }
+  return `${result}…`;
 };
 
 interface TruncatedBodyEnvelope {
@@ -210,16 +239,27 @@ const buildTruncatedEnvelope = (serialized: string, maxLength: number): Truncate
   _preview: truncateString(serialized, maxLength),
 });
 
-const serializeBody = (body: unknown, maskKeys?: string[], maxLength = DEFAULT_BODY_LIMIT) => {
+const serializeBody = (
+  body: unknown,
+  maskKeys?: string[] | ReadonlySet<string>,
+  maxLength = DEFAULT_BODY_LIMIT,
+) => {
   if (body === undefined || body === null) {
     return undefined;
   }
 
-  const masked = redactValue(
-    body,
-    new Set((maskKeys ?? []).map((key) => key.toLowerCase())),
-    new WeakSet(),
-  );
+  // Accept either a pre-resolved Set (passed from the construction-time hot
+  // path) or a plain array (used by __requestInternals direct test calls).
+  // `Array.isArray` is the discriminant — it narrows `maskKeys` to `string[]`
+  // in the true branch so `.map()` type-checks cleanly. In the else branch the
+  // value is `ReadonlySet<string> | undefined`; we cast to `Set<string>` (all
+  // ReadonlySet values are Set instances at runtime) and fall back to an empty
+  // Set for the undefined case.
+  const maskSet: Set<string> = Array.isArray(maskKeys)
+    ? new Set(maskKeys.map((key) => key.toLowerCase()))
+    : ((maskKeys as Set<string> | undefined) ?? new Set<string>());
+
+  const masked = redactValue(body, maskSet, new WeakSet());
 
   if (typeof masked === "string") {
     return truncateString(masked, maxLength);
@@ -370,7 +410,7 @@ const redactUrlQuery = (url: string, maskQueryKeys: ReadonlySet<string> | undefi
       return url;
     }
 
-    parsed.search = params.toString();
+    parsed.search = params.toString().replace(/%5B/gi, "[").replace(/%5D/gi, "]");
     if (isAbsolute) {
       return parsed.toString();
     }
@@ -574,6 +614,8 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
   validateMaskKeysOption("maskBodyKeys", options.maskBodyKeys, false);
   validateMaskKeysOption("maskHeaderKeys", options.maskHeaderKeys, true);
   validateMaskKeysOption("maskQueryKeys", options.maskQueryKeys, true);
+  validateMaskKeysOption("redactPaths", options.redactPaths, false);
+  validateMaxBodyLength(options.maxBodyLength);
 
   const { loggingEnabled = true, loggingMode } = options;
   const envAllowsLogging = shouldLogForEnvironment(loggingMode);
@@ -606,6 +648,13 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
   // arrays/sets for every request.
   const headerMaskSet = resolveMaskHeaderKeys(maskHeaderKeys);
   const queryMaskSet = resolveMaskQueryKeys(maskQueryKeys);
+  // Pre-resolve the body mask set alongside headerMaskSet/queryMaskSet.
+  // An undefined or empty maskBodyKeys collapses to undefined so serializeBody
+  // builds an empty Set only on the internal (array-based) test path.
+  const bodyMaskSet: ReadonlySet<string> | undefined =
+    Array.isArray(maskBodyKeys) && maskBodyKeys.length > 0
+      ? new Set(maskBodyKeys.map((key) => key.toLowerCase()))
+      : undefined;
   const resolvedRedactPaths = Array.isArray(redactPaths) ? redactPaths : [];
 
   return (req: LoggableRequest, res: LoggableResponse, next: LoggableNext) => {
@@ -644,126 +693,140 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
       res.removeListener("finish", finishHandler);
       res.removeListener("close", closeHandler);
 
-      const durationNs = Number(process.hrtime.bigint() - start);
-      const durationMs = durationNs / 1_000_000;
+      try {
+        const durationNs = Number(process.hrtime.bigint() - start);
+        const durationMs = durationNs / 1_000_000;
 
-      const statusCode = res.statusCode ?? 0;
-      const resolvedLevel =
-        typeof level === "function" ? level(statusCode) : (level ?? determineLevel(statusCode));
+        const statusCode = res.statusCode ?? 0;
+        const candidateLevel =
+          typeof level === "function" ? level(statusCode) : (level ?? determineLevel(statusCode));
+        const resolvedLevel: LogLevel = isValidLogLevel(candidateLevel)
+          ? candidateLevel
+          : determineLevel(statusCode);
 
-      const headerOrUndefined = (name: string): string | undefined => {
-        const raw = req.headers[name];
-        if (Array.isArray(raw)) {
-          return raw.join(", ");
+        const headerOrUndefined = (name: string): string | undefined => {
+          const raw = req.headers[name];
+          if (Array.isArray(raw)) {
+            return raw.join(", ");
+          }
+          return typeof raw === "string" ? raw : undefined;
+        };
+
+        const lookupHeader = (name: string): string | undefined => {
+          if (typeof req.get === "function") {
+            // `req.get(name) ?? undefined` collapses an explicit `null` return
+            // (some Express subclasses) to `undefined` so the `RequestLogEntry`
+            // optional-string contract is preserved.
+            return req.get(name) ?? undefined;
+          }
+          return headerOrUndefined(name);
+        };
+
+        const responseHeaders = res.getHeaders ? res.getHeaders() : undefined;
+
+        // Resolve and redact the URL we will log. We prefer `originalUrl` (Express
+        // semantics) and fall back to `url` (raw Node). URL redaction strips
+        // sensitive query params (token/key/secret/etc.) per `maskQueryKeys`.
+        const sourceUrl = req.originalUrl ?? req.url ?? "";
+        const loggedUrl = redactUrlQuery(sourceUrl, queryMaskSet);
+
+        // Capture transport-level lifecycle flags BEFORE refining the event.
+        // `responseWritableEnded` indicates whether the response body was fully
+        // written; combined with the raised `event === "close"` it lets us
+        // distinguish a true client abort from a benign post-finish close.
+        // `responseDestroyed` mirrors socket.destroyed for diagnostic context.
+        // `requestAborted` is reported when the request adapter exposes it.
+        const responseWritableEnded =
+          typeof res.writableEnded === "boolean" ? res.writableEnded : undefined;
+        const responseDestroyed = typeof res.destroyed === "boolean" ? res.destroyed : undefined;
+        const requestAborted = typeof req.aborted === "boolean" ? req.aborted : undefined;
+
+        // Refined classification: a `close` event is a true abort ONLY when the
+        // response body was NOT fully written (`!res.writableEnded`). A `close`
+        // after a normal `finish` (HTTP/1 keep-alive socket teardown, HTTP/2
+        // stream end) sets `writableEnded === true` and is benign — it is
+        // logged as `"completed"`. Adapters that do not surface
+        // `writableEnded` (raw mocks, custom transports) treat the close as a
+        // true abort to preserve the previous behavior.
+        const refinedEvent: RequestLogEvent =
+          event === "aborted" && !responseWritableEnded ? "aborted" : "completed";
+
+        const entry: RequestLogEntry = {
+          event: refinedEvent,
+          method: req.method ?? "GET",
+          url: loggedUrl,
+          statusCode,
+          responseTimeMs: Number(durationMs.toFixed(2)),
+          contentLength: toNumber(res.getHeader("content-length")) ?? initialContentLength,
+          ip: req.ip ?? req.socket?.remoteAddress ?? undefined,
+          userAgent: lookupHeader("user-agent"),
+          requestId: lookupHeader("x-request-id"),
+        };
+
+        if (responseWritableEnded !== undefined) {
+          entry.responseWritableEnded = responseWritableEnded;
         }
-        return typeof raw === "string" ? raw : undefined;
-      };
-
-      const lookupHeader = (name: string): string | undefined => {
-        if (typeof req.get === "function") {
-          // `req.get(name) ?? undefined` collapses an explicit `null` return
-          // (some Express subclasses) to `undefined` so the `RequestLogEntry`
-          // optional-string contract is preserved.
-          return req.get(name) ?? undefined;
+        if (responseDestroyed !== undefined) {
+          entry.responseDestroyed = responseDestroyed;
         }
-        return headerOrUndefined(name);
-      };
+        if (requestAborted !== undefined) {
+          entry.requestAborted = requestAborted;
+        }
 
-      const responseHeaders = res.getHeaders ? res.getHeaders() : undefined;
+        if (includeRequestBody) {
+          // Use the body snapshot taken at middleware entry — see the comment on
+          // `bodySnapshot` above for why we do not deep-clone by default.
+          // Pass the pre-resolved Set (built once at construction time) instead
+          // of the raw array so this hot path allocates no new Set per request.
+          entry.requestBody = serializeBody(bodySnapshot, bodyMaskSet, maxBodyLength);
+        }
 
-      // Resolve and redact the URL we will log. We prefer `originalUrl` (Express
-      // semantics) and fall back to `url` (raw Node). URL redaction strips
-      // sensitive query params (token/key/secret/etc.) per `maskQueryKeys`.
-      const sourceUrl = req.originalUrl ?? req.url ?? "";
-      const loggedUrl = redactUrlQuery(sourceUrl, queryMaskSet);
+        entry.requestHeaders = normalizeHeaders(
+          req.headers as Record<string, unknown>,
+          includeRequestHeaders,
+          headerMaskSet,
+        );
+        entry.responseHeaders = normalizeHeaders(
+          responseHeaders as Record<string, unknown> | undefined,
+          includeResponseHeaders,
+          headerMaskSet,
+        );
 
-      // Capture transport-level lifecycle flags BEFORE refining the event.
-      // `responseWritableEnded` indicates whether the response body was fully
-      // written; combined with the raised `event === "close"` it lets us
-      // distinguish a true client abort from a benign post-finish close.
-      // `responseDestroyed` mirrors socket.destroyed for diagnostic context.
-      // `requestAborted` is reported when the request adapter exposes it.
-      const responseWritableEnded =
-        typeof res.writableEnded === "boolean" ? res.writableEnded : undefined;
-      const responseDestroyed = typeof res.destroyed === "boolean" ? res.destroyed : undefined;
-      const requestAborted = typeof req.aborted === "boolean" ? req.aborted : undefined;
+        if (enrich) {
+          // `enrich(...) ?? undefined` collapses a `null` or `undefined` return
+          // value to `undefined` so `entry.context` is never set to `null`.
+          entry.context = enrich(req, res, durationMs) ?? undefined;
+        }
 
-      // Refined classification: a `close` event is a true abort ONLY when the
-      // response body was NOT fully written (`!res.writableEnded`). A `close`
-      // after a normal `finish` (HTTP/1 keep-alive socket teardown, HTTP/2
-      // stream end) sets `writableEnded === true` and is benign — it is
-      // logged as `"completed"`. Adapters that do not surface
-      // `writableEnded` (raw mocks, custom transports) treat the close as a
-      // true abort to preserve the previous behavior.
-      const refinedEvent: RequestLogEvent =
-        event === "aborted" && !responseWritableEnded ? "aborted" : "completed";
+        // Surgical path-based redaction — runs LAST so it can override anything
+        // that survived the keyword-based body/header masks. Missing intermediate
+        // segments are a graceful no-op.
+        if (resolvedRedactPaths.length > 0) {
+          resolvedRedactPaths.forEach((path) =>
+            redactEntryPath(entry as unknown as Record<string, unknown>, path),
+          );
+        }
 
-      const entry: RequestLogEntry = {
-        event: refinedEvent,
-        method: req.method ?? "GET",
-        url: loggedUrl,
-        statusCode,
-        responseTimeMs: Number(durationMs.toFixed(2)),
-        contentLength: toNumber(res.getHeader("content-length")) ?? initialContentLength,
-        ip: req.ip ?? req.socket?.remoteAddress ?? undefined,
-        userAgent: lookupHeader("user-agent"),
-        requestId: lookupHeader("x-request-id"),
-      };
+        const message = messageBuilder(entry);
 
-      if (responseWritableEnded !== undefined) {
-        entry.responseWritableEnded = responseWritableEnded;
-      }
-      if (responseDestroyed !== undefined) {
-        entry.responseDestroyed = responseDestroyed;
-      }
-      if (requestAborted !== undefined) {
-        entry.requestAborted = requestAborted;
-      }
+        const logEntry: winston.LogEntry & { http?: RequestLogEntry } = {
+          level: resolvedLevel,
+          message,
+        };
 
-      if (includeRequestBody) {
-        // Use the body snapshot taken at middleware entry — see the comment on
-        // `bodySnapshot` above for why we do not deep-clone by default.
-        entry.requestBody = serializeBody(bodySnapshot, maskBodyKeys, maxBodyLength);
-      }
+        if (includeHttpContext) {
+          logEntry.http = entry;
+        }
 
-      entry.requestHeaders = normalizeHeaders(
-        req.headers as Record<string, unknown>,
-        includeRequestHeaders,
-        headerMaskSet,
-      );
-      entry.responseHeaders = normalizeHeaders(
-        responseHeaders as Record<string, unknown> | undefined,
-        includeResponseHeaders,
-        headerMaskSet,
-      );
-
-      if (enrich) {
-        // `enrich(...) ?? undefined` collapses a `null` or `undefined` return
-        // value to `undefined` so `entry.context` is never set to `null`.
-        entry.context = enrich(req, res, durationMs) ?? undefined;
-      }
-
-      // Surgical path-based redaction — runs LAST so it can override anything
-      // that survived the keyword-based body/header masks. Missing intermediate
-      // segments are a graceful no-op.
-      if (resolvedRedactPaths.length > 0) {
-        resolvedRedactPaths.forEach((path) =>
-          redactEntryPath(entry as unknown as Record<string, unknown>, path),
+        logger.log(logEntry);
+      } catch (err) {
+        const method = req.method ?? "GET";
+        const reqUrl = req.originalUrl ?? req.url ?? "";
+        const reason = err instanceof Error ? err.message : String(err);
+        console.error(
+          `@hiprax/logger request logger failed while logging ${method} ${reqUrl}: ${reason}`,
         );
       }
-
-      const message = messageBuilder(entry);
-
-      const logEntry: winston.LogEntry & { http?: RequestLogEntry } = {
-        level: resolvedLevel,
-        message,
-      };
-
-      if (includeHttpContext) {
-        logEntry.http = entry;
-      }
-
-      logger.log(logEntry);
     };
 
     const finishHandler = () => finalize("completed");
@@ -794,6 +857,7 @@ export const __requestInternals = {
   resolveMaskQueryKeys,
   validateRequestLevelOption,
   validateMaskKeysOption,
+  validateMaxBodyLength,
   isValidLogLevel,
   VALID_LOG_LEVELS,
   DEFAULT_MASKED_HEADER_KEYS,
