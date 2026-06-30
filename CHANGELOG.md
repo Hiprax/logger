@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.21.8] - 2026-06-30
+
+### Packaging (2026-06-30)
+
+- **Added `.npmignore`** (`.npmignore`): a defensive second layer over the existing `package.json` `files` allowlist (`dist`, `src`, `README.md`, `LICENSE`), which remains the primary control over what gets published. The published tarball is unchanged at 15 files (`LICENSE`, `README.md`, `package.json`, the six `dist/` artifacts including sourcemaps, and the six `src/*.ts` sources); `npm pack --dry-run` confirms no test, config, script, CI, or local tooling file is included. Because the `files` allowlist force-includes the `dist` and `src` directories, the ignore file does not change current contents; it documents what must never ship and keeps stray cruft (test files, coverage, caches, OS / editor files, env files, logs, local `*.tmp` backups, packed `*.tgz`, and the local orchestrator tooling) out of the tarball even if the allowlist is ever broadened or removed. The `.ts` sources and `.map` sourcemaps are intentionally retained so consumers can resolve original source while debugging.
+- **`.gitignore`** (`.gitignore`): added a dedicated "Orchestrator" section so local orchestrator tooling never enters version control (`.orchestrator/`, `orchestrator/`, `.orchestrator.ps1`, `.orchestrator.env`, `orchestrator.ps1`, `orchestrator.env`, `phases.json`, `PLAN.md`, `plan.md`).
+
 ## [0.21.7] - 2026-05-12
 
 ### Documentation (2026-05-12)

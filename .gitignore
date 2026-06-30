@@ -102,3 +102,14 @@ test-cjs-types.ts
 # Temporary files
 tmp/
 temp/
+
+# Orchestrator
+.orchestrator/
+orchestrator/
+.orchestrator.ps1
+.orchestrator.env
+orchestrator.ps1
+orchestrator.env
+phases.json
+PLAN.md
+plan.md

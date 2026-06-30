@@ -1,0 +1,98 @@
+# .npmignore
+#
+# What gets published is controlled primarily by the "files" allowlist in
+# package.json (dist, src, README.md, LICENSE). Directories named there are
+# force-included by npm and cannot be pruned from here, so this file is a
+# second, defensive layer: it documents what must never ship and keeps stray
+# cruft out of the tarball if the allowlist is ever broadened or removed.
+#
+# Do NOT list dist, src, *.ts, *.d.ts, *.map, README.md, LICENSE, or
+# package.json here. The .ts sources and .map sourcemaps are published on
+# purpose so consumers can step into original source while debugging.
+
+# Dependencies
+node_modules/
+
+# Tests (never publish, even if colocated under a published directory)
+tests/
+__tests__/
+*.test.ts
+*.test.cts
+*.test.mts
+*.test.js
+*.spec.ts
+*.spec.cts
+*.spec.mts
+*.spec.js
+
+# Coverage and test artifacts
+coverage/
+*.lcov
+.nyc_output/
+test-results/
+test-results.xml
+playwright-report/
+
+# Build caches and tooling state
+*.tsbuildinfo
+.eslintcache
+.cache/
+.parcel-cache/
+
+# Project config and CI (not part of the published library)
+.github/
+.vscode/
+.idea/
+scripts/
+tsconfig.json
+tsup.config.ts
+jest.config.ts
+eslint.config.mjs
+.prettierrc.json
+.editorconfig
+codecov.yml
+.gitattributes
+
+# Environment files and secrets
+.env
+.env.*
+
+# Logs and runtime data
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# OS and editor cruft
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Local backups, temp files, and packed tarballs
+*.tmp
+tmp/
+temp/
+*.tgz
+
+# Orchestrator (local-only tooling, mirrors .gitignore)
+.orchestrator/
+orchestrator/
+.orchestrator.ps1
+.orchestrator.env
+orchestrator.ps1
+orchestrator.env
+phases.json
+PLAN.md
+plan.md
