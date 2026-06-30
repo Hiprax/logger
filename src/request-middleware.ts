@@ -160,13 +160,6 @@ const DEFAULT_MASKED_QUERY_KEYS: readonly string[] = [
   "password",
 ];
 
-/**
- * Sentinel base used to parse relative URLs (e.g. `"/auth/login?token=abc"`)
- * with `URL`. The base is stripped after re-stringification so the logged URL
- * keeps its original relative form.
- */
-const URL_PARSE_SENTINEL_BASE = "http://hiprax-logger.invalid";
-
 const determineLevel = (statusCode: number): LogLevel => {
   if (statusCode >= 500) {
     return "error";
@@ -370,15 +363,24 @@ const toNumber = (value: unknown): number | undefined => {
 
 /**
  * Redacts query-string parameters whose names appear in `maskQueryKeys` from a
- * URL string. Handles both absolute and relative URLs by parsing against a
- * sentinel base when no scheme is present, then stripping the base back off
- * before returning. Re-stringification preserves the original parameter order.
+ * URL string. Operates directly on the raw query bytes without URL-parsing, so
+ * every unmasked byte is preserved exactly: sibling-param encoding (`%20`,
+ * `%5B`, `%5D`, `%2B`), the `//host` authority of protocol-relative URLs,
+ * scheme and host of absolute URLs, and URL fragments are all left untouched.
+ *
+ * For each `key=value` pair the key is decoded with `decodeURIComponent` (for
+ * case-insensitive comparison); if the lowercased decoded key matches an entry
+ * in `maskQueryKeys`, the original raw key bytes are kept and only the value is
+ * replaced with the literal `[REDACTED]` sentinel. Pairs without `=` (bare
+ * flags) are left as-is. Malformed percent-encoding in a key is silently
+ * treated as non-matching so the pair passes through unchanged.
  *
  * Returns the original URL unchanged when:
  * - `maskQueryKeys` is undefined or empty.
  * - The URL has no query component.
- * - Parsing fails (malformed URL); we never throw on bad input — logging
- *   should be best-effort and never the cause of a request failure.
+ * - No masked key is found.
+ * We never throw on any input — logging must be best-effort and never the
+ * cause of a request failure.
  */
 const redactUrlQuery = (url: string, maskQueryKeys: ReadonlySet<string> | undefined): string => {
   if (!maskQueryKeys || maskQueryKeys.size === 0 || !url) {
@@ -388,40 +390,42 @@ const redactUrlQuery = (url: string, maskQueryKeys: ReadonlySet<string> | undefi
     return url;
   }
 
-  try {
-    // Detect whether the input was an absolute URL so we know whether to strip
-    // the sentinel base from the re-stringified result.
-    const isAbsolute = /^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(url);
-    const parsed = isAbsolute ? new URL(url) : new URL(url, URL_PARSE_SENTINEL_BASE);
+  // Peel off the fragment (everything from the first `#`). It is re-appended
+  // verbatim after the query portion is edited.
+  const hashIdx = url.indexOf("#");
+  const fragment = hashIdx === -1 ? "" : url.slice(hashIdx);
+  const beforeFragment = hashIdx === -1 ? url : url.slice(0, hashIdx);
 
-    let mutated = false;
-    // Build a fresh USP so we preserve insertion order while editing values.
-    const params = new URLSearchParams();
-    parsed.searchParams.forEach((value, key) => {
-      if (maskQueryKeys.has(key.toLowerCase())) {
-        params.append(key, REDACTED);
+  // Split the pre-fragment part on the first `?`.
+  const qIdx = beforeFragment.indexOf("?");
+  const base = beforeFragment.slice(0, qIdx);
+  const rawQuery = beforeFragment.slice(qIdx + 1);
+
+  let mutated = false;
+  const editedParts = rawQuery.split("&").map((pair) => {
+    const eqIdx = pair.indexOf("=");
+    if (eqIdx === -1) {
+      // Bare flag param (no `=`) — leave untouched.
+      return pair;
+    }
+    const rawKey = pair.slice(0, eqIdx);
+    try {
+      const decodedKey = decodeURIComponent(rawKey).toLowerCase();
+      if (maskQueryKeys.has(decodedKey)) {
         mutated = true;
-      } else {
-        params.append(key, value);
+        return `${rawKey}=${REDACTED}`;
       }
-    });
-
-    if (!mutated) {
-      return url;
+    } catch {
+      // Malformed percent-encoding in the key — treat as non-matching.
     }
+    return pair;
+  });
 
-    parsed.search = params.toString().replace(/%5B/gi, "[").replace(/%5D/gi, "]");
-    if (isAbsolute) {
-      return parsed.toString();
-    }
-
-    // Strip the sentinel base back off so the relative URL keeps its
-    // original form. `parsed.pathname + parsed.search + parsed.hash` is the
-    // correct relative reconstitution.
-    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
-  } catch {
+  if (!mutated) {
     return url;
   }
+
+  return `${base}?${editedParts.join("&")}${fragment}`;
 };
 
 /**

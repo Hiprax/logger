@@ -1852,21 +1852,21 @@ describe("request middleware internals", () => {
     );
   });
 
-  it("redactUrlQuery returns the input unchanged when URL parsing fails", () => {
+  it("redactUrlQuery redacts query params in URLs with malformed hosts (no URL-parse dependency)", () => {
     const mask = new Set(["token"]);
-    // `http://[invalid?...` triggers a real `URL` parse failure (`ERR_INVALID_URL`)
-    // because the unclosed IPv6 bracket runs into the query separator. The
-    // helper must catch the throw and return the input unchanged so logging is
-    // never the cause of a request failure.
-    const malformed = "http://[invalid?token=abc";
-    expect(redactUrlQuery(malformed, mask)).toBe(malformed);
+    // The in-place implementation never invokes `new URL()`, so a malformed
+    // host (unclosed IPv6 bracket) does not prevent query-param redaction.
+    // Sensitive params are still redacted; the rest of the URL is left verbatim.
+    expect(redactUrlQuery("http://[invalid?token=abc", mask)).toBe(
+      "http://[invalid?token=[REDACTED]",
+    );
   });
 
   it("redactUrlQuery emits the literal [REDACTED] sentinel (not %5BREDACTED%5D) for relative URLs", () => {
-    // URLSearchParams.toString() percent-encodes `[` → `%5B` and `]` → `%5D`.
-    // Without the post-processing `.replace(/%5B/gi,"[").replace(/%5D/gi,"]")`
-    // the logged URL would show `token=%5BREDACTED%5D` instead of the literal
-    // sentinel used everywhere else in the package, breaking log monitoring.
+    // The in-place implementation writes the REDACTED constant directly into
+    // the raw query string, so the brackets in `[REDACTED]` are never
+    // percent-encoded — we never call URLSearchParams.toString() which would
+    // produce `token=%5BREDACTED%5D`.
     const mask = new Set(["token", "api_key"]);
     const result = redactUrlQuery("/auth/login?token=secret&keep=me&api_key=sk-1", mask);
     expect(result).toContain("[REDACTED]");
@@ -1887,6 +1887,87 @@ describe("request middleware internals", () => {
     expect(result).toBe(
       "https://api.example.com/v1/resource?secret=[REDACTED]&token=[REDACTED]&safe=ok",
     );
+  });
+
+  it("redactUrlQuery preserves sibling-param encoding (%20, %5B/%5D, %2B) on non-masked params", () => {
+    const mask = new Set(["token"]);
+    // None of these encoding sequences are present in the masked value — they
+    // are in a *sibling* param. The in-place edit must leave them byte-for-byte
+    // unchanged (the old URLSearchParams round-trip decoded %20→+ etc.).
+    expect(redactUrlQuery("/p?q=hello%20world&token=abc", mask)).toBe(
+      "/p?q=hello%20world&token=[REDACTED]",
+    );
+    expect(redactUrlQuery("/p?name=arr%5Bidx%5D&token=x", mask)).toBe(
+      "/p?name=arr%5Bidx%5D&token=[REDACTED]",
+    );
+    expect(redactUrlQuery("/p?q=foo%2Bbar&token=abc", mask)).toBe(
+      "/p?q=foo%2Bbar&token=[REDACTED]",
+    );
+  });
+
+  it("redactUrlQuery preserves the //host authority of protocol-relative URLs", () => {
+    const mask = new Set(["token"]);
+    // The old `parsed.pathname + parsed.search + parsed.hash` reconstruction
+    // silently dropped the `//host` authority for `//host/path?…` inputs.
+    // The in-place edit preserves every byte before the first `?`.
+    expect(redactUrlQuery("//host/path?token=abc&q=1", mask)).toBe(
+      "//host/path?token=[REDACTED]&q=1",
+    );
+  });
+
+  it("redactUrlQuery preserves sibling-param encoding in absolute URLs", () => {
+    const mask = new Set(["token"]);
+    expect(redactUrlQuery("https://h/p?token=abc&q=hello%20world", mask)).toBe(
+      "https://h/p?token=[REDACTED]&q=hello%20world",
+    );
+  });
+
+  it("redactUrlQuery redacts all occurrences of a repeated masked key", () => {
+    const mask = new Set(["token"]);
+    expect(redactUrlQuery("/p?token=a&token=b&keep=1", mask)).toBe(
+      "/p?token=[REDACTED]&token=[REDACTED]&keep=1",
+    );
+  });
+
+  it("redactUrlQuery preserves all occurrences of a repeated non-masked key", () => {
+    const mask = new Set(["token"]);
+    expect(redactUrlQuery("/p?ids=1&ids=2&token=x", mask)).toBe("/p?ids=1&ids=2&token=[REDACTED]");
+  });
+
+  it("redactUrlQuery handles bracket-array params verbatim (arr[] kept, masked params redacted)", () => {
+    const mask = new Set(["token"]);
+    // `arr[]` is a common PHP/Rails convention for array query params.
+    // The in-place edit decodes the key to compare, so `arr[]` ≠ `token` and
+    // stays untouched, while `token` is still redacted.
+    expect(redactUrlQuery("/p?arr[]=1&arr[]=2&token=x", mask)).toBe(
+      "/p?arr[]=1&arr[]=2&token=[REDACTED]",
+    );
+  });
+
+  it("redactUrlQuery preserves the URL fragment verbatim after editing the query", () => {
+    const mask = new Set(["token"]);
+    // Fragment (`#section`) must be peeled off before splitting on `?` and
+    // re-appended verbatim — it is never part of the query string.
+    expect(redactUrlQuery("/p?token=abc#section", mask)).toBe("/p?token=[REDACTED]#section");
+    // Fragment with no masked params → identity (original string returned).
+    expect(redactUrlQuery("/p?keep=me#anchor", mask)).toBe("/p?keep=me#anchor");
+  });
+
+  it("redactUrlQuery passes bare flag params (no `=` sign) through unchanged", () => {
+    const mask = new Set(["token"]);
+    // A flag like `?debug` has no `=` so there is nothing to mask.
+    expect(redactUrlQuery("/p?flag&token=abc", mask)).toBe("/p?flag&token=[REDACTED]");
+    // All bare flags → nothing to mask at all.
+    const maskNone = new Set(["token"]);
+    expect(redactUrlQuery("/p?flagonly", maskNone)).toBe("/p?flagonly");
+  });
+
+  it("redactUrlQuery skips pairs with malformed percent-encoding in the key", () => {
+    const mask = new Set(["token"]);
+    // `%GG` is not valid percent-encoding — decodeURIComponent throws URIError.
+    // The inner catch must leave the malformed pair untouched while still
+    // redacting the subsequent well-formed masked key.
+    expect(redactUrlQuery("/p?%GG=x&token=abc", mask)).toBe("/p?%GG=x&token=[REDACTED]");
   });
 
   it("redactEntryPath redacts a top-level path", () => {
