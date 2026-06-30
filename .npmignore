@@ -1,17 +1,26 @@
 # .npmignore
 #
 # What gets published is controlled primarily by the "files" allowlist in
-# package.json (dist, src, README.md, LICENSE). Directories named there are
+# package.json (dist, README.md, LICENSE). Directories named there are
 # force-included by npm and cannot be pruned from here, so this file is a
 # second, defensive layer: it documents what must never ship and keeps stray
 # cruft out of the tarball if the allowlist is ever broadened or removed.
 #
-# Do NOT list dist, src, *.ts, *.d.ts, *.map, README.md, LICENSE, or
-# package.json here. The .ts sources and .map sourcemaps are published on
-# purpose so consumers can step into original source while debugging.
+# Do NOT list dist, *.d.ts, *.map, README.md, LICENSE, or package.json here.
+# The .map sourcemaps under dist are published on purpose and already inline
+# the full original TypeScript (sourcesContent), so consumers can step into
+# original source while debugging WITHOUT the raw src/ tree being shipped.
+# The raw src/ sources are intentionally NOT published (the allowlist omits
+# them); the src/ entry below is belt-and-suspenders in case the allowlist is
+# ever broadened.
 
 # Dependencies
 node_modules/
+
+# Raw TypeScript sources (NOT published — the dist sourcemaps carry inlined
+# source for debugging). Excludes the src/ tree only; dist/*.d.ts type
+# declarations and dist/*.map sourcemaps are unaffected.
+src/
 
 # Tests (never publish, even if colocated under a published directory)
 tests/

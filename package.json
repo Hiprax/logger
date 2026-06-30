@@ -1,6 +1,6 @@
 {
   "name": "@hiprax/logger",
-  "version": "0.21.8",
+  "version": "0.21.9",
   "description": "Fully typed Winston-based logger with rotation, timezone support, and Express middleware",
   "keywords": [
     "logger",
@@ -17,7 +17,6 @@
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
-    "src",
     "README.md",
     "LICENSE"
   ],
@@ -93,5 +92,10 @@
     "tsup": "^8.5.1",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.3"
+  },
+  "overrides": {
+    "js-yaml@3": "^3.15.0",
+    "@babel/core": "^7.29.7",
+    "esbuild": "^0.28.1"
   }
 }
