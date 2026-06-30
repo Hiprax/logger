@@ -7,7 +7,7 @@ import {
 import * as loggerModule from "../src/logger";
 import { resetLoggerRegistry } from "../src/logger";
 import { RequestLoggerOptionError } from "../src/errors";
-import type { LoggableRequest, LoggableResponse, LoggableNext } from "../src/types";
+import type { LoggableRequest, LoggableResponse, LoggableNext, LogLevel } from "../src/types";
 import { createMockLogger, MockRequest, runMiddleware, withEnv } from "./_helpers";
 
 describe("createRequestLogger", () => {
@@ -1333,6 +1333,55 @@ describe("createRequestLogger", () => {
 
     expect(errSpy).toHaveBeenCalledTimes(1);
     expect(errSpy.mock.calls[0][0]).toMatch(/GET .* enrich boom fallback/);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 2 — function-form level validated at request time (Task 2.3)
+  // ---------------------------------------------------------------------------
+
+  it("function-form level returning an invalid string logs at the status-derived level (2xx → info)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      level: () => "not-a-level" as unknown as LogLevel,
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.statusCode = 200;
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0].level).toBe("info");
+  });
+
+  it("function-form level returning undefined logs at the status-derived level (5xx → error)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      level: () => undefined as unknown as LogLevel,
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.statusCode = 500;
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0].level).toBe("error");
+  });
+
+  it("function-form level returning undefined logs at the status-derived level (4xx → warn)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      level: () => undefined as unknown as LogLevel,
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.statusCode = 404;
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0].level).toBe("warn");
   });
 });
 

@@ -34,8 +34,10 @@ const isValidLogLevel = (value: unknown): value is LogLevel =>
 
 /**
  * Validates the static-string form of `RequestLoggerOptions.level`. The
- * function-form (`(statusCode) => LogLevel`) is NOT validated here — the
- * function's return value is checked at request time by the middleware itself.
+ * function-form (`(statusCode) => LogLevel`) is accepted here without
+ * up-front validation — its return value is validated at request time inside
+ * `finalize()`: an invalid or `undefined` return falls back to
+ * `determineLevel(statusCode)` so the log line is never silently dropped.
  */
 const validateRequestLevelOption = (value: unknown): void => {
   if (value === undefined || typeof value === "function") {
@@ -649,8 +651,11 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
         const durationMs = durationNs / 1_000_000;
 
         const statusCode = res.statusCode ?? 0;
-        const resolvedLevel =
+        const candidateLevel =
           typeof level === "function" ? level(statusCode) : (level ?? determineLevel(statusCode));
+        const resolvedLevel: LogLevel = isValidLogLevel(candidateLevel)
+          ? candidateLevel
+          : determineLevel(statusCode);
 
         const headerOrUndefined = (name: string): string | undefined => {
           const raw = req.headers[name];
