@@ -2368,6 +2368,117 @@ describe("createLogger", () => {
 
       spy.mockRestore();
     });
+
+    it("throws LoggerOptionError({ code: 'INVALID_MASK' }) when maskMetaKeys is a bare string", () => {
+      let caught: unknown;
+      try {
+        createLogger({
+          maskMetaKeys: "password" as unknown as string[],
+          includeConsole: false,
+          includeFile: false,
+          includeGlobalFile: false,
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+      expect((caught as LoggerOptionError).message).toContain("maskMetaKeys");
+    });
+
+    it("throws LoggerOptionError({ code: 'INVALID_MASK' }) when maskMetaKeys is null", () => {
+      let caught: unknown;
+      try {
+        createLogger({
+          maskMetaKeys: null as unknown as string[],
+          includeConsole: false,
+          includeFile: false,
+          includeGlobalFile: false,
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+      expect((caught as LoggerOptionError).message).toContain("maskMetaKeys");
+    });
+
+    it("throws LoggerOptionError({ code: 'INVALID_MASK' }) when maskMetaKeys contains a non-string entry", () => {
+      let caught: unknown;
+      try {
+        createLogger({
+          maskMetaKeys: ["password", 42] as unknown as string[],
+          includeConsole: false,
+          includeFile: false,
+          includeGlobalFile: false,
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+      expect((caught as LoggerOptionError).message).toContain("maskMetaKeys");
+      expect((caught as LoggerOptionError).message).toContain("index 1");
+    });
+
+    it("throws INVALID_MASK even when a logger is already cached for the same key", () => {
+      const root = createTempDir();
+      // Prime the cache with a valid logger.
+      const first = createLogger({
+        moduleName: "mask-cache-test",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+      });
+      teardownLogger(first);
+
+      // A second call with bad maskMetaKeys must still throw even though the
+      // registry already has an entry for this moduleName + logDirectory.
+      let caught: unknown;
+      try {
+        createLogger({
+          moduleName: "mask-cache-test",
+          logDirectory: root,
+          maskMetaKeys: "leaked" as unknown as string[],
+          includeConsole: false,
+          includeFile: false,
+          includeGlobalFile: false,
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+    });
+
+    it("accepts a valid string[] maskMetaKeys without throwing", () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "mask-valid",
+        logDirectory: root,
+        maskMetaKeys: ["password", "token"],
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+      });
+      expect(logger).toBeDefined();
+      teardownLogger(logger);
+    });
+
+    it("accepts undefined maskMetaKeys without throwing (treated as [])", () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "mask-undefined",
+        logDirectory: root,
+        maskMetaKeys: undefined,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+      });
+      expect(logger).toBeDefined();
+      teardownLogger(logger);
+    });
   });
 
   describe("internals — option validators", () => {
@@ -2395,6 +2506,54 @@ describe("createLogger", () => {
       expect(__loggerInternals.isValidLogLevel("noisy")).toBe(false);
       expect(__loggerInternals.isValidLogLevel(42)).toBe(false);
       expect(__loggerInternals.isValidLogLevel(undefined)).toBe(false);
+    });
+
+    it("validateMaskMetaKeysOption is a no-op for undefined", () => {
+      expect(() => __loggerInternals.validateMaskMetaKeysOption(undefined)).not.toThrow();
+    });
+
+    it("validateMaskMetaKeysOption accepts an empty array", () => {
+      expect(() => __loggerInternals.validateMaskMetaKeysOption([])).not.toThrow();
+    });
+
+    it("validateMaskMetaKeysOption accepts a string[] without throwing", () => {
+      expect(() =>
+        __loggerInternals.validateMaskMetaKeysOption(["password", "token"]),
+      ).not.toThrow();
+    });
+
+    it("validateMaskMetaKeysOption throws INVALID_MASK for a bare string", () => {
+      let caught: unknown;
+      try {
+        __loggerInternals.validateMaskMetaKeysOption("password");
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+    });
+
+    it("validateMaskMetaKeysOption throws INVALID_MASK for null", () => {
+      let caught: unknown;
+      try {
+        __loggerInternals.validateMaskMetaKeysOption(null);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+    });
+
+    it("validateMaskMetaKeysOption throws INVALID_MASK for an array with a non-string entry", () => {
+      let caught: unknown;
+      try {
+        __loggerInternals.validateMaskMetaKeysOption(["ok", 99]);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LoggerOptionError);
+      expect((caught as LoggerOptionError).code).toBe("INVALID_MASK");
+      expect((caught as LoggerOptionError).message).toContain("index 1");
     });
   });
 

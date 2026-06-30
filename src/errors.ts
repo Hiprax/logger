@@ -40,12 +40,17 @@ export class InvalidTimezoneError extends Error {
  *   The original filesystem error is wrapped via the `cause` option (Node 16+).
  * - `INVALID_FORMAT` — `format` is not in the documented `"pretty" | "json"`
  *   union (e.g. typo'd as `"JSON"` or `"plain"`).
+ * - `INVALID_MASK` — `maskMetaKeys` is not an array of strings. A bare string
+ *   (the natural typo `maskMetaKeys: "password"` instead of
+ *   `["password"]`), `null`, or an array containing a non-string entry all
+ *   throw this code. `undefined` is accepted and treated as `[]`.
  */
 export type LoggerOptionErrorCode =
   | "INVALID_LEVEL"
   | "INVALID_ROTATION"
   | "LOG_DIRECTORY_UNWRITABLE"
-  | "INVALID_FORMAT";
+  | "INVALID_FORMAT"
+  | "INVALID_MASK";
 
 /**
  * Structured option-validation error thrown by `createLogger()` when the

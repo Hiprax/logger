@@ -79,6 +79,34 @@ const validateFormatOption = (value: unknown): void => {
   }
 };
 
+/**
+ * Validates `maskMetaKeys` up front — before the cache lookup — so a bad
+ * value always throws a structured {@link LoggerOptionError} even when a
+ * logger is already cached for the same `moduleName` + `logDirectory`. A bare
+ * string (the natural typo `"password"` instead of `["password"]`), `null`,
+ * or an array containing a non-string entry all throw `INVALID_MASK`.
+ * `undefined` is accepted and treated as the default `[]`.
+ */
+const validateMaskMetaKeysOption = (value: unknown): void => {
+  if (value === undefined) {
+    return;
+  }
+  if (!Array.isArray(value)) {
+    throw new LoggerOptionError(
+      "INVALID_MASK",
+      `Invalid \`maskMetaKeys\` option: expected an array of strings, but received ${typeof value}.`,
+    );
+  }
+  for (let i = 0; i < value.length; i++) {
+    if (typeof value[i] !== "string") {
+      throw new LoggerOptionError(
+        "INVALID_MASK",
+        `Invalid \`maskMetaKeys\` option: entry at index ${i} must be a string (got ${typeof value[i]}).`,
+      );
+    }
+  }
+};
+
 const validateRotationField = (label: string, value: unknown, pattern: RegExp): void => {
   if (value === undefined) {
     return;
@@ -763,6 +791,11 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
   validateLogLevelOption("level", level);
   validateLogLevelOption("consoleLevel", consoleLevel);
   validateFormatOption(format);
+
+  // Validate `maskMetaKeys` BEFORE the cache lookup so a non-array or an
+  // array-with-non-string entry throws a structured LoggerOptionError even
+  // when a logger is already cached for the same module + directory.
+  validateMaskMetaKeysOption(maskMetaKeys as unknown);
 
   // Validate `rotation` and `globalRotation` shapes (lenient regex on
   // `maxSize`/`maxFiles`) BEFORE the cache lookup. Rejects garbage values like
@@ -1582,6 +1615,7 @@ export const __loggerInternals = {
   validateRotationStrategy,
   validateRotationField,
   validateFormatOption,
+  validateMaskMetaKeysOption,
   isValidLogLevel,
   ensureDirectory,
   bigintSafeReplacer,
