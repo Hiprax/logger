@@ -399,7 +399,7 @@ const redactUrlQuery = (url: string, maskQueryKeys: ReadonlySet<string> | undefi
       return url;
     }
 
-    parsed.search = params.toString();
+    parsed.search = params.toString().replace(/%5B/gi, "[").replace(/%5D/gi, "]");
     if (isAbsolute) {
       return parsed.toString();
     }

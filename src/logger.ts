@@ -559,7 +559,7 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
         ? info.message
         : typeof info.message === "bigint"
           ? info.message.toString()
-          : JSON.stringify(info.message, bigintSafeReplacer, 2);
+          : (JSON.stringify(info.message, bigintSafeReplacer, 2) ?? String(info.message));
     // When `escapeMessageNewlines` is on AND the original message was a string,
     // rewrite embedded `\r` / `\n` to their visible escape sequences so a
     // user-supplied payload like `"alice\n[ERROR] (admin)\nfake event"` cannot

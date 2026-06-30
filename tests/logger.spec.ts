@@ -1351,6 +1351,53 @@ describe("createLogger", () => {
       expect(output).not.toContain("\x1b");
     });
 
+    it("formatMessage renders undefined message as the literal 'undefined', not a blank line", () => {
+      // JSON.stringify(undefined) returns the JS value `undefined` (not the
+      // string "undefined"), so without the `?? String(info.message)` fallback
+      // `rawMessage` was `undefined` and the formatter emitted a blank line.
+      const formatter = __loggerInternals.formatMessage(
+        { label: "test", timezones: [] },
+        { includeTimestamps: false },
+      );
+      const info = formatter.transform({ level: "info", message: undefined } as any);
+      const output = Reflect.get(
+        info as Record<PropertyKey, unknown>,
+        Symbol.for("message"),
+      ) as string;
+      // The rendered output must include the literal word "undefined".
+      expect(output).toContain("undefined");
+      // The message line must not be blank (trimmed non-empty after stripping the
+      // "[INFO] (test)" prefix line).
+      const lines = output
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+      expect(lines.some((l) => l === "undefined")).toBe(true);
+    });
+
+    it("formatMessage renders a function message via String() fallback, not a blank line", () => {
+      // JSON.stringify(() => 42) also returns JS `undefined`; the fallback
+      // String(info.message) converts the function to its source representation.
+      const formatter = __loggerInternals.formatMessage(
+        { label: "test", timezones: [] },
+        { includeTimestamps: false },
+      );
+      const fn = () => 42;
+      const info = formatter.transform({ level: "info", message: fn } as any);
+      const output = Reflect.get(
+        info as Record<PropertyKey, unknown>,
+        Symbol.for("message"),
+      ) as string;
+      // The output must not be just the level/label header with a trailing blank —
+      // String(fn) yields a non-empty source representation.
+      const lines = output
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+      // At minimum: "[INFO] (test)" + the stringified function body.
+      expect(lines.length).toBeGreaterThanOrEqual(2);
+    });
+
     it("resolveLogDirectory falls back to path.resolve when the dir does not exist", () => {
       const ghost = path.join(os.tmpdir(), `adv-logger-ghost-${Date.now()}`);
       const resolved = __loggerInternals.resolveLogDirectory(ghost);

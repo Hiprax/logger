@@ -713,7 +713,7 @@ describe("createRequestLogger", () => {
     res.emit("finish");
 
     const payload = log.mock.calls[0][0];
-    expect(payload.http.url).toBe("/auth/login?token=%5BREDACTED%5D&keep=me");
+    expect(payload.http.url).toBe("/auth/login?token=[REDACTED]&keep=me");
   });
 
   it("redacts originalUrl alongside url when originalUrl differs from url", () => {
@@ -729,7 +729,7 @@ describe("createRequestLogger", () => {
     res.emit("finish");
 
     const payload = log.mock.calls[0][0];
-    expect(payload.http.url).toBe("/auth/login?token=%5BREDACTED%5D&keep=me");
+    expect(payload.http.url).toBe("/auth/login?token=[REDACTED]&keep=me");
   });
 
   it("supports custom maskQueryKeys arrays (case-insensitive)", () => {
@@ -746,7 +746,7 @@ describe("createRequestLogger", () => {
     res.emit("finish");
 
     const payload = log.mock.calls[0][0];
-    expect(payload.http.url).toBe("/path?SessionId=%5BREDACTED%5D&token=keep");
+    expect(payload.http.url).toBe("/path?SessionId=[REDACTED]&token=keep");
   });
 
   it("disables query masking entirely when maskQueryKeys is false", () => {
@@ -1756,11 +1756,9 @@ describe("request middleware internals", () => {
 
   it("redactUrlQuery rewrites both absolute and relative URL query strings", () => {
     const mask = new Set(["token", "secret"]);
-    expect(redactUrlQuery("/path?token=abc&keep=me", mask)).toBe(
-      "/path?token=%5BREDACTED%5D&keep=me",
-    );
+    expect(redactUrlQuery("/path?token=abc&keep=me", mask)).toBe("/path?token=[REDACTED]&keep=me");
     expect(redactUrlQuery("https://api.example.com/path?secret=sk-1&safe=ok", mask)).toBe(
-      "https://api.example.com/path?secret=%5BREDACTED%5D&safe=ok",
+      "https://api.example.com/path?secret=[REDACTED]&safe=ok",
     );
   });
 
@@ -1772,6 +1770,33 @@ describe("request middleware internals", () => {
     // never the cause of a request failure.
     const malformed = "http://[invalid?token=abc";
     expect(redactUrlQuery(malformed, mask)).toBe(malformed);
+  });
+
+  it("redactUrlQuery emits the literal [REDACTED] sentinel (not %5BREDACTED%5D) for relative URLs", () => {
+    // URLSearchParams.toString() percent-encodes `[` → `%5B` and `]` → `%5D`.
+    // Without the post-processing `.replace(/%5B/gi,"[").replace(/%5D/gi,"]")`
+    // the logged URL would show `token=%5BREDACTED%5D` instead of the literal
+    // sentinel used everywhere else in the package, breaking log monitoring.
+    const mask = new Set(["token", "api_key"]);
+    const result = redactUrlQuery("/auth/login?token=secret&keep=me&api_key=sk-1", mask);
+    expect(result).toContain("[REDACTED]");
+    expect(result).not.toContain("%5B");
+    expect(result).not.toContain("%5D");
+    expect(result).toBe("/auth/login?token=[REDACTED]&keep=me&api_key=[REDACTED]");
+  });
+
+  it("redactUrlQuery emits the literal [REDACTED] sentinel (not %5BREDACTED%5D) for absolute URLs", () => {
+    const mask = new Set(["secret", "token"]);
+    const result = redactUrlQuery(
+      "https://api.example.com/v1/resource?secret=top&token=abc&safe=ok",
+      mask,
+    );
+    expect(result).toContain("[REDACTED]");
+    expect(result).not.toContain("%5B");
+    expect(result).not.toContain("%5D");
+    expect(result).toBe(
+      "https://api.example.com/v1/resource?secret=[REDACTED]&token=[REDACTED]&safe=ok",
+    );
   });
 
   it("redactEntryPath redacts a top-level path", () => {
