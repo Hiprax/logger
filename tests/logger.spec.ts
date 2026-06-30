@@ -1669,6 +1669,7 @@ describe("createLogger", () => {
       logger.info("flush me");
 
       await expect(shutdownLogger(logger)).resolves.toBeUndefined();
+      teardownLogger(logger);
     });
 
     it("rejects with a timeout error when a transport never finishes", async () => {
@@ -1699,6 +1700,7 @@ describe("createLogger", () => {
       await expect(shutdownLogger(logger, { timeoutMs: 50 })).rejects.toThrow(
         /shutdownLogger timed out after 50ms/,
       );
+      teardownLogger(logger);
     });
 
     it("is idempotent — calling shutdownLogger twice does not throw", async () => {
@@ -1723,6 +1725,7 @@ describe("createLogger", () => {
       expect(second).toBe(first);
       await expect(first).resolves.toBeUndefined();
       await expect(shutdownLogger(logger)).resolves.toBeUndefined();
+      teardownLogger(logger);
     });
 
     it("shutdownAllLoggers shuts down every cached logger", async () => {
@@ -1758,6 +1761,70 @@ describe("createLogger", () => {
       expect(a).not.toBe(b);
 
       await expect(shutdownAllLoggers()).resolves.toBeUndefined();
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    // -------------------------------------------------------------------------
+    // Phase 7 — shutdownAllLoggers partial-timeout rejection + independence
+    // (Task 7.1, closes F10)
+    // -------------------------------------------------------------------------
+
+    it("shutdownAllLoggers rejects when one logger stalls, while the healthy logger flushes independently (Phase 7)", async () => {
+      // Same StalledTransport pattern as the single-logger timeout test above,
+      // registered alongside a normal Stream-backed logger so BOTH land in the
+      // module-level registry that shutdownAllLoggers() walks via Promise.all.
+      class StalledAllTransport extends Transport {
+        public name = "stalled-all";
+        public log = jest.fn((_info: unknown, callback?: () => void) => callback?.());
+        public _final = (_callback: (err?: Error | null) => void): void => {
+          // Intentionally never invoke the callback — this transport never
+          // reaches the `finish` state, so its shutdownLogger() call must time
+          // out at the 50ms deadline below.
+        };
+      }
+      const stalled = new StalledAllTransport();
+      const stream = new PassThrough();
+
+      const healthy = createLogger({
+        moduleName: "shutdown-all-healthy",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      const broken = createLogger({
+        moduleName: "shutdown-all-broken",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [stalled as unknown as winston.transport],
+      });
+      // Sanity: both got cached as distinct registry entries.
+      expect(healthy).not.toBe(broken);
+
+      // shutdownAllLoggers() is `Promise.all(...)` under the hood — it MUST
+      // reject as soon as the broken logger's own 50ms timeout fires. This
+      // pins the documented "can reject / timeout is independent per logger"
+      // contract so a future `Promise.allSettled` refactor can't silently
+      // flip it while staying green.
+      await expect(shutdownAllLoggers({ timeoutMs: 50 })).rejects.toThrow(
+        /shutdownLogger timed out after 50ms/,
+      );
+
+      // Independence proof: shutdownAllLoggers() issued the healthy logger's
+      // OWN shutdownLogger() call internally, and that call already resolved
+      // (the Stream transport flushes well within 50ms) — its resolved
+      // promise is cached in the per-logger WeakMap. A fresh call here MUST
+      // resolve immediately from that cached entry rather than reissuing
+      // logger.end() (which would hang: the Stream's `finish` event already
+      // fired once and a Writable does not re-emit it on a second `end()`).
+      // If shutdownAllLoggers had been refactored to discard per-logger state
+      // on rejection, this call would hang until the default 5000ms timeout
+      // instead of resolving immediately.
+      await expect(shutdownLogger(healthy)).resolves.toBeUndefined();
+      teardownLogger(healthy);
+      teardownLogger(broken);
     });
 
     it("removes finish/close listeners after a timeout-rejected shutdown", async () => {
@@ -1817,6 +1884,7 @@ describe("createLogger", () => {
       await expect(shutdownLogger(logger, { timeoutMs: 50 })).rejects.toThrow(
         /shutdownLogger timed out after 50ms/,
       );
+      teardownLogger(logger);
     });
 
     it("awaitTransportFlush exposes a cleanup() that detaches both listeners", () => {
@@ -1885,6 +1953,7 @@ describe("createLogger", () => {
       // (This simulates the transport eventually completing its flush.)
       stalled.emit("finish");
       await expect(second).resolves.toBeUndefined();
+      teardownLogger(logger);
     });
 
     it("successful shutdown remains idempotent: second and third calls return the same promise (Phase 10)", async () => {
@@ -1913,6 +1982,7 @@ describe("createLogger", () => {
       const third = shutdownLogger(logger);
       expect(third).toBe(first);
       await expect(third).resolves.toBeUndefined();
+      teardownLogger(logger);
     });
 
     it("concurrent same-tick calls share one in-flight promise (Phase 10)", async () => {
@@ -1939,6 +2009,7 @@ describe("createLogger", () => {
       expect(p3).toBe(p1);
 
       await expect(Promise.all([p1, p2, p3])).resolves.toEqual([undefined, undefined, undefined]);
+      teardownLogger(logger);
     });
   });
 
@@ -3290,6 +3361,71 @@ describe("createLogger", () => {
       teardownLogger(logger);
 
       expect(clockCalls).toBe(1);
+    });
+
+    // -------------------------------------------------------------------------
+    // Phase 7 — JSON-mode circular references end-to-end (Task 7.2, closes F12)
+    // -------------------------------------------------------------------------
+
+    it("json mode WITH maskMetaKeys redacts a circular metadata object via buildMetaRedactor's WeakSet (Phase 7)", () => {
+      // `circular` is passed AS the metadata object, so winston merges its own
+      // enumerable keys directly onto `info` — `info.self === circular` and
+      // `circular.self === circular` form a genuine cycle. With a non-empty
+      // `maskMetaKeys`, `buildMetaRedactor` runs the shared `redactValue(...)`
+      // over every metadata key BEFORE `winston.format.json()` ever sees the
+      // object, so the cycle is resolved into the literal string "[Circular]"
+      // by OUR WeakSet-based detection (src/redact.ts), not by
+      // safe-stable-stringify's own handling (exercised by the sibling test
+      // below, without maskMetaKeys).
+      const circular: Record<string, unknown> = { keep: 1 };
+      circular.self = circular;
+
+      let output = "";
+      expect(() => {
+        output = renderJsonLine(
+          "json-circular-masked",
+          (logger) => {
+            logger.info("circular", circular);
+          },
+          { maskMetaKeys: ["password"] },
+        );
+      }).not.toThrow();
+
+      const line = output.trim();
+      expect(() => JSON.parse(line)).not.toThrow();
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+
+      expect(line).toContain('"[Circular]"');
+      expect(parsed.keep).toBe(1);
+      expect(parsed.self).toEqual({ keep: 1, self: "[Circular]" });
+    });
+
+    it("json mode WITHOUT maskMetaKeys handles a circular metadata object via winston.format.json()'s safe-stable-stringify (Phase 7)", () => {
+      // Same circular payload, but `maskMetaKeys` is omitted entirely so
+      // `buildMetaRedactor` takes its documented no-op pass-through branch
+      // (early return on `!maskMetaKeys || maskMetaKeys.size === 0`). The raw,
+      // still-circular `info` object reaches `winston.format.json()` untouched,
+      // so this exercises `safe-stable-stringify`'s OWN circular-reference
+      // handling — its default `circularValue` is also the literal
+      // "[Circular]" (confirmed in node_modules/safe-stable-stringify/index.js),
+      // so the two code paths are expected to produce equivalent output.
+      const circular: Record<string, unknown> = { keep: 1 };
+      circular.self = circular;
+
+      let output = "";
+      expect(() => {
+        output = renderJsonLine("json-circular-unmasked", (logger) => {
+          logger.info("circular", circular);
+        });
+      }).not.toThrow();
+
+      const line = output.trim();
+      expect(() => JSON.parse(line)).not.toThrow();
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+
+      expect(line).toContain('"[Circular]"');
+      expect(parsed.keep).toBe(1);
+      expect(parsed.self).toEqual({ keep: 1, self: "[Circular]" });
     });
   });
 
