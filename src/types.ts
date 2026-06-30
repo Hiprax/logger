@@ -111,8 +111,11 @@ export interface RotationStrategy {
    * **Format:** `^\d+d?$` (case-insensitive). Either a bare numeric file
    * count or a day-suffixed retention window.
    *
-   * **Accepted examples:** `"7"`, `"500"`, `"14d"`, `"30d"`, `"14D"` (case
-   * is ignored).
+   * **Accepted examples:** `"7"`, `"500"`, `"14d"`, `"30d"`, `"14D"` (case is
+   * ignored — `@hiprax/logger` lowercases the day suffix before handing the
+   * value to `winston-daily-rotate-file`, whose own upstream parser checks
+   * for a lowercase `"d"` only, so an uppercase `"14D"` is honored as 14
+   * *days* rather than silently falling back to file-count semantics).
    *
    * **Rejected examples:** `"20m"`, `"20kb"`, `"1g"` (size suffixes are NOT
    * honored — `parseInt("20m")` silently coerces to `20` and the upstream

@@ -104,6 +104,32 @@ describe("createLogger", () => {
     teardownLogger(logger);
   });
 
+  it("normalizes an uppercase maxFiles day suffix to lowercase before the transport (F8)", () => {
+    // `file-stream-rotator` (the engine behind `winston-daily-rotate-file`)
+    // detects the day suffix case-SENSITIVELY (`max_logs.toString().substr(-1)
+    // === 'd'`), while `MAX_FILES_PATTERN` and the public JSDoc both document
+    // `"14D"` as accepted "14 days" input. Without normalization, "14D" would
+    // pass validation but silently behave as a 14-FILE retention window
+    // instead of 14 days. Both the module-scoped and the global rotating-file
+    // transport must receive the normalized lowercase value.
+    const root = createTempDir();
+    const logger = createLogger({
+      logDirectory: root,
+      includeConsole: false,
+      rotation: { maxFiles: "14D" },
+      globalRotation: { maxFiles: "30D" },
+    });
+
+    const rotating = logger.transports.filter(
+      (transport): transport is DailyRotateFile => transport instanceof DailyRotateFile,
+    );
+
+    expect(rotating).toHaveLength(2);
+    expect(rotating[0].options.maxFiles).toBe("14d");
+    expect(rotating[1].options.maxFiles).toBe("30d");
+    teardownLogger(logger);
+  });
+
   it("supports extra timezones and renders enriched messages", () => {
     const root = createTempDir();
     const messages: string[] = [];
@@ -828,6 +854,24 @@ describe("createLogger", () => {
       expect(warnSpy).toHaveBeenCalledTimes(1);
       const message = String(warnSpy.mock.calls[0][0]);
       expect(message).toContain("rotation");
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("does not warn when rotation.maxFiles differs only by day-suffix case (F8)", () => {
+      // "14d" and "14D" normalize to the same transport-facing value, so the
+      // registry signature must treat them as equal — otherwise this would be
+      // a false-positive conflict warning for two functionally identical
+      // configs.
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({ ...baseOpts(root), rotation: { maxFiles: "14d" } });
+      const second = createLogger({ ...baseOpts(root), rotation: { maxFiles: "14D" } });
+
+      expect(second).toBe(first);
+      expect(warnSpy).not.toHaveBeenCalled();
 
       warnSpy.mockRestore();
       teardownLogger(first);
@@ -2725,6 +2769,17 @@ describe("createLogger", () => {
       expect(() =>
         __loggerInternals.validateRotationStrategy("rotation", { maxSize: "20m" }),
       ).not.toThrow();
+    });
+
+    it("normalizeMaxFiles lowercases a string day suffix regardless of input case (F8)", () => {
+      expect(__loggerInternals.normalizeMaxFiles("14D")).toBe("14d");
+      expect(__loggerInternals.normalizeMaxFiles("14d")).toBe("14d");
+      // Bare numeric counts have no suffix to normalize but still round-trip.
+      expect(__loggerInternals.normalizeMaxFiles("30")).toBe("30");
+    });
+
+    it("normalizeMaxFiles passes a non-string value through unchanged", () => {
+      expect(__loggerInternals.normalizeMaxFiles(undefined)).toBeUndefined();
     });
 
     it("isValidLogLevel returns true for valid levels and false otherwise", () => {

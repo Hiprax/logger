@@ -38,8 +38,11 @@ const VALID_LOG_LEVELS = Object.freeze([
  *   — `getMaxSize("20mb")` returns `null` and rotation is silently disabled.
  * - {@link MAX_FILES_PATTERN} — `^\d+d?$` (case-insensitive). Matches bare
  *   numeric file counts (`"7"`, `"500"`) and day-suffixed retention windows
- *   (`"14d"`, `"30d"`). Size suffixes are NOT accepted — `parseInt("20m")`
- *   silently coerces to `20` and the rotation interprets it as "20 files".
+ *   (`"14d"`, `"30d"`, `"14D"`). Size suffixes are NOT accepted — `parseInt("20m")`
+ *   silently coerces to `20` and the rotation interprets it as "20 files". An
+ *   uppercase-`D` day suffix is accepted here and then lowercased by
+ *   {@link normalizeMaxFiles} before reaching `winston-daily-rotate-file`,
+ *   whose upstream parser checks the suffix case-sensitively.
  */
 const MAX_SIZE_PATTERN = /^(?:0\.)?\d+[kmg]$/i;
 const MAX_FILES_PATTERN = /^\d+d?$/i;
@@ -133,6 +136,23 @@ const validateRotationStrategy = (label: string, rotation: RotationStrategy | un
   validateRotationField(`${label}.maxSize`, rotation.maxSize, MAX_SIZE_PATTERN);
   validateRotationField(`${label}.maxFiles`, rotation.maxFiles, MAX_FILES_PATTERN);
 };
+
+/**
+ * Lowercases a string `maxFiles` value before it reaches
+ * `winston-daily-rotate-file`. {@link MAX_FILES_PATTERN} (and the public
+ * `RotationStrategy.maxFiles` JSDoc) document the day suffix as
+ * case-insensitive — `"14D"` is accepted as "14 days" — but the upstream
+ * `file-stream-rotator` parser checks for the suffix with a case-SENSITIVE
+ * `max_logs.toString().substr(-1) === 'd'`. Left un-normalized, `"14D"`
+ * passes validation yet silently falls through to upstream's file-COUNT
+ * branch (kept as 14 files, not pruned by age) — the opposite of what the
+ * docs promise. Normalizing here (rather than rejecting uppercase `D` at
+ * validation time) keeps every previously-accepted value working, matching
+ * how upstream already lowercases the sibling `maxSize` suffix internally.
+ * Non-string values (`undefined`) pass through unchanged.
+ */
+const normalizeMaxFiles = (maxFiles: string | undefined): string | undefined =>
+  typeof maxFiles === "string" ? maxFiles.toLowerCase() : maxFiles;
 
 const TIMESTAMP_FORMAT = "YYYY-MM-DD HH:mm:ss";
 const DEFAULT_LOG_DIR = path.resolve(process.cwd(), "logs");
@@ -641,7 +661,7 @@ const buildRotateTransport = (options: {
     filename: options.filename,
     datePattern: rotation.datePattern,
     maxSize: rotation.maxSize,
-    maxFiles: rotation.maxFiles,
+    maxFiles: normalizeMaxFiles(rotation.maxFiles),
     zippedArchive: rotation.zippedArchive,
     level: options.level,
     handleExceptions: options.handleExceptions,
@@ -823,11 +843,17 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
   const resolvedLogDirectory = resolveLogDirectory(logDirectory);
   const registryKey = buildRegistryKey(moduleName, resolvedLogDirectory);
 
+  // Normalize `maxFiles` the SAME way `buildRotateTransport` does before it
+  // feeds the registry signature below — otherwise two calls that are
+  // functionally identical post-normalization (`"14d"` vs `"14D"`) would hash
+  // to different signatures and trip a false-positive conflict warning.
   const resolvedRotation: RotationStrategy = { ...defaultRotation, ...rotation };
+  resolvedRotation.maxFiles = normalizeMaxFiles(resolvedRotation.maxFiles);
   const resolvedGlobalRotation: RotationStrategy = {
     ...defaultRotation,
     ...(globalRotation ?? rotation),
   };
+  resolvedGlobalRotation.maxFiles = normalizeMaxFiles(resolvedGlobalRotation.maxFiles);
 
   const optionsSignature = buildOptionsSignature({
     level,
@@ -1649,6 +1675,7 @@ export const __loggerInternals = {
   validateLogLevelOption,
   validateRotationStrategy,
   validateRotationField,
+  normalizeMaxFiles,
   validateFormatOption,
   validateMaskMetaKeysOption,
   isValidLogLevel,
