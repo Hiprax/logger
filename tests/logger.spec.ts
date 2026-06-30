@@ -1721,6 +1721,99 @@ describe("createLogger", () => {
       expect(idle.listenerCount("finish")).toBe(finishBefore);
       expect(idle.listenerCount("close")).toBe(closeBefore);
     });
+
+    // -------------------------------------------------------------------------
+    // Phase 10 — shutdownLogger retry-after-timeout (Task 10.2)
+    // -------------------------------------------------------------------------
+
+    it("retry-after-timeout: evicts WeakMap entry so a later call can retry (Phase 10)", async () => {
+      // A transport that stalls in `_final` and never emits `finish`/`close` on
+      // its own — ensuring the first shutdown always times out.
+      class StalledRetryTransport extends Transport {
+        public name = "stalled-retry-p10";
+        public log = jest.fn((_info: unknown, callback?: () => void) => callback?.());
+        public _final = (_callback: (err?: Error | null) => void): void => {
+          // Intentionally never invokes the callback.
+        };
+      }
+      const stalled = new StalledRetryTransport();
+
+      const logger = createLogger({
+        moduleName: "shutdown-retry-p10",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [stalled as unknown as winston.transport],
+      });
+
+      // First call: small timeout → must reject.
+      const first = shutdownLogger(logger, { timeoutMs: 20 });
+      await expect(first).rejects.toThrow(/shutdownLogger timed out after 20ms/);
+
+      // After the rejection the WeakMap entry must be evicted.
+      // The second call must return a BRAND-NEW promise, not the cached rejection.
+      const second = shutdownLogger(logger, { timeoutMs: 2000 });
+      expect(second).not.toBe(first);
+
+      // Manually emit "finish" so the second call's fresh awaiter resolves.
+      // (This simulates the transport eventually completing its flush.)
+      stalled.emit("finish");
+      await expect(second).resolves.toBeUndefined();
+    });
+
+    it("successful shutdown remains idempotent: second and third calls return the same promise (Phase 10)", async () => {
+      // The Proxy wrapping makes jest.spyOn(logger, "end") unreliable (the get
+      // trap returns value.bind(target), not the raw spy). Idempotency is proven
+      // by promise identity: if a second logger.end() were issued, shutdownLogger
+      // would create a new Promise.race and return a different object.
+      const stream = new PassThrough();
+      const logger = createLogger({
+        moduleName: "shutdown-idempotent-end-p10",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      const first = shutdownLogger(logger);
+      const second = shutdownLogger(logger);
+
+      // Must be the exact same promise object — no new end()/race() on repeat call.
+      expect(second).toBe(first);
+
+      await expect(first).resolves.toBeUndefined();
+
+      // A call after resolution also returns the cached resolved promise.
+      const third = shutdownLogger(logger);
+      expect(third).toBe(first);
+      await expect(third).resolves.toBeUndefined();
+    });
+
+    it("concurrent same-tick calls share one in-flight promise (Phase 10)", async () => {
+      // Three synchronous calls in the same event-loop turn. Only the first can
+      // miss the WeakMap (it's empty); the second and third see the entry the
+      // first installed and return the same promise. Promise callbacks are
+      // deferred to the microtask queue, so none of the three calls can observe
+      // a settled state before returning.
+      const stream = new PassThrough();
+      const logger = createLogger({
+        moduleName: "shutdown-concurrent-p10",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      const p1 = shutdownLogger(logger);
+      const p2 = shutdownLogger(logger);
+      const p3 = shutdownLogger(logger);
+
+      // All three must be the identical promise object.
+      expect(p2).toBe(p1);
+      expect(p3).toBe(p1);
+
+      await expect(Promise.all([p1, p2, p3])).resolves.toEqual([undefined, undefined, undefined]);
+    });
   });
 
   // ---------------------------------------------------------------------------

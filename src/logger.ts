@@ -1487,10 +1487,20 @@ const awaitTransportFlush = (
  * has flushed, or rejects with a clear timeout error after `timeoutMs` ms
  * (default 5000).
  *
- * Idempotent: calling `shutdownLogger(logger)` a second time returns the same
- * promise as the first call. After a successful shutdown the logger should be
- * considered closed — further `logger.info(...)` calls may silently no-op or
- * throw depending on the underlying transport state.
+ * **Idempotent for successful shutdowns:** a second call after the first
+ * resolves returns the same cached resolved promise — `logger.end()` is never
+ * issued a second time.
+ *
+ * **Retryable after a timeout:** a timed-out shutdown evicts its cached promise
+ * so a subsequent call can retry the flush with a fresh `timeoutMs`. This
+ * allows callers to escalate: call first with a short deadline, catch the
+ * timeout, then call again with a longer one. Concurrent same-tick calls still
+ * share one in-flight promise regardless of which `timeoutMs` value reaches the
+ * `WeakMap` first.
+ *
+ * After a successful shutdown the logger should be considered closed — further
+ * `logger.info(...)` calls may silently no-op or throw depending on the
+ * underlying transport state.
  *
  * @example
  * ```ts
@@ -1555,17 +1565,33 @@ export const shutdownLogger = (
     timeoutHandle.unref?.();
   });
 
-  const promise = Promise.race([flushAll, timeout]).finally(() => {
-    if (timeoutHandle !== undefined) {
-      clearTimeout(timeoutHandle);
-    }
-    // Detach every per-transport listener pair regardless of which side of the
-    // race won. On the success path `settle()` already removed them (and a
-    // second `removeListener` for an absent handler is a documented no-op), so
-    // this is safe to call unconditionally; on the timeout path this is the
-    // ONLY place the listeners get removed, so it is load-bearing.
-    awaiters.forEach((awaiter) => awaiter.cleanup());
-  });
+  const promise = Promise.race([flushAll, timeout])
+    .catch((err) => {
+      // On rejection (timeout), evict the WeakMap so a subsequent call can
+      // retry the flush with a fresh timeout. Successful shutdowns are NOT
+      // evicted — their cached resolved promise is the idempotent "already
+      // done" signal. The identity check is defensive: in single-threaded JS
+      // no code can run between the rejection microtask and this `.catch()`
+      // handler, so the stored entry will always be `promise`. The guard exists
+      // so that if this function is ever refactored to be partially async (e.g.
+      // an `await` is introduced before the `set`), a retry that managed to
+      // install a newer entry first would not be accidentally evicted here.
+      if (shutdownPromises.get(logger) === promise) {
+        shutdownPromises.delete(logger);
+      }
+      throw err;
+    })
+    .finally(() => {
+      if (timeoutHandle !== undefined) {
+        clearTimeout(timeoutHandle);
+      }
+      // Detach every per-transport listener pair regardless of which side of
+      // the race won. On the success path `settle()` already removed them (and
+      // a second `removeListener` for an absent handler is a documented no-op),
+      // so this is safe to call unconditionally; on the timeout path this is
+      // the ONLY place the listeners get removed, so it is load-bearing.
+      awaiters.forEach((awaiter) => awaiter.cleanup());
+    });
 
   shutdownPromises.set(logger, promise);
   return promise;
