@@ -1271,6 +1271,43 @@ describe("createRequestLogger", () => {
       expect((payload.http.requestBody as string).length).toBe(4000);
     });
 
+    it("throws RequestLoggerOptionError({ code: 'INVALID_MASK' }) when redactPaths is a string instead of array", () => {
+      let caught: unknown;
+      try {
+        createRequestLogger({ redactPaths: "body.password" as unknown as string[] });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(RequestLoggerOptionError);
+      expect((caught as RequestLoggerOptionError).code).toBe("INVALID_MASK");
+      expect((caught as RequestLoggerOptionError).message).toContain("redactPaths");
+    });
+
+    it("throws RequestLoggerOptionError({ code: 'INVALID_MASK' }) when a redactPaths entry is not a string", () => {
+      let caught: unknown;
+      try {
+        createRequestLogger({ redactPaths: ["body.user.password", 42 as unknown as string] });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(RequestLoggerOptionError);
+      expect((caught as RequestLoggerOptionError).code).toBe("INVALID_MASK");
+      expect((caught as RequestLoggerOptionError).message).toContain("redactPaths");
+      expect((caught as RequestLoggerOptionError).message).toContain("index 1");
+    });
+
+    it("accepts redactPaths: undefined without throwing", () => {
+      const { logger } = createMockLogger();
+      expect(() => createRequestLogger({ logger, redactPaths: undefined })).not.toThrow();
+    });
+
+    it("accepts a valid string[] for redactPaths without throwing", () => {
+      const { logger } = createMockLogger();
+      expect(() =>
+        createRequestLogger({ logger, redactPaths: ["body.user.password", "context.token"] }),
+      ).not.toThrow();
+    });
+
     it("RequestLoggerOptionError without a cause leaves `cause` as undefined", () => {
       const err = new RequestLoggerOptionError("INVALID_LEVEL", "no cause");
       expect(err.code).toBe("INVALID_LEVEL");

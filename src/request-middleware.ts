@@ -597,6 +597,7 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
   validateMaskKeysOption("maskBodyKeys", options.maskBodyKeys, false);
   validateMaskKeysOption("maskHeaderKeys", options.maskHeaderKeys, true);
   validateMaskKeysOption("maskQueryKeys", options.maskQueryKeys, true);
+  validateMaskKeysOption("redactPaths", options.redactPaths, false);
   validateMaxBodyLength(options.maxBodyLength);
 
   const { loggingEnabled = true, loggingMode } = options;

@@ -528,6 +528,12 @@ export interface RequestLoggerOptions {
    * captured `requestBody` object). Missing intermediate keys are handled
    * gracefully (no-op).
    *
+   * Must be an array of strings (or `undefined`). A non-array value (e.g. the
+   * typo `"body.password"` instead of `["body.password"]`) throws
+   * `RequestLoggerOptionError({ code: "INVALID_MASK" })` at middleware-creation
+   * time so the misconfiguration surfaces immediately rather than silently
+   * failing to redact the intended secret.
+   *
    * Defaults to `[]`.
    */
   redactPaths?: string[];

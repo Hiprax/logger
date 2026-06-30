@@ -102,9 +102,9 @@ export class LoggerOptionError extends Error {
  *
  * - `INVALID_LEVEL` — `level` is not in the npm-levels union (when supplied as
  *   a string; function-form `level` is not validated up front).
- * - `INVALID_MASK` — `maskBodyKeys`, `maskHeaderKeys`, or `maskQueryKeys` is
- *   not an array of strings (the `false` opt-out for the header/query masks is
- *   still accepted; only malformed array forms throw).
+ * - `INVALID_MASK` — `maskBodyKeys`, `maskHeaderKeys`, `maskQueryKeys`, or
+ *   `redactPaths` is not an array of strings (the `false` opt-out for the
+ *   header/query masks is still accepted; only malformed array forms throw).
  * - `INVALID_BODY_LIMIT` — `maxBodyLength` is not a positive number or
  *   `Infinity`. `NaN`, `0`, negative values, and non-number types all throw
  *   this code. `undefined` is accepted and falls back to the default of `3000`.
