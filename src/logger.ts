@@ -1356,7 +1356,6 @@ export const createNoopLogger = (): winston.Logger => {
   if (cachedNoopLogger) {
     return cachedNoopLogger;
   }
-  const noop = (..._args: unknown[]): unknown => undefined;
   // Backing object exposes the well-known surface as own properties so
   // `Reflect.has(target, "info")` (used by inspectors and the request
   // middleware's typecheck) returns `true`. The Proxy below catches anything
@@ -1367,6 +1366,8 @@ export const createNoopLogger = (): winston.Logger => {
     level: "silent",
     transports: Object.freeze([]),
     silent: true,
+    // Stable serialization — the unknown-method fallback would produce a circular result.
+    toJSON: () => ({ type: "@hiprax/logger", level: "silent", transports: 0 }),
   };
 
   const noopLogger: winston.Logger = new Proxy(target, {
@@ -1406,10 +1407,18 @@ export const createNoopLogger = (): winston.Logger => {
         bag[propStr] = fn;
         return fn;
       }
-      // 6. Anything else — return a chainable no-op so even unknown winston
+      // 6. Deny-list — same set the real logger proxy uses: Promise
+      //    machinery (then/catch/finally), framework probes ($$typeof,
+      //    nodeType), and engine introspection props. Blocking these keeps
+      //    the no-op logger non-thenable and prevents it from being mistaken
+      //    for a Vue/React component, a Jest mock, or a callable function.
+      if (DENIED_PROXY_PROPS.has(propStr)) {
+        return undefined;
+      }
+      // 7. Anything else — return a chainable no-op so even unknown winston
       //    methods do not throw. This makes the no-op logger forward-
       //    compatible with future winston versions.
-      return noop;
+      return (..._args: unknown[]) => noopLogger;
     },
   }) as unknown as winston.Logger;
 

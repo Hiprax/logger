@@ -3256,6 +3256,62 @@ describe("createLogger", () => {
       });
       expect(typeof middleware).toBe("function");
     });
+
+    it("is not thenable — then/catch/finally are undefined (F2)", () => {
+      const logger = createNoopLogger() as unknown as Record<string, unknown>;
+      expect(typeof logger["then"]).toBe("undefined");
+      expect(typeof logger["catch"]).toBe("undefined");
+      expect(typeof logger["finally"]).toBe("undefined");
+    });
+
+    it("await createNoopLogger() resolves to the logger without hanging (F2)", async () => {
+      const logger = createNoopLogger();
+      // Race the await against a deadline. If then were a function the
+      // resolution would never be called and the timer would win.
+      const DEADLINE_MS = 500;
+      const result = await Promise.race([
+        new Promise<typeof logger>((resolve) => {
+          // nextTick ensures this fires on the next iteration — fast enough
+          // to beat the deadline unless the engine is following a thenable.
+          process.nextTick(() => resolve(logger));
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("await hung — createNoopLogger() appears thenable")),
+            DEADLINE_MS,
+          ),
+        ),
+      ]);
+      expect(result).toBe(logger);
+    });
+
+    it("unknown-method chain returns the no-op logger for forward-compat (F3)", () => {
+      const logger = createNoopLogger();
+      const rec = logger as unknown as Record<string, (...args: unknown[]) => unknown>;
+      // The return value of any unknown method must be the logger itself
+      // so callers can chain: logger.someFuture().info("x")
+      const ret = rec.someFutureWinstonMethod();
+      expect(ret).toBe(logger);
+      // Full chain: someFuture().info("x") must not throw
+      const chained = rec.someFutureWinstonMethod2() as typeof logger;
+      expect(() => chained.info("chained")).not.toThrow();
+    });
+
+    it("JSON.stringify returns a valid object and keeps the field in a wrapper (F4)", () => {
+      const logger = createNoopLogger();
+      const serialized = JSON.stringify(logger);
+      // Must produce a string, not undefined
+      expect(typeof serialized).toBe("string");
+      const parsed = JSON.parse(serialized as string) as Record<string, unknown>;
+      expect(parsed.type).toBe("@hiprax/logger");
+      expect(parsed.level).toBe("silent");
+      expect(parsed.transports).toBe(0);
+      // Must not be silently dropped when embedded in a wrapper object
+      const wrapped = JSON.stringify({ logger });
+      const parsedWrapped = JSON.parse(wrapped) as { logger: Record<string, unknown> };
+      expect(parsedWrapped.logger).toBeDefined();
+      expect(parsedWrapped.logger.level).toBe("silent");
+    });
   });
 
   describe("BigInt-safe serialization", () => {
