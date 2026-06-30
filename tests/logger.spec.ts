@@ -2646,6 +2646,128 @@ describe("createLogger", () => {
       expect(transformed.timestamp).toBe("2026-05-04 00:00:00");
       expect(transformed.stack).toBe("Error: ...");
     });
+
+    it("json mode calls clock() exactly once per log line regardless of transport count", () => {
+      // Each call returns a distinct Date (seconds = call index) so a double
+      // invocation is detectable: the second timestamp would have a different
+      // seconds digit than the first.
+      let clockCalls = 0;
+      const clock = (): Date => {
+        clockCalls++;
+        const d = new Date("2030-01-01T00:00:00Z");
+        d.setSeconds(clockCalls);
+        return d;
+      };
+
+      const stream = new PassThrough();
+      const logger = createLogger({
+        moduleName: "json-clock-once",
+        format: "json",
+        includeConsole: true,
+        includeFile: false,
+        includeGlobalFile: false,
+        clock,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      logger.info("ping");
+      teardownLogger(logger);
+
+      // The Console transport's per-transport format must NOT re-run
+      // timestampCapture — the logger-level format already captured the
+      // timestamp via the single clock() call. A second call would produce a
+      // different timestamp on the console JSON line than on the file line.
+      expect(clockCalls).toBe(1);
+    });
+
+    it("json mode console format preserves the timestamp written by the logger-level format", () => {
+      // Drives both format pipelines manually — the same way Winston does it
+      // internally: logger-level format first, then the Console transport's
+      // per-transport format on a shallow clone of the transformed info.
+      // This bypasses stream-timing concerns and directly asserts the format
+      // composition contract: the Console format must NOT call clock() again
+      // or overwrite info.timestamp.
+      const fixedDate = new Date("2030-06-15T12:34:56Z");
+      const clock = () => fixedDate;
+
+      const logger = createLogger({
+        moduleName: "json-ts-fmt",
+        format: "json",
+        includeConsole: true,
+        includeFile: false,
+        includeGlobalFile: false,
+        clock,
+      });
+
+      const loggerLevelFormat = (logger as unknown as { format: winston.Logform.Format }).format;
+      const consoleTransport = logger.transports.find(
+        (t) => t instanceof winston.transports.Console,
+      );
+      const consoleTransportFormat = (
+        consoleTransport as unknown as { format: winston.Logform.Format }
+      ).format;
+
+      const syntheticInfo = {
+        level: "info",
+        message: "hello",
+        [Symbol.for("level")]: "info",
+      };
+
+      // Step 1 — logger-level format: runs timestampCapture → sets info.timestamp
+      const afterLogger = loggerLevelFormat.transform({ ...syntheticInfo } as any);
+      expect(afterLogger).not.toBe(false);
+
+      // Step 2 — Console transport format: runs on a clone of the Step 1 result,
+      // mirroring Winston's `Object.assign({}, info)` clone before per-transport
+      // format execution. Must NOT re-run timestampCapture.
+      const afterConsole = consoleTransportFormat.transform({
+        ...(afterLogger as Record<string, unknown>),
+      } as any);
+      expect(afterConsole).not.toBe(false);
+
+      teardownLogger(logger);
+
+      const loggerJson = JSON.parse(
+        Reflect.get(afterLogger as Record<PropertyKey, unknown>, Symbol.for("message")) as string,
+      ) as Record<string, unknown>;
+
+      const consoleJson = JSON.parse(
+        Reflect.get(afterConsole as Record<PropertyKey, unknown>, Symbol.for("message")) as string,
+      ) as Record<string, unknown>;
+
+      // The console format must carry the timestamp already written by the
+      // logger-level format, not a new clock() read that would differ.
+      expect(loggerJson.timestamp).toBe("2030-06-15 12:34:56");
+      expect(consoleJson.timestamp).toBe("2030-06-15 12:34:56");
+      expect(consoleJson.timestamp).toBe(loggerJson.timestamp);
+    });
+
+    it("pretty mode calls clock() exactly once per log line (regression guard)", () => {
+      // Confirms the pretty-mode pipeline was already single-capture and that
+      // the json-mode fix did not accidentally regress the pretty branch.
+      let clockCalls = 0;
+      const clock = (): Date => {
+        clockCalls++;
+        const d = new Date("2030-01-01T00:00:00Z");
+        d.setSeconds(clockCalls);
+        return d;
+      };
+
+      const stream = new PassThrough();
+      const logger = createLogger({
+        moduleName: "pretty-clock-once",
+        includeConsole: true,
+        includeFile: false,
+        includeGlobalFile: false,
+        clock,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      logger.info("ping");
+      teardownLogger(logger);
+
+      expect(clockCalls).toBe(1);
+    });
   });
 
   describe("createNoopLogger", () => {

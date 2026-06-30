@@ -878,16 +878,28 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     // Error instances to `{ message, stack, ...rest }` so the stack survives
     // the JSON serialization; `buildMetaRedactor` runs the shared deep
     // redaction over caller-supplied metadata BEFORE `json()` serializes —
-    // so secrets never reach the line. The console pipeline gets the SAME
-    // raw JSON (no colorize) so a consumer piping `stdout` to a shipper
-    // sees byte-identical payloads on every transport.
+    // so secrets never reach the line.
+    //
+    // The Console transport receives a SEPARATE format chain that intentionally
+    // omits `timestampCapture`. Winston applies the logger-level `sharedFormat`
+    // first (writing `info.timestamp` via the single `clock()` call), then
+    // pipes a shallow clone of the transformed info to each transport's own
+    // format. If the Console transport's format also included `timestampCapture`,
+    // `clock()` would fire a second time and overwrite `info.timestamp` with a
+    // new value — making the console JSON timestamp diverge from the file JSON
+    // timestamp. Omitting it here means `json()` serializes the timestamp that
+    // was already captured at log-call time, keeping all outputs identical.
     sharedFormat = winston.format.combine(
       timestampCapture,
       winston.format.errors({ stack: true }),
       buildMetaRedactor(maskMetaKeySet),
       winston.format.json(),
     );
-    consoleFormat = sharedFormat;
+    consoleFormat = winston.format.combine(
+      winston.format.errors({ stack: true }),
+      buildMetaRedactor(maskMetaKeySet),
+      winston.format.json(),
+    );
   } else {
     // Pretty branch — preserves the existing human-readable printf output
     // for backward compatibility. The timestamp capture runs FIRST so
