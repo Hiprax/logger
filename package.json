@@ -1,6 +1,6 @@
 {
   "name": "@hiprax/logger",
-  "version": "0.21.10",
+  "version": "0.22.0",
   "description": "Fully typed Winston-based logger with rotation, timezone support, and Express middleware",
   "keywords": [
     "logger",

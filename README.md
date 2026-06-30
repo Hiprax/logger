@@ -605,7 +605,7 @@ narrowly scoped `redactPaths` API.
   - `set-cookie`
   - `x-api-key`
   - `proxy-authorization`
-- **URL query redaction (`maskQueryKeys`)**: parses the logged `req.originalUrl` / `req.url` with `URLSearchParams`, replaces matching parameter values with `[REDACTED]`, and re-stringifies. Handles both absolute and relative URLs. Default mask list (opt-out by passing `false`):
+- **URL query redaction (`maskQueryKeys`)**: edits the logged `req.originalUrl` / `req.url` query string **in place** — it locates each `key=value` pair in the raw query and replaces only a matched parameter's value with the literal `[REDACTED]`, leaving every other byte untouched. Sibling-parameter encoding (`%20`, `%5B`/`%5D`, `%2B`), the `//host` authority of protocol-relative URLs, the scheme/host of absolute URLs, and the URL fragment are all preserved exactly; parameters are never re-ordered or re-encoded, and the function never throws. Handles both absolute and relative URLs. Default mask list (opt-out by passing `false`):
   - `token`, `access_token`
   - `api_key`, `apikey`, `key`
   - `code` (covers OAuth callback codes)

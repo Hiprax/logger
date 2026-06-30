@@ -529,8 +529,11 @@ export interface RequestLoggerOptions {
   /**
    * Query-string parameter names whose values should be replaced with
    * `[REDACTED]` in the logged `req.url` / `req.originalUrl`. Matched
-   * case-insensitively. Re-stringification preserves the original parameter
-   * order and uses URL-encoded form.
+   * case-insensitively. The raw query string is edited **in place**: only a
+   * matched parameter's value is replaced with `[REDACTED]`; every other byte
+   * — parameter order, sibling-param percent-encoding (`%20`, `%5B`/`%5D`,
+   * `%2B`), the `//host` authority of protocol-relative URLs, and the fragment
+   * — is preserved exactly. Values are never re-encoded or re-serialized.
    *
    * Defaults to `["token", "access_token", "api_key", "apikey", "key", "code",
    * "secret", "password"]` (a safe-defaults list covering OAuth callback
