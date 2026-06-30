@@ -2300,5 +2300,186 @@ describe("request middleware internals", () => {
       expect(out.err).toBe(err);
       expect(out.buf).toBe(buf);
     });
+
+    // -------------------------------------------------------------------------
+    // Phase 1 — Leak-safe deep redaction: class/Error instance masking
+    // -------------------------------------------------------------------------
+
+    it("redacts a masked own key on a class instance (data-bearing branch)", () => {
+      class Credentials {
+        constructor(
+          public readonly username: string,
+          public readonly password: string,
+        ) {}
+      }
+      const input = new Credentials("alice", "s3cr3t");
+      const mask = new Set(["password"]);
+      const out = redactValue(input, mask, new WeakSet()) as Record<string, unknown>;
+      // password is masked → fresh plain object returned
+      expect(out).not.toBe(input);
+      expect(out.password).toBe("[REDACTED]");
+      expect(out.username).toBe("alice");
+    });
+
+    it("redacts a masked own key nested inside a plain object that holds a class instance", () => {
+      class Token {
+        constructor(
+          public readonly value: string,
+          public readonly label: string,
+        ) {}
+      }
+      const tok = new Token("secret-token", "api");
+      const body = { meta: { auth: tok, tag: "ok" } };
+      const mask = new Set(["value"]);
+      const out = redactValue(body, mask, new WeakSet()) as {
+        meta: { auth: Record<string, unknown>; tag: string };
+      };
+      // The outer plain object is rebuilt; the inner class instance is also
+      // walked because it contains a masked key.
+      expect(out.meta.auth).not.toBe(tok);
+      expect(out.meta.auth.value).toBe("[REDACTED]");
+      expect(out.meta.auth.label).toBe("api");
+      expect(out.meta.tag).toBe("ok");
+    });
+
+    it("redacts a masked enumerable prop on an Error subclass", () => {
+      class AppError extends Error {
+        public token: string;
+        constructor(message: string, token: string) {
+          super(message);
+          this.name = "AppError";
+          this.token = token; // own enumerable key
+        }
+      }
+      const err = new AppError("auth failed", "bearer-xyz");
+      const mask = new Set(["token"]);
+      const out = redactValue(err, mask, new WeakSet()) as Record<string, unknown>;
+      // token is enumerable and masked → fresh plain object
+      expect(out).not.toBe(err);
+      expect(out.token).toBe("[REDACTED]");
+      // name was not masked and is enumerable on this subclass
+      expect(out.name).toBe("AppError");
+    });
+
+    it("returns a class instance by identity when the mask is non-empty but no key matches", () => {
+      class Payload {
+        constructor(public readonly data: string) {}
+      }
+      const input = new Payload("hello");
+      const mask = new Set(["password", "token"]); // non-empty but no match
+      const out = redactValue(input, mask, new WeakSet());
+      // Nothing changed → original returned by identity
+      expect(out).toBe(input);
+      expect((out as Payload).data).toBe("hello");
+    });
+
+    it("passes through a class instance that defines toJSON even when a key matches (documented limitation)", () => {
+      class Timestamped {
+        public readonly password = "secret";
+        toJSON() {
+          return { customized: true };
+        }
+      }
+      const input = new Timestamped();
+      const mask = new Set(["password"]);
+      const out = redactValue(input, mask, new WeakSet());
+      // hasToJSON === true → pass-through, no key walk; this is the documented
+      // limitation: use `redactPaths` or normalize to a plain object instead.
+      expect(out).toBe(input);
+    });
+
+    it("does NOT yield [Circular] when the same built-in is referenced by two keys", () => {
+      // Before the fix, seen.add(date) ran before the non-plain check, so the
+      // second reference to the same Date returned "[Circular]".
+      const d = new Date("2024-01-01T00:00:00.000Z");
+      const body = { start: d, end: d };
+      const out = redactValue(body, empty, new WeakSet()) as Record<string, unknown>;
+      // Both keys must carry the original Date instance, not "[Circular]".
+      expect(out.start).toBe(d);
+      expect(out.end).toBe(d);
+      expect(out.start).not.toBe("[Circular]");
+      expect(out.end).not.toBe("[Circular]");
+    });
+
+    it("serializeBody redacts a masked key on a class-instance request body", () => {
+      // End-to-end fix for F1: the downstream JSON.stringify enumerates own
+      // keys of class instances, so secrets stored as instance fields leaked
+      // even when the key was in maskBodyKeys. This test pins the fix.
+      class LoginBody {
+        constructor(
+          public readonly username: string,
+          public readonly password: string,
+        ) {}
+      }
+      const body = new LoginBody("alice", "s3cr3t");
+      const out = serializeBody(body, ["password"]) as Record<string, unknown>;
+      expect(out.password).toBe("[REDACTED]");
+      expect(out.username).toBe("alice");
+      // The raw secret string must NOT appear in any serialized form.
+      expect(JSON.stringify(out)).not.toContain("s3cr3t");
+    });
+
+    it("data-bearing instance: FORBIDDEN_KEYS are skipped during the walk (defense-in-depth)", () => {
+      // Exercises lines 119-121: the case where a class instance has an own
+      // enumerable key whose name is in FORBIDDEN_KEYS (__proto__, constructor,
+      // prototype). Object.assign copies own-enumerable properties — including
+      // 'constructor' from an object literal — onto the target instance.
+      class SafeDto {
+        public safe: string;
+        constructor(safe: string) {
+          this.safe = safe;
+        }
+      }
+      // Create an instance whose own enumerable keys include 'constructor'
+      // (a FORBIDDEN_KEY). This is an adversarial/prototype-pollution scenario.
+      const instance = Object.assign(Object.create(SafeDto.prototype) as SafeDto, {
+        safe: "data",
+        constructor: "evil" as unknown, // own enumerable FORBIDDEN_KEY
+      });
+
+      const mask = new Set(["safe"]);
+      const out = redactValue(instance, mask, new WeakSet()) as Record<string, unknown>;
+
+      // 'constructor' was skipped (dropped) → not an OWN property on the output.
+      expect(Object.prototype.hasOwnProperty.call(out, "constructor")).toBe(false);
+      // 'safe' was masked.
+      expect(out.safe).toBe("[REDACTED]");
+      // changed === true (masked key + forbidden key skipped) → fresh plain object.
+      expect(out).not.toBe(instance);
+    });
+
+    it("data-bearing instance with a circular self-reference emits [Circular]", () => {
+      // Exercises the seen.has() branch inside the data-bearing instance path
+      // (distinct from the plain-object circular path exercised by other tests).
+      class Node {
+        public self?: Node;
+        public label: string;
+        constructor(label: string) {
+          this.label = label;
+        }
+      }
+      const n = new Node("root");
+      n.self = n; // circular: n.self === n
+
+      const mask = new Set<string>();
+      const out = redactValue(n, mask, new WeakSet()) as Record<string, unknown>;
+
+      // The self-reference must be replaced with "[Circular]" without throwing.
+      expect(out.self).toBe("[Circular]");
+      expect(out.label).toBe("root");
+    });
+
+    it("circular array containing itself emits [Circular] without throwing", () => {
+      // Exercises the seen.has() branch inside the Array.isArray path (line 83).
+      // An array that holds a reference to itself must be handled gracefully.
+      const arr: unknown[] = [];
+      arr.push(arr); // arr[0] === arr — circular
+
+      const mask = new Set<string>();
+      const out = redactValue(arr, mask, new WeakSet()) as unknown[];
+
+      // The nested self-reference is replaced with "[Circular]".
+      expect(out[0]).toBe("[Circular]");
+    });
   });
 });

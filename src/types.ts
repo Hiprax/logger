@@ -297,6 +297,13 @@ export interface LoggerOptions {
    * runs in BOTH the file pipeline and the console pipeline, so a key cannot
    * leak via one transport but not the other. Circular references are handled
    * gracefully (replaced with `"[Circular]"`).
+   *
+   * **Redaction boundary.** Deep redaction covers plain objects, arrays, and
+   * the enumerable own fields of class/Error instances. Values that define
+   * their own `toJSON()` (such as `Date`, `URL`, and custom serializable
+   * classes) or that carry no enumerable own keys (`Map`, `Set`, `RegExp`,
+   * etc.) are serialized via their built-in method and are **not** key-
+   * redacted — use `redactPaths` or normalize to a plain object for those.
    */
   maskMetaKeys?: string[];
   /**
@@ -494,6 +501,15 @@ export interface RequestLoggerOptions {
   maxBodyLength?: number;
   /**
    * Keys within the request body that should be replaced with `[REDACTED]`.
+   * Matched **case-insensitively** and applied **deeply** (including arrays
+   * and nested objects).
+   *
+   * **Redaction boundary.** Deep redaction covers plain objects, arrays, and
+   * the enumerable own fields of class/Error instances. Values that define
+   * their own `toJSON()` (such as `Date`, `URL`, and custom serializable
+   * classes) or that carry no enumerable own keys (`Map`, `Set`, `RegExp`,
+   * etc.) are serialized via their built-in method and are **not** key-
+   * redacted — use `redactPaths` or normalize to a plain object for those.
    */
   maskBodyKeys?: string[];
   /**
@@ -535,6 +551,12 @@ export interface RequestLoggerOptions {
    * failing to redact the intended secret.
    *
    * Defaults to `[]`.
+   *
+   * **Redaction boundary note.** Deep redaction (via `maskBodyKeys`) covers
+   * plain objects, arrays, and the enumerable own fields of class/Error
+   * instances but does **not** key-redact values that define their own
+   * `toJSON()`. Use `redactPaths` for surgical path-based replacement of such
+   * values (e.g. `["body.user.createdAt"]` to blank a `Date` field).
    */
   redactPaths?: string[];
   /**

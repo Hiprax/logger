@@ -2170,6 +2170,72 @@ describe("createLogger", () => {
       expect(rendered).toContain('"email": "u@example.com"');
       expect(rendered).not.toContain("[REDACTED]");
     });
+
+    // -----------------------------------------------------------------------
+    // Phase 1 — Leak-safe deep redaction: end-to-end class-instance masking
+    // -----------------------------------------------------------------------
+
+    it("pretty mode: redacts a masked key stored on a class-instance metadata value", () => {
+      // F1 fix: the downstream JSON.stringify in the printf formatter enumerates
+      // own enumerable keys of class instances, so without the fix a secret
+      // stored as `instance.password` would leak into the log line even when
+      // `password ∈ maskMetaKeys`.
+      class UserMeta {
+        constructor(
+          public readonly email: string,
+          public readonly password: string,
+        ) {}
+      }
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-class-pretty",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      logger.info("Login", new UserMeta("alice@example.com", "topsecret"));
+      teardownLogger(logger);
+      const rendered = chunks.join("");
+
+      expect(rendered).not.toContain("topsecret");
+      expect(rendered).toContain("[REDACTED]");
+      expect(rendered).toContain("alice@example.com");
+    });
+
+    it("json mode: redacts a masked key stored on a class-instance metadata value", () => {
+      class UserMeta {
+        constructor(
+          public readonly email: string,
+          public readonly password: string,
+        ) {}
+      }
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-class-json",
+        format: "json",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      logger.info("Login", new UserMeta("alice@example.com", "topsecret"));
+      teardownLogger(logger);
+      const output = chunks.join("").trim();
+
+      expect(output).not.toContain("topsecret");
+      expect(output).toContain("[REDACTED]");
+      // Must still be valid JSON.
+      const parsed = JSON.parse(output) as Record<string, unknown>;
+      expect(parsed.password).toBe("[REDACTED]");
+      expect(parsed.email).toBe("alice@example.com");
+    });
   });
 
   describe("escapeMessageNewlines", () => {
