@@ -482,7 +482,14 @@ export interface RequestLoggerOptions {
    */
   includeRequestBody?: boolean;
   /**
-   * Max serialized body length to guard against huge payloads.
+   * Caps serialized body size to guard against log-flood attacks from huge
+   * payloads. Defaults to `3000` (characters).
+   *
+   * Must be a **positive number** or `Infinity` when supplied. `Infinity`
+   * disables truncation entirely (body is always logged in full). `NaN`, `0`,
+   * negative values, and non-number types throw
+   * `RequestLoggerOptionError({ code: "INVALID_BODY_LIMIT" })` synchronously
+   * at middleware-creation time.
    */
   maxBodyLength?: number;
   /**

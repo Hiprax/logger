@@ -105,8 +105,11 @@ export class LoggerOptionError extends Error {
  * - `INVALID_MASK` — `maskBodyKeys`, `maskHeaderKeys`, or `maskQueryKeys` is
  *   not an array of strings (the `false` opt-out for the header/query masks is
  *   still accepted; only malformed array forms throw).
+ * - `INVALID_BODY_LIMIT` — `maxBodyLength` is not a positive number or
+ *   `Infinity`. `NaN`, `0`, negative values, and non-number types all throw
+ *   this code. `undefined` is accepted and falls back to the default of `3000`.
  */
-export type RequestLoggerOptionErrorCode = "INVALID_LEVEL" | "INVALID_MASK";
+export type RequestLoggerOptionErrorCode = "INVALID_LEVEL" | "INVALID_MASK" | "INVALID_BODY_LIMIT";
 
 /**
  * Structured option-validation error thrown by `createRequestLogger()` when

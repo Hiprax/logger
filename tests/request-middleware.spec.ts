@@ -1199,6 +1199,78 @@ describe("createRequestLogger", () => {
       ).toThrow(RequestLoggerOptionError);
     });
 
+    it("throws RequestLoggerOptionError({ code: 'INVALID_BODY_LIMIT' }) for NaN", () => {
+      let caught: unknown;
+      try {
+        createRequestLogger({ maxBodyLength: NaN });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(RequestLoggerOptionError);
+      expect((caught as RequestLoggerOptionError).code).toBe("INVALID_BODY_LIMIT");
+      expect((caught as RequestLoggerOptionError).message).toContain("maxBodyLength");
+    });
+
+    it("throws RequestLoggerOptionError({ code: 'INVALID_BODY_LIMIT' }) for 0", () => {
+      let caught: unknown;
+      try {
+        createRequestLogger({ maxBodyLength: 0 });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(RequestLoggerOptionError);
+      expect((caught as RequestLoggerOptionError).code).toBe("INVALID_BODY_LIMIT");
+      expect((caught as RequestLoggerOptionError).message).toContain("maxBodyLength");
+    });
+
+    it("throws RequestLoggerOptionError({ code: 'INVALID_BODY_LIMIT' }) for a negative value", () => {
+      let caught: unknown;
+      try {
+        createRequestLogger({ maxBodyLength: -5 });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(RequestLoggerOptionError);
+      expect((caught as RequestLoggerOptionError).code).toBe("INVALID_BODY_LIMIT");
+      expect((caught as RequestLoggerOptionError).message).toContain("maxBodyLength");
+    });
+
+    it("throws RequestLoggerOptionError({ code: 'INVALID_BODY_LIMIT' }) for a non-number type", () => {
+      let caught: unknown;
+      try {
+        createRequestLogger({ maxBodyLength: "100" as unknown as number });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(RequestLoggerOptionError);
+      expect((caught as RequestLoggerOptionError).code).toBe("INVALID_BODY_LIMIT");
+      expect((caught as RequestLoggerOptionError).message).toContain("maxBodyLength");
+    });
+
+    it("accepts a valid positive maxBodyLength without throwing", () => {
+      const { logger } = createMockLogger();
+      expect(() => createRequestLogger({ logger, maxBodyLength: 5000 })).not.toThrow();
+    });
+
+    it("accepts Infinity as maxBodyLength and never truncates the body", () => {
+      const { logger, log } = createMockLogger();
+      const body = "x".repeat(4000);
+      const middleware = createRequestLogger({
+        logger,
+        includeRequestBody: true,
+        includeHttpContext: true,
+        maxBodyLength: Infinity,
+      });
+
+      const { res } = runMiddleware(middleware, { body });
+      res.emit("finish");
+
+      const payload = log.mock.calls[0][0];
+      expect(typeof payload.http.requestBody).toBe("string");
+      expect(payload.http.requestBody).toBe(body);
+      expect((payload.http.requestBody as string).length).toBe(4000);
+    });
+
     it("RequestLoggerOptionError without a cause leaves `cause` as undefined", () => {
       const err = new RequestLoggerOptionError("INVALID_LEVEL", "no cause");
       expect(err.code).toBe("INVALID_LEVEL");

@@ -85,6 +85,27 @@ const validateMaskKeysOption = (label: string, value: unknown, allowFalse: boole
   }
 };
 
+/**
+ * Validates `RequestLoggerOptions.maxBodyLength`. Accepts `undefined` (falls
+ * back to `DEFAULT_BODY_LIMIT`). Otherwise requires a number that is not `NaN`
+ * and is `> 0` — this rejects `0`, negatives, and non-numbers while preserving
+ * `Infinity` as "unlimited" (body is never truncated). Throws
+ * `RequestLoggerOptionError({ code: "INVALID_BODY_LIMIT" })` on bad input.
+ */
+const validateMaxBodyLength = (value: unknown): void => {
+  if (value === undefined) {
+    return;
+  }
+  if (typeof value !== "number" || isNaN(value) || value <= 0) {
+    throw new RequestLoggerOptionError(
+      "INVALID_BODY_LIMIT",
+      `Invalid \`maxBodyLength\` option: expected a positive number or Infinity, got ${
+        typeof value === "number" ? value : JSON.stringify(value)
+      }.`,
+    );
+  }
+};
+
 const DEFAULT_BODY_LIMIT = 3000;
 const DEFAULT_ENV_SOURCES = ["NODE_ENV", "APP_ENV", "ENV"];
 const DEFAULT_DEV_VALUES = ["dev", "development", "local"];
@@ -576,6 +597,7 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
   validateMaskKeysOption("maskBodyKeys", options.maskBodyKeys, false);
   validateMaskKeysOption("maskHeaderKeys", options.maskHeaderKeys, true);
   validateMaskKeysOption("maskQueryKeys", options.maskQueryKeys, true);
+  validateMaxBodyLength(options.maxBodyLength);
 
   const { loggingEnabled = true, loggingMode } = options;
   const envAllowsLogging = shouldLogForEnvironment(loggingMode);
@@ -808,6 +830,7 @@ export const __requestInternals = {
   resolveMaskQueryKeys,
   validateRequestLevelOption,
   validateMaskKeysOption,
+  validateMaxBodyLength,
   isValidLogLevel,
   VALID_LOG_LEVELS,
   DEFAULT_MASKED_HEADER_KEYS,
