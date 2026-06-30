@@ -299,7 +299,11 @@ export const getDefaultRotation = (): RotationStrategy => ({
  * options that affect runtime behavior: `level`, `consoleLevel`,
  * `includeConsole`, `includeFile`, `includeGlobalFile`, `globalModuleName`,
  * `extraTimezones` (sorted to be order-independent), `rotation`,
- * `globalRotation`. Does NOT include `additionalTransports` — function/class
+ * `globalRotation`, `escapeMessageNewlines`, `format`, `maskMetaKeys`
+ * (lowercased + sorted to be order-independent — security-relevant, so a
+ * silently-dropped redaction config must surface as a conflict), `colorize`
+ * (the *resolved* `{level, message}` flags, not the raw option shape), and
+ * `captureUncaught`. Does NOT include `additionalTransports` — function/class
  * instances are not stably comparable; the registry tracks their count
  * separately and the warning surfaces it as a caveat.
  */
@@ -315,6 +319,9 @@ const buildOptionsSignature = (resolved: {
   globalRotation: RotationStrategy;
   escapeMessageNewlines: boolean;
   format: "pretty" | "json";
+  maskMetaKeys: string[];
+  colorize: { level: boolean; message: boolean };
+  captureUncaught: boolean;
 }): string => {
   return JSON.stringify({
     level: resolved.level,
@@ -328,6 +335,9 @@ const buildOptionsSignature = (resolved: {
     globalRotation: resolved.globalRotation,
     escapeMessageNewlines: resolved.escapeMessageNewlines,
     format: resolved.format,
+    maskMetaKeys: [...resolved.maskMetaKeys].map((key) => key.toLowerCase()).sort(),
+    colorize: resolved.colorize,
+    captureUncaught: resolved.captureUncaught,
   });
 };
 
@@ -855,6 +865,15 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
   };
   resolvedGlobalRotation.maxFiles = normalizeMaxFiles(resolvedGlobalRotation.maxFiles);
 
+  // Resolve the colorize option to per-flag booleans BEFORE the cache lookup
+  // (and the options signature it feeds) so a divergent `colorize` between two
+  // createLogger() calls on the same key is caught by the conflict warning
+  // below instead of being silently dropped. The flags are resolved
+  // unconditionally — the same `colorizeFlags` value is reused further down
+  // for both the `pretty` branch (used inline) and the `json` branch (which
+  // ignores them — JSON output never gets colorized regardless).
+  const colorizeFlags = resolveColorizeFlags(colorize);
+
   const optionsSignature = buildOptionsSignature({
     level,
     consoleLevel,
@@ -867,6 +886,9 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     globalRotation: resolvedGlobalRotation,
     escapeMessageNewlines,
     format,
+    maskMetaKeys,
+    colorize: colorizeFlags,
+    captureUncaught,
   });
 
   const cached = loggerRegistry.get(registryKey);
@@ -918,14 +940,6 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     maskMetaKeys.length > 0
       ? new Set<string>(maskMetaKeys.map((key) => key.toLowerCase()))
       : undefined;
-  // Resolve the colorize option to per-flag booleans. `level: true` causes
-  // the printf below to wrap `[LEVEL]` in ANSI codes via a standalone
-  // colorizer instance; `message: true` adds winston's standard
-  // `colorize({ message: true })` transform to the console pipeline. The
-  // colorize flags are resolved unconditionally so the value is available
-  // for both the `pretty` branch (used inline) and the `json` branch (which
-  // ignores them — JSON output never gets colorized regardless).
-  const colorizeFlags = resolveColorizeFlags(colorize);
 
   let sharedFormat: winston.Logform.Format;
   let consoleFormat: winston.Logform.Format;

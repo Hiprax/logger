@@ -877,6 +877,54 @@ describe("createLogger", () => {
       teardownLogger(first);
     });
 
+    it("warns when maskMetaKeys differs and returns the cached instance (F9)", () => {
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({ ...baseOpts(root), maskMetaKeys: ["password"] });
+      const second = createLogger({ ...baseOpts(root), maskMetaKeys: ["token"] });
+
+      expect(second).toBe(first);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const message = String(warnSpy.mock.calls[0][0]);
+      expect(message).toContain("conflicting options");
+      expect(message).toContain("maskMetaKeys");
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("does not warn when maskMetaKeys differs only by order or case (F9)", () => {
+      // ["Password", "TOKEN"] and ["token", "password"] normalize to the same
+      // lowercased+sorted signature, so this must NOT be a false-positive
+      // conflict warning for two functionally identical redaction configs.
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({ ...baseOpts(root), maskMetaKeys: ["Password", "TOKEN"] });
+      const second = createLogger({ ...baseOpts(root), maskMetaKeys: ["token", "password"] });
+
+      expect(second).toBe(first);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("does not warn when the same non-empty maskMetaKeys array is passed twice (F9)", () => {
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({ ...baseOpts(root), maskMetaKeys: ["password", "token"] });
+      const second = createLogger({ ...baseOpts(root), maskMetaKeys: ["password", "token"] });
+
+      expect(second).toBe(first);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
     it("does not warn a second time when the same mismatched options recur", () => {
       const root = createTempDir();
       const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -1482,6 +1530,9 @@ describe("createLogger", () => {
         globalRotation: { maxSize: "20m", maxFiles: "14d" },
         escapeMessageNewlines: false,
         format: "pretty" as const,
+        maskMetaKeys: [] as string[],
+        colorize: { level: true, message: true },
+        captureUncaught: true,
       };
       const a = __loggerInternals.buildOptionsSignature({
         ...base,
@@ -1492,6 +1543,37 @@ describe("createLogger", () => {
         extraTimezones: ["America/New_York", "Europe/London"],
       });
       expect(a).toBe(b);
+    });
+
+    it("buildOptionsSignature includes maskMetaKeys/colorize/captureUncaught and sorts+lowercases maskMetaKeys (F9)", () => {
+      const base = {
+        level: "info" as const,
+        consoleLevel: "info" as const,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        globalModuleName: "all-logs",
+        extraTimezones: [] as string[],
+        rotation: { maxSize: "20m", maxFiles: "14d" },
+        globalRotation: { maxSize: "20m", maxFiles: "14d" },
+        escapeMessageNewlines: false,
+        format: "pretty" as const,
+        colorize: { level: true, message: true },
+        captureUncaught: true,
+      };
+      const a = __loggerInternals.buildOptionsSignature({
+        ...base,
+        maskMetaKeys: ["password", "Token"],
+      });
+      const b = __loggerInternals.buildOptionsSignature({
+        ...base,
+        maskMetaKeys: ["TOKEN", "Password"],
+      });
+
+      expect(a).toBe(b);
+      expect(a).toContain('"maskMetaKeys":["password","token"]');
+      expect(a).toContain('"colorize":{"level":true,"message":true}');
+      expect(a).toContain('"captureUncaught":true');
     });
 
     it("diffSignatures lists divergent top-level keys", () => {
