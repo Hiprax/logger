@@ -201,7 +201,7 @@ process.once("SIGTERM", handleSignal);
 process.once("SIGINT", handleSignal);
 ```
 
-`shutdownLogger(logger, { timeoutMs = 5000 })` calls `logger.end()` (winston's flush API) and awaits the `finish` event on every transport. It rejects with a `shutdownLogger timed out after <timeoutMs>ms…` error when any transport fails to flush in time. The function is **idempotent** — calling it twice on the same logger returns the cached promise rather than issuing a second `logger.end()`.
+`shutdownLogger(logger, { timeoutMs = 5000 })` calls `logger.end()` (winston's flush API) and awaits the `finish` event on every transport. It rejects with a `shutdownLogger timed out after <timeoutMs>ms…` error when any transport fails to flush in time. The function is **idempotent for successful shutdowns** — calling it twice returns the cached resolved promise without issuing a second `logger.end()`. A **timed-out shutdown is retryable**: the cached rejected promise is evicted so a subsequent call with a longer `timeoutMs` can start a fresh flush attempt.
 
 `shutdownAllLoggers(options?)` is a convenience that walks the internal registry and calls `shutdownLogger()` on every cached logger in parallel. Both helpers `unref()` the timeout's `setTimeout` handle so a pending shutdown does not keep the event loop alive on its own.
 
@@ -267,7 +267,7 @@ The override MUST be a `bigint` produced by `process.hrtime.bigint()`. Any other
 | `label`                  | `string`                                            | —                                     | Included in the auto-generated logger name (`http/<label>`).                              |
 | `messageBuilder`         | `(entry) => string`                                 | `"METHOD URL status latency (event)"` | Customize the final message string.                                                       |
 | `skip`                   | `(req, res) => boolean`                             | —                                     | Return `true` to skip logging for specific requests.                                      |
-| `enrich`                 | `(req, res, durationMs) => Record<string, unknown>` | —                                     | Inject extra context (e.g., tenant, user). Attached under `entry.context`.                |
+| `enrich`                 | `(req, res, durationMs) => Record<string, unknown> \| null \| undefined` | —         | Inject extra context (e.g., tenant, user). Attached under `entry.context`. Returning `null` or `undefined` is treated as "no extra context" — `entry.context` is left unset. |
 | `includeRequestHeaders`  | `boolean \| string[]`                               | `false`                               | `true` for all headers, or an array of allowed header names.                              |
 | `includeResponseHeaders` | `boolean \| string[]`                               | `false`                               | Same as above for response headers.                                                       |
 | `includeRequestBody`     | `boolean`                                           | `false`                               | Logs parsed request body (with redaction support).                                        |
