@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [0.21.9] - 2026-06-30
+
+### Security / Dependencies (2026-06-30)
+
+- **Closed all three open Dependabot alerts** by pinning the affected transitive **devDependencies** to their patched versions via a new top-level `overrides` block in `package.json`. All three are build/test-time-only transitive dependencies — none is a runtime dependency and none ships in the published tarball (the `files` allowlist is `dist`, `README.md`, `LICENSE`), so consumers of `@hiprax/logger` were never exposed; the alerts only ever concerned the maintainer's CI and local dev toolchain. `npm audit` now reports **0 vulnerabilities at every audit level** (was 1 moderate + 2 low). Full pre-completion checklist passes (build, 253/253 tests + 100% coverage on every metric, lint, type-check, format:check).
+  - **`js-yaml` → `^3.15.0` (override `"js-yaml@3"`)** — closes **GHSA-h67p-54hq-rp68 / CVE-2026-53550** (moderate; quadratic-complexity DoS in YAML merge-key handling via repeated aliases). Reached only through `ts-jest > @jest/transform > babel-plugin-istanbul > @istanbuljs/load-nyc-config`, which parses the project's own trusted nyc/istanbul config during the coverage step of `npm test`; the package never parses untrusted YAML. The `@3` selector key scopes the override to the js-yaml **3.x line only** so a future 4.x consumer is never forced down to 3.x (verified against npm 11's version-range override semantics).
+  - **`@babel/core` → `^7.29.7`** — closes **GHSA-4x5r-pxfx-6jf8 / CVE-2026-49356** (low; arbitrary file read via crafted `//# sourceMappingURL=` comment, CWE-22). Pulled in only through jest / ts-jest's transform plumbing, where Babel only ever processes the project's own first-party source; the advisory itself notes that "users that only compile trusted code are not impacted."
+  - **`esbuild` → `^0.28.1`** — closes **GHSA-g7r4-m6w7-qqqr** (low; Windows-only arbitrary file read in esbuild's HTTP development server, CWE-22). Reached only through `tsup` for one-shot bundling; esbuild's dev server (`serve` / `--servedir`) is never started by this package, so there is no request surface to traverse. `tsup@8.5.1` (the latest release) still declares `esbuild ^0.27.0`, so an `overrides` pin is the only way to reach the fix while keeping `tsup` on its latest version; the build and full test suite confirm `tsup@8.5.1` is fully compatible with `esbuild@0.28.1` (dual ESM/CJS + declaration output unchanged). `package-lock.json` updated to the patched resolutions (`js-yaml@3.15.0`, `@babel/core@7.29.7`, `esbuild@0.28.1` plus its platform-specific `@esbuild/*` packages); `npm ci` confirmed in sync.
+
+### Packaging (2026-06-30)
+
+- **Stopped publishing the raw `src/*.ts` sources** (`package.json` `files`, `.npmignore`). Removed `src` from the `files` allowlist, trimming the published tarball from **15 files to 9** (`LICENSE`, `README.md`, `package.json`, and the six `dist/` artifacts) and the unpacked size from ~558 kB to ~430 kB. The raw sources were redundant for debugging: the `dist/*.map` sourcemaps already inline the complete original TypeScript via `sourcesContent` (verified), so debuggers resolve original source from the maps alone, and no declaration maps (`.d.ts.map`) are emitted — meaning a shipped `src/` would not have powered "go to definition" from the type declarations either. The package's only public entry is the `.` export (there is no `./src` subpath in the `exports` map), so omitting the sources breaks **no** consumer import path; this is a packaging-only change with no API or behavioral impact. The `.npmignore` header and a new defensive `src/` entry were updated to document the new published set and keep the sources out even if the allowlist is ever broadened.
+
 ## [0.21.8] - 2026-06-30
 
 ### Packaging (2026-06-30)
