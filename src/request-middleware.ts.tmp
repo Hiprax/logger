@@ -431,16 +431,6 @@ const redactUrlQuery = (url: string, maskQueryKeys: ReadonlySet<string> | undefi
 
   // Split the pre-fragment part on the first `?`.
   const qIdx = beforeFragment.indexOf("?");
-  if (qIdx === -1) {
-    // The whole-URL `?` check above matched, but that `?` lives inside the
-    // fragment (e.g. "token=secret#?x") — the fragment-free prefix has no
-    // `?` of its own, so there is no real query component to redact. Without
-    // this guard, `slice(0, -1)`/`slice(0)` below would drop the prefix's
-    // last character and re-parse the whole prefix as a bogus query string.
-    // Returning verbatim keeps this in agreement with the documented "no
-    // query component" contract.
-    return url;
-  }
   const base = beforeFragment.slice(0, qIdx);
   const rawQuery = beforeFragment.slice(qIdx + 1);
 

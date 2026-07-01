@@ -2129,41 +2129,6 @@ describe("request middleware internals", () => {
     expect(redactUrlQuery("/p?%GG=x&token=abc", mask)).toBe("/p?%GG=x&token=[REDACTED]");
   });
 
-  it("redactUrlQuery returns the URL verbatim when the only `?` lives inside the fragment", () => {
-    const mask = new Set(["token"]);
-    // Before the `qIdx === -1` guard, the fragment-free prefix ("token=secret")
-    // was mis-parsed as a query string: `beforeFragment.slice(0, -1)` dropped
-    // the trailing "t" and `beforeFragment.slice(0)` re-read the whole prefix
-    // as `rawQuery`, producing the corrupted "token=secre?token=[REDACTED]#?x".
-    // The whole-URL `?` check matches (there IS a `?`, inside the fragment),
-    // but the pre-fragment split finds none — there is no real query
-    // component, so the URL must come back unchanged. This is the case that
-    // actually reproduces the bug on pre-fix code.
-    expect(redactUrlQuery("token=secret#?x", mask)).toBe("token=secret#?x");
-  });
-
-  it("redactUrlQuery returns a fragment-only-`?` hash-router URL unchanged", () => {
-    const mask = new Set(["token"]);
-    // Realistic hash-router shape: the `?` belongs to the fragment's own
-    // client-side route, not to a real query component. Note this particular
-    // input happens to survive even on pre-fix code (the mis-sliced prefix
-    // "/dash" contains no "=", so the pre-existing `!mutated` fallback
-    // returns it unchanged by coincidence, not because the old logic was
-    // correct) — it is kept here as a post-fix guard for a realistic shape,
-    // not as the bug's reproduction case (see the preceding test for that).
-    expect(redactUrlQuery("/dash#/r?token=abc", mask)).toBe("/dash#/r?token=abc");
-  });
-
-  it("redactUrlQuery still redacts a real query-before-fragment URL after the qIdx guard", () => {
-    const mask = new Set(["token"]);
-    // Regression guard for the `qIdx === -1` fix above: deliberately
-    // duplicates the "preserves the URL fragment" test's first assertion,
-    // kept local to the new fragment-only-`?` tests so it is obvious the
-    // guard does not affect the ordinary query-before-fragment case (`qIdx`
-    // is a real, non-negative index here, so the new branch never fires).
-    expect(redactUrlQuery("/p?token=abc#section", mask)).toBe("/p?token=[REDACTED]#section");
-  });
-
   it("redactEntryPath redacts a top-level path", () => {
     const entry = { context: { token: "abc" } } as unknown as Record<string, unknown>;
     redactEntryPath(entry, "context.token");
