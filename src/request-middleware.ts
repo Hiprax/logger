@@ -236,6 +236,7 @@ const serializeBody = (
   body: unknown,
   maskKeys?: string[] | ReadonlySet<string>,
   maxLength = DEFAULT_BODY_LIMIT,
+  bodyRedactPaths?: readonly string[],
 ) => {
   if (body === undefined || body === null) {
     return undefined;
@@ -252,7 +253,39 @@ const serializeBody = (
     ? new Set(maskKeys.map((key) => key.toLowerCase()))
     : ((maskKeys as Set<string> | undefined) ?? new Set<string>());
 
-  const masked = redactValue(body, maskSet, new WeakSet());
+  // `forceCopy: true` (only when `redactPaths` will actually be applied
+  // below) makes `redactValue` always return a FRESH copy of a data-bearing
+  // class instance / Error subclass, even when no `maskKeys` entry matched it
+  // — the case where it would otherwise return the original object BY
+  // IDENTITY (see `src/redact.ts`). Without this, the `redactEntryPath`
+  // mutation a few lines below could reach and mutate a class-instance
+  // request body the caller (e.g. `req.body`) still holds a live reference
+  // to. Plain-object bodies — the overwhelming majority of real HTTP JSON
+  // bodies — are unaffected: `redactValue` always rebuilds those fresh
+  // regardless of this flag.
+  let masked = redactValue(body, maskSet, new WeakSet(), (bodyRedactPaths?.length ?? 0) > 0);
+
+  // Apply body-scoped `redactPaths` to the (keyword-masked, mutation-safe)
+  // object graph BEFORE the truncation decision below. Without this, a
+  // secret targeted only by `redactPaths` (no matching `maskBodyKeys` entry)
+  // would survive untouched inside the `_preview` string of the truncation
+  // envelope: the post-assembly `redactPaths` pass in `finalize()` runs
+  // AFTER this function returns, by which point an over-limit body has
+  // already collapsed into `{ _truncated, _originalLength, _preview }` — a
+  // shape that no longer has the nested key the path was targeting, so the
+  // redaction silently no-ops. Reuses `redactEntryPath` via a throw-away
+  // `{ requestBody: masked }` wrapper so the `body.` → `requestBody.` alias
+  // and prototype-pollution guards stay centralized in one implementation.
+  // Non-body-scoped paths (`context.*`, header paths) no-op against this
+  // wrapper — they are still applied by the post-assembly loop in
+  // `finalize()`.
+  if (bodyRedactPaths && bodyRedactPaths.length > 0 && masked && typeof masked === "object") {
+    const wrapper: Record<string, unknown> = { requestBody: masked };
+    for (const path of bodyRedactPaths) {
+      redactEntryPath(wrapper, path);
+    }
+    masked = wrapper.requestBody;
+  }
 
   if (typeof masked === "string") {
     return truncateString(masked, maxLength);
@@ -782,7 +815,15 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
           // `bodySnapshot` above for why we do not deep-clone by default.
           // Pass the pre-resolved Set (built once at construction time) instead
           // of the raw array so this hot path allocates no new Set per request.
-          entry.requestBody = serializeBody(bodySnapshot, bodyMaskSet, maxBodyLength);
+          // Also pass `resolvedRedactPaths` so body-scoped paths are applied to
+          // the object graph BEFORE any over-limit truncation collapses it into
+          // the `_preview` envelope (see the comment inside `serializeBody`).
+          entry.requestBody = serializeBody(
+            bodySnapshot,
+            bodyMaskSet,
+            maxBodyLength,
+            resolvedRedactPaths,
+          );
         }
 
         entry.requestHeaders = normalizeHeaders(
@@ -802,9 +843,15 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
           entry.context = enrich(req, res, durationMs) ?? undefined;
         }
 
-        // Surgical path-based redaction — runs LAST so it can override anything
-        // that survived the keyword-based body/header masks. Missing intermediate
-        // segments are a graceful no-op.
+        // Surgical path-based redaction. Body-scoped paths (`body.*` /
+        // `requestBody.*`) were ALREADY applied inside `serializeBody` above,
+        // before any over-limit truncation could collapse the body into the
+        // `{ _truncated, _originalLength, _preview }` envelope — re-applying
+        // them here is a harmless idempotent no-op. This pass remains the ONLY
+        // place `context.*` / `requestHeaders.*` / `responseHeaders.*` paths
+        // are redacted, and it still runs LAST so it can override anything
+        // that survived the keyword-based body/header masks. Missing
+        // intermediate segments are a graceful no-op.
         if (resolvedRedactPaths.length > 0) {
           resolvedRedactPaths.forEach((path) =>
             redactEntryPath(entry as unknown as Record<string, unknown>, path),

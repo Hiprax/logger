@@ -879,6 +879,85 @@ describe("createRequestLogger", () => {
     expect(payload.http.requestBody).toEqual({ token: "[REDACTED]" });
   });
 
+  it("applies redactPaths to a nested body field BEFORE truncation so the secret cannot survive inside _preview", () => {
+    // Regression for the redactPaths truncation-leak: previously `redactPaths`
+    // only ran on `entry.requestBody` AFTER an over-limit body had already
+    // collapsed into the `{ _truncated, _originalLength, _preview }` envelope,
+    // so a secret targeted ONLY by `redactPaths` (no matching `maskBodyKeys`)
+    // leaked verbatim inside `_preview`.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      redactPaths: ["body.password"],
+    });
+
+    const body = { password: "SECRET", filler: "x".repeat(4000) };
+    const { res } = runMiddleware(middleware, { body });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    const requestBody = payload.http.requestBody as {
+      _truncated: boolean;
+      _originalLength: number;
+      _preview: string;
+    };
+    expect(requestBody._truncated).toBe(true);
+    expect(requestBody._preview).not.toContain("SECRET");
+    expect(requestBody._preview).toContain("[REDACTED]");
+  });
+
+  it("still redacts a body field via redactPaths when the body is small enough to skip truncation (regression)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      redactPaths: ["body.password"],
+    });
+
+    const body = { password: "SECRET", filler: "small" };
+    const { res } = runMiddleware(middleware, { body });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toEqual({ password: "[REDACTED]", filler: "small" });
+    expect((payload.http.requestBody as { _truncated?: boolean })._truncated).toBeUndefined();
+  });
+
+  it("does not mutate the caller's original class-instance request body when redactPaths targets a field with no matching maskBodyKeys", () => {
+    // Guards against a mutation hazard found during review: `redactValue`
+    // returns a data-bearing class instance BY IDENTITY when no
+    // `maskBodyKeys` entry matches it (see `src/redact.ts`). Applying
+    // `redactPaths` to that identity-shared value without `serializeBody`'s
+    // `forceCopy` guard would mutate the caller's own live object in place.
+    class LoginDto {
+      constructor(
+        public readonly username: string,
+        public readonly password: string,
+      ) {}
+    }
+    const originalBody = new LoginDto("alice", "REALSECRET");
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      redactPaths: ["body.password"],
+    });
+
+    const { res } = runMiddleware(middleware, { body: originalBody });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toEqual({ username: "alice", password: "[REDACTED]" });
+    // The caller's ORIGINAL instance must be untouched.
+    expect(originalBody.password).toBe("REALSECRET");
+    expect(originalBody.username).toBe("alice");
+  });
+
   // ---------------------------------------------------------------------------
   // Task #12 — Truncation type stability
   // ---------------------------------------------------------------------------
@@ -1637,6 +1716,53 @@ describe("request middleware internals", () => {
     const result = serializeBody(body, ["secret"]) as Record<string, unknown>;
     expect(result.x).toBe("keep");
     expect(result.secret).toBe("[REDACTED]");
+  });
+
+  it("serializeBody applies the 4th bodyRedactPaths arg to an over-limit body so the secret cannot survive inside _preview", () => {
+    const body = { password: "SECRET", filler: "x".repeat(4000) };
+    const result = serializeBody(body, undefined, 3000, ["body.password"]) as {
+      _truncated: boolean;
+      _originalLength: number;
+      _preview: string;
+    };
+    expect(result._truncated).toBe(true);
+    expect(result._preview).not.toContain("SECRET");
+    expect(result._preview).toContain("[REDACTED]");
+  });
+
+  it("serializeBody's bodyRedactPaths param is opt-in — omitting it leaves the pre-existing truncation behavior unchanged (backward compat)", () => {
+    // Identical over-limit body and target field as the test above, but the
+    // 4th argument is never passed — exactly what every pre-existing call
+    // site does. `serializeBody` has no other way to learn about
+    // `redactPaths`, so the secret is (as before this parameter existed)
+    // still present in `_preview`. Pins that the new parameter only changes
+    // behavior when a caller explicitly opts in.
+    const body = { password: "SECRET", filler: "x".repeat(4000) };
+    const result = serializeBody(body, undefined, 3000) as {
+      _truncated: boolean;
+      _preview: string;
+    };
+    expect(result._truncated).toBe(true);
+    expect(result._preview).toContain("SECRET");
+  });
+
+  it("serializeBody does not mutate a caller-owned class-instance body when applying bodyRedactPaths to an unmasked field", () => {
+    class LoginDto {
+      constructor(
+        public readonly username: string,
+        public readonly password: string,
+      ) {}
+    }
+    const originalBody = new LoginDto("alice", "REALSECRET");
+
+    const result = serializeBody(originalBody, undefined, 3000, ["body.password"]) as Record<
+      string,
+      unknown
+    >;
+
+    expect(result).toEqual({ username: "alice", password: "[REDACTED]" });
+    expect(originalBody.password).toBe("REALSECRET");
+    expect(originalBody.username).toBe("alice");
   });
 
   it("truncates fallback strings when JSON serialization fails", () => {
@@ -2485,6 +2611,31 @@ describe("request middleware internals", () => {
       // Nothing changed → original returned by identity
       expect(out).toBe(input);
       expect((out as Payload).data).toBe("hello");
+    });
+
+    it("forceCopy=true (4th arg) always returns a fresh copy of a data-bearing instance, even when nothing changed", () => {
+      // Contrasts with the identity-passthrough test above: same inputs, but
+      // with forceCopy requested — used by `serializeBody` to guarantee its
+      // subsequent in-place `redactPaths` mutation never lands on a
+      // caller-owned object (see the comment on the `forceCopy` parameter in
+      // `src/redact.ts`).
+      class Payload {
+        constructor(public readonly data: string) {}
+      }
+      const input = new Payload("hello");
+      const mask = new Set(["password", "token"]); // non-empty but no match
+      const out = redactValue(input, mask, new WeakSet(), true);
+      expect(out).not.toBe(input);
+      expect(out).toEqual({ data: "hello" });
+    });
+
+    it("forceCopy defaults to false when the 4th arg is omitted, preserving identity-passthrough (backward compat)", () => {
+      class Payload {
+        constructor(public readonly data: string) {}
+      }
+      const input = new Payload("hello");
+      const out = redactValue(input, new Set<string>(), new WeakSet());
+      expect(out).toBe(input);
     });
 
     it("passes through a class instance that defines toJSON even when a key matches (documented limitation)", () => {

@@ -35,7 +35,16 @@
  *     nothing changed (no key matched and every recursed child is `===` its
  *     original). Returns a fresh **plain** object only when a redaction
  *     actually occurred; downstream is always JSON serialization, so a plain
- *     rebuild is output-equivalent.
+ *     rebuild is output-equivalent. The optional 4th parameter `forceCopy`
+ *     (default `false`) overrides this identity-preserving return for this
+ *     branch only: when `true`, a data-bearing instance is always rebuilt
+ *     into a fresh plain object, even when nothing on it changed. Threaded
+ *     through every recursive call so nested class instances at any depth are
+ *     covered too; plain objects and arrays are unaffected since they already
+ *     always rebuild. Intended for callers that will mutate the returned
+ *     value in place afterward (`request-middleware.ts`'s `serializeBody`
+ *     applies `redactPaths` this way) and must not risk that mutation landing
+ *     on a caller-owned object that `maskKeys` alone left untouched.
  * - **Cycle detection is active-path tracking, not all-visited tracking.**
  *   The per-call `WeakSet` (`seen`) records only the objects on the CURRENT
  *   recursion path: the array, plain-object, and data-bearing-instance
@@ -88,6 +97,7 @@ export const redactValue = (
   value: unknown,
   maskKeys: Set<string>,
   seen: WeakSet<object>,
+  forceCopy = false,
 ): unknown => {
   if (!value || typeof value !== "object") {
     return value;
@@ -96,7 +106,7 @@ export const redactValue = (
   if (Array.isArray(value)) {
     if (seen.has(value as object)) return "[Circular]";
     seen.add(value as object);
-    const mapped = value.map((item) => redactValue(item, maskKeys, seen));
+    const mapped = value.map((item) => redactValue(item, maskKeys, seen, forceCopy));
     seen.delete(value as object);
     return mapped;
   }
@@ -110,6 +120,9 @@ export const redactValue = (
     // Pass built-ins through by identity WITHOUT adding to `seen`. This fixes
     // a latent bug where the same Date/URL/etc. referenced by two keys in an
     // outer plain object would yield "[Circular]" on the second reference.
+    // `forceCopy` does NOT apply here: these values own no key `redactEntryPath`
+    // could ever redact (no enumerable own keys, or a `toJSON` bypass), so
+    // identity-sharing them back to the caller is always safe.
     const hasToJSON = typeof (value as Record<string, unknown>).toJSON === "function";
     if (hasToJSON || ArrayBuffer.isView(value) || Object.keys(value as object).length === 0) {
       return value;
@@ -118,7 +131,13 @@ export const redactValue = (
     // Data-bearing instance (class DTO, Error subclass with enumerable props).
     // Walk own enumerable string keys, redact matched ones, recurse into the
     // rest. Return the original by identity when nothing changed so the
-    // documented pass-through for instances holding no masked key is preserved.
+    // documented pass-through for instances holding no masked key is
+    // preserved — UNLESS `forceCopy` is set, in which case a fresh plain
+    // object is always returned even when nothing changed. `forceCopy` exists
+    // for callers (see `serializeBody` in `request-middleware.ts`) that will
+    // mutate the returned value in place afterward (e.g. to apply
+    // `redactPaths`) and must not risk touching a caller-owned object that
+    // `maskKeys` alone left untouched.
     if (seen.has(value as object)) return "[Circular]";
     seen.add(value as object);
 
@@ -135,14 +154,14 @@ export const redactValue = (
         result[key] = REDACTED;
         changed = true;
       } else {
-        const recursed = redactValue(original, maskKeys, seen);
+        const recursed = redactValue(original, maskKeys, seen, forceCopy);
         result[key] = recursed;
         if (recursed !== original) changed = true;
       }
     }
 
     seen.delete(value as object);
-    return changed ? result : value;
+    return changed || forceCopy ? result : value;
   }
 
   // Plain object branch — always rebuilds a fresh plain object so callers that
@@ -156,7 +175,9 @@ export const redactValue = (
       if (FORBIDDEN_KEYS.has(key)) {
         return acc;
       }
-      acc[key] = maskKeys.has(key.toLowerCase()) ? REDACTED : redactValue(val, maskKeys, seen);
+      acc[key] = maskKeys.has(key.toLowerCase())
+        ? REDACTED
+        : redactValue(val, maskKeys, seen, forceCopy);
       return acc;
     },
     {},
