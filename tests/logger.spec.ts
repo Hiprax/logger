@@ -2433,6 +2433,47 @@ describe("createLogger", () => {
       expect(parsed.password).toBe("[REDACTED]");
       expect(parsed.email).toBe("alice@example.com");
     });
+
+    // -----------------------------------------------------------------------
+    // Phase 1 (redact.ts DAG/diamond fix) — pretty-mode end-to-end
+    // -----------------------------------------------------------------------
+
+    it("pretty mode: renders both occurrences of a shared metadata object instead of collapsing the second into [Circular] (diamond fix)", () => {
+      // `shared` is referenced by TWO metadata keys (`a`, `b`) passed in the
+      // SAME call. Before the active-path fix, `formatMessage`'s single
+      // `new WeakSet()` covering the whole metadata object never released a
+      // visited value, so the second occurrence of `shared` rendered as the
+      // literal string "[Circular]" instead of being walked and redacted.
+      const shared = { password: "topsecret", keep: "visible" };
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-diamond-pretty",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      logger.info("Login", { a: shared, b: shared });
+      teardownLogger(logger);
+      const rendered = chunks.join("");
+
+      expect(rendered).not.toContain("[Circular]");
+      expect(rendered).not.toContain("topsecret");
+
+      // The metadata block is the trailing JSON.stringify(..., 2) segment of
+      // the rendered line — extract and parse it to assert BOTH keys render
+      // fully (not just that "[REDACTED]" appears somewhere).
+      const metaJson = rendered.slice(rendered.indexOf("{")).trim();
+      const parsedMeta = JSON.parse(metaJson) as {
+        a: { password: string; keep: string };
+        b: { password: string; keep: string };
+      };
+      expect(parsedMeta.a).toEqual({ password: "[REDACTED]", keep: "visible" });
+      expect(parsedMeta.b).toEqual({ password: "[REDACTED]", keep: "visible" });
+    });
   });
 
   describe("escapeMessageNewlines", () => {
@@ -3426,6 +3467,41 @@ describe("createLogger", () => {
       expect(line).toContain('"[Circular]"');
       expect(parsed.keep).toBe(1);
       expect(parsed.self).toEqual({ keep: 1, self: "[Circular]" });
+    });
+
+    // -------------------------------------------------------------------------
+    // Phase 1 (redact.ts DAG/diamond fix) — json-mode, cross-top-level-key
+    // -------------------------------------------------------------------------
+
+    it("json mode WITH maskMetaKeys renders both occurrences of a shared metadata object across two top-level keys (DAG/diamond fix)", () => {
+      // `shared` is referenced by TWO separate top-level metadata keys (`a`,
+      // `b`), both merged directly onto `info` by winston. `buildMetaRedactor`
+      // creates ONE `seen` WeakSet for the whole format call and reuses it
+      // across its loop over `Object.keys(info)`, so this specifically
+      // exercises whether the SECOND top-level `redactValue` call still sees
+      // `shared` as available (active-path fix) instead of falsely flagging
+      // it as a cycle just because the FIRST top-level call already visited
+      // — and fully unwound from — the same reference.
+      const shared = { password: "topsecret", keep: "visible" };
+
+      const output = renderJsonLine(
+        "json-diamond-cross-key",
+        (logger) => {
+          logger.info("Login", { a: shared, b: shared });
+        },
+        { maskMetaKeys: ["password"] },
+      );
+
+      const line = output.trim();
+      expect(line).not.toContain('"[Circular]"');
+      expect(line).not.toContain("topsecret");
+
+      const parsed = JSON.parse(line) as {
+        a: { password: string; keep: string };
+        b: { password: string; keep: string };
+      };
+      expect(parsed.a).toEqual({ password: "[REDACTED]", keep: "visible" });
+      expect(parsed.b).toEqual({ password: "[REDACTED]", keep: "visible" });
     });
   });
 

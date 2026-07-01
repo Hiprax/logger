@@ -25,9 +25,9 @@
  *     own keys.
  *     - The value has zero enumerable own string keys (`Map`, `Set`, `RegExp`,
  *       `Promise`, a vanilla `Error` with no extra props) — no key can match.
- *     Not adding these to `seen` fixes a latent bug where the same built-in
- *     referenced by two keys (e.g. `{ a: date, b: date }`) would yield
- *     `"[Circular]"` on the second occurrence.
+ *     Not adding these to `seen` means built-ins are never subject to cycle
+ *     tracking at all — the same built-in referenced by two keys (e.g.
+ *     `{ a: date, b: date }`) has always rendered both occurrences fully.
  *   - **Data-bearing instances** (class DTOs, `Error` subclasses with
  *     enumerable props) — walked via their own enumerable string keys. Keys
  *     whose lowercased form is in `maskKeys` are replaced with `"[REDACTED]"`;
@@ -36,9 +36,23 @@
  *     original). Returns a fresh **plain** object only when a redaction
  *     actually occurred; downstream is always JSON serialization, so a plain
  *     rebuild is output-equivalent.
- * - Detects circular references via a per-call `WeakSet` and writes the
- *   literal string `"[Circular]"` in their place — the function never throws
- *   on a self-referencing object.
+ * - **Cycle detection is active-path tracking, not all-visited tracking.**
+ *   The per-call `WeakSet` (`seen`) records only the objects on the CURRENT
+ *   recursion path: the array, plain-object, and data-bearing-instance
+ *   branches each add their `value` to `seen` on entry and remove it again
+ *   immediately before returning, once that value's own subtree has finished
+ *   processing. Consequences:
+ *   - A value that is its own ancestor on the active path — a true
+ *     self-cycle (`obj.self = obj`) or an indirect/mutual cycle
+ *     (`a.b = b; b.a = a`) — still renders as the literal string
+ *     `"[Circular]"`, and the function never throws on a self-referencing
+ *     object.
+ *   - A shared (non-circular) value reached via two independent paths — the
+ *     same object under two sibling keys, repeated in an array, nested at
+ *     different depths, or assigned to two different top-level metadata keys
+ *     that share one `seen` instance (as `buildMetaRedactor` in `logger.ts`
+ *     does across a single log call) — is fully walked and redacted on EVERY
+ *     occurrence instead of collapsing to `"[Circular]"` after the first.
  * - **Prototype-pollution hardened.** Own keys named `__proto__`, `constructor`,
  *   or `prototype` are skipped during the rebuild. Direct assignment via
  *   `acc[key] = …` would otherwise invoke the `__proto__` setter (mutating
@@ -82,7 +96,9 @@ export const redactValue = (
   if (Array.isArray(value)) {
     if (seen.has(value as object)) return "[Circular]";
     seen.add(value as object);
-    return value.map((item) => redactValue(item, maskKeys, seen));
+    const mapped = value.map((item) => redactValue(item, maskKeys, seen));
+    seen.delete(value as object);
+    return mapped;
   }
 
   const proto = Object.getPrototypeOf(value);
@@ -125,6 +141,7 @@ export const redactValue = (
       }
     }
 
+    seen.delete(value as object);
     return changed ? result : value;
   }
 
@@ -133,7 +150,7 @@ export const redactValue = (
   if (seen.has(value as object)) return "[Circular]";
   seen.add(value as object);
 
-  return Object.entries(value as Record<string, unknown>).reduce<Record<string, unknown>>(
+  const rebuilt = Object.entries(value as Record<string, unknown>).reduce<Record<string, unknown>>(
     (acc, [key, val]) => {
       // Skip prototype-pollution vectors. See FORBIDDEN_KEYS docstring.
       if (FORBIDDEN_KEYS.has(key)) {
@@ -144,4 +161,6 @@ export const redactValue = (
     },
     {},
   );
+  seen.delete(value as object);
+  return rebuilt;
 };

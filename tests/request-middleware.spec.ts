@@ -224,6 +224,39 @@ describe("createRequestLogger", () => {
     expect(payload.http.requestBody).toEqual({ self: "[Circular]" });
   });
 
+  it("renders both occurrences of a shared (non-circular) request-body object instead of collapsing the second into [Circular] (DAG/diamond fix)", () => {
+    // `u` is referenced by TWO sibling keys (`owner`, `editor`) on the same
+    // body object — a diamond, not a cycle. Before the active-path fix, the
+    // `seen` WeakSet inside `redactValue` (threaded through `serializeBody`)
+    // never removed a value once visited, so the second occurrence of `u`
+    // was misclassified as circular and rendered as the literal string
+    // "[Circular]" instead of being redacted — silently dropping real data.
+    const { logger, log } = createMockLogger();
+    const u = { name: "Alice", password: "topsecret" };
+    const body = { owner: u, editor: u };
+
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      maskBodyKeys: ["password"],
+    });
+
+    const { res } = runMiddleware(middleware, { body });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toEqual({
+      owner: { name: "Alice", password: "[REDACTED]" },
+      editor: { name: "Alice", password: "[REDACTED]" },
+    });
+    // Neither occurrence is the literal "[Circular]" string, and the raw
+    // secret must not survive anywhere in the logged payload.
+    expect(payload.http.requestBody.owner).not.toBe("[Circular]");
+    expect(payload.http.requestBody.editor).not.toBe("[Circular]");
+    expect(JSON.stringify(payload.http.requestBody)).not.toContain("topsecret");
+  });
+
   it("falls back to string serialization when JSON conversion fails", () => {
     const { logger, log } = createMockLogger();
 
@@ -2561,6 +2594,112 @@ describe("request middleware internals", () => {
 
       // The nested self-reference is replaced with "[Circular]".
       expect(out[0]).toBe("[Circular]");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 1 (redact.ts DAG/diamond fix) — active-path cycle detection
+  //
+  // Before this fix, the `seen` WeakSet tracked "every object visited
+  // anywhere in the traversal" rather than "objects on the current active DFS
+  // path", so a shared (non-circular) reference reached via two independent
+  // paths was misclassified as a cycle and rendered as the literal string
+  // "[Circular]" on its second occurrence, silently dropping real
+  // (already-redacted) data. These tests pin the corrected active-path
+  // (add-on-entry, delete-on-unwind) behavior: shared/DAG references render
+  // FULLY on every occurrence, and ONLY a genuine cycle (an object that is
+  // its own ancestor on the active path) still yields "[Circular]".
+  // ---------------------------------------------------------------------------
+  describe("redactValue active-path cycle detection (DAG/diamond fix)", () => {
+    const { redactValue } = __requestInternals;
+
+    it("renders a plain-object diamond referenced by two sibling keys in full (no mask)", () => {
+      const shared = { value: "x" };
+      const body = { a: shared, b: shared };
+      const mask = new Set<string>();
+      const out = redactValue(body, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out.a).toEqual({ value: "x" });
+      expect(out.b).toEqual({ value: "x" });
+      expect(out.a).not.toBe("[Circular]");
+      expect(out.b).not.toBe("[Circular]");
+    });
+
+    it("redacts a plain-object diamond referenced by two sibling keys under a mask", () => {
+      const shared = { password: "topsecret", keep: "visible" };
+      const body = { a: shared, b: shared };
+      const mask = new Set(["password"]);
+      const out = redactValue(body, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out.a).toEqual({ password: "[REDACTED]", keep: "visible" });
+      expect(out.b).toEqual({ password: "[REDACTED]", keep: "visible" });
+    });
+
+    it("renders both occurrences of a shared object inside an array ([shared, shared])", () => {
+      const shared = { password: "topsecret", keep: "visible" };
+      const mask = new Set(["password"]);
+      const out = redactValue([shared, shared], mask, new WeakSet()) as unknown[];
+
+      expect(out[0]).toEqual({ password: "[REDACTED]", keep: "visible" });
+      expect(out[1]).toEqual({ password: "[REDACTED]", keep: "visible" });
+    });
+
+    it("renders a deep diamond where a nested leaf is shared two levels down", () => {
+      const leaf = { secret: "s3cr3t", keep: "ok" };
+      const body = { x: { l: leaf }, y: { l: leaf } };
+      const mask = new Set(["secret"]);
+      const out = redactValue(body, mask, new WeakSet()) as {
+        x: { l: Record<string, unknown> };
+        y: { l: Record<string, unknown> };
+      };
+
+      expect(out.x.l).toEqual({ secret: "[REDACTED]", keep: "ok" });
+      expect(out.y.l).toEqual({ secret: "[REDACTED]", keep: "ok" });
+    });
+
+    it("redacts both occurrences of a shared class-DTO instance referenced by two sibling keys", () => {
+      class Credentials {
+        constructor(
+          public readonly username: string,
+          public readonly password: string,
+        ) {}
+      }
+      const dto = new Credentials("alice", "s3cr3t");
+      const body = { u: dto, v: dto };
+      const mask = new Set(["password"]);
+      const out = redactValue(body, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out.u).toEqual({ username: "alice", password: "[REDACTED]" });
+      expect(out.v).toEqual({ username: "alice", password: "[REDACTED]" });
+      expect(out.u).not.toBe("[Circular]");
+      expect(out.v).not.toBe("[Circular]");
+    });
+
+    it("a true self-referencing plain object still resolves to [Circular] after the active-path fix", () => {
+      const obj: Record<string, unknown> = { label: "root" };
+      obj.self = obj;
+      const mask = new Set<string>();
+      const out = redactValue(obj, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out.label).toBe("root");
+      expect(out.self).toBe("[Circular]");
+    });
+
+    it("a mutual cycle between two plain objects still resolves to [Circular] after the active-path fix", () => {
+      const a: Record<string, unknown> = { name: "a" };
+      const b: Record<string, unknown> = { name: "b" };
+      a.peer = b;
+      b.peer = a;
+      const mask = new Set<string>();
+      const out = redactValue(a, mask, new WeakSet()) as Record<string, unknown>;
+      const peer = out.peer as Record<string, unknown>;
+
+      expect(out.name).toBe("a");
+      expect(peer.name).toBe("b");
+      // The edge that closes the cycle (b.peer -> a) resolves to "[Circular]";
+      // the forward edge (a.peer -> b) is not itself circular and renders as
+      // a proper nested object.
+      expect(peer.peer).toBe("[Circular]");
     });
   });
 });
