@@ -25,9 +25,9 @@
  *     own keys.
  *     - The value has zero enumerable own string keys (`Map`, `Set`, `RegExp`,
  *       `Promise`, a vanilla `Error` with no extra props) — no key can match.
- *     Not adding these to `seen` fixes a latent bug where the same built-in
- *     referenced by two keys (e.g. `{ a: date, b: date }`) would yield
- *     `"[Circular]"` on the second occurrence.
+ *     Not adding these to `seen` means built-ins are never subject to cycle
+ *     tracking at all — the same built-in referenced by two keys (e.g.
+ *     `{ a: date, b: date }`) has always rendered both occurrences fully.
  *   - **Data-bearing instances** (class DTOs, `Error` subclasses with
  *     enumerable props) — walked via their own enumerable string keys. Keys
  *     whose lowercased form is in `maskKeys` are replaced with `"[REDACTED]"`;
@@ -35,10 +35,36 @@
  *     nothing changed (no key matched and every recursed child is `===` its
  *     original). Returns a fresh **plain** object only when a redaction
  *     actually occurred; downstream is always JSON serialization, so a plain
- *     rebuild is output-equivalent.
- * - Detects circular references via a per-call `WeakSet` and writes the
- *   literal string `"[Circular]"` in their place — the function never throws
- *   on a self-referencing object.
+ *     rebuild is output-equivalent. The optional 4th parameter `forceCopy`
+ *     (default `false`) overrides this identity-preserving return for this
+ *     branch only: when `true`, a data-bearing instance is always rebuilt
+ *     into a fresh plain object, even when nothing on it changed. Threaded
+ *     through every recursive call so nested class instances at any depth are
+ *     covered too; plain objects and arrays are unaffected since they already
+ *     always rebuild. It is a general-purpose deep-copy option for callers
+ *     that will mutate the returned value in place afterward and must not risk
+ *     that mutation landing on a caller-owned object that `maskKeys` alone
+ *     left untouched. (Note: `request-middleware.ts`'s `serializeBody` does
+ *     NOT rely on this for `redactPaths`; it applies paths on a
+ *     `toJSON`-resolved `JSON.parse(JSON.stringify(...))` copy instead, which
+ *     is both mutation-safe and renders built-ins via their `toJSON()`.)
+ * - **Cycle detection is active-path tracking, not all-visited tracking.**
+ *   The per-call `WeakSet` (`seen`) records only the objects on the CURRENT
+ *   recursion path: the array, plain-object, and data-bearing-instance
+ *   branches each add their `value` to `seen` on entry and remove it again
+ *   immediately before returning, once that value's own subtree has finished
+ *   processing. Consequences:
+ *   - A value that is its own ancestor on the active path — a true
+ *     self-cycle (`obj.self = obj`) or an indirect/mutual cycle
+ *     (`a.b = b; b.a = a`) — still renders as the literal string
+ *     `"[Circular]"`, and the function never throws on a self-referencing
+ *     object.
+ *   - A shared (non-circular) value reached via two independent paths — the
+ *     same object under two sibling keys, repeated in an array, nested at
+ *     different depths, or assigned to two different top-level metadata keys
+ *     that share one `seen` instance (as `buildMetaRedactor` in `logger.ts`
+ *     does across a single log call) — is fully walked and redacted on EVERY
+ *     occurrence instead of collapsing to `"[Circular]"` after the first.
  * - **Prototype-pollution hardened.** Own keys named `__proto__`, `constructor`,
  *   or `prototype` are skipped during the rebuild. Direct assignment via
  *   `acc[key] = …` would otherwise invoke the `__proto__` setter (mutating
@@ -74,6 +100,7 @@ export const redactValue = (
   value: unknown,
   maskKeys: Set<string>,
   seen: WeakSet<object>,
+  forceCopy = false,
 ): unknown => {
   if (!value || typeof value !== "object") {
     return value;
@@ -82,7 +109,9 @@ export const redactValue = (
   if (Array.isArray(value)) {
     if (seen.has(value as object)) return "[Circular]";
     seen.add(value as object);
-    return value.map((item) => redactValue(item, maskKeys, seen));
+    const mapped = value.map((item) => redactValue(item, maskKeys, seen, forceCopy));
+    seen.delete(value as object);
+    return mapped;
   }
 
   const proto = Object.getPrototypeOf(value);
@@ -94,6 +123,9 @@ export const redactValue = (
     // Pass built-ins through by identity WITHOUT adding to `seen`. This fixes
     // a latent bug where the same Date/URL/etc. referenced by two keys in an
     // outer plain object would yield "[Circular]" on the second reference.
+    // `forceCopy` does NOT apply here: these values own no key `redactEntryPath`
+    // could ever redact (no enumerable own keys, or a `toJSON` bypass), so
+    // identity-sharing them back to the caller is always safe.
     const hasToJSON = typeof (value as Record<string, unknown>).toJSON === "function";
     if (hasToJSON || ArrayBuffer.isView(value) || Object.keys(value as object).length === 0) {
       return value;
@@ -102,7 +134,13 @@ export const redactValue = (
     // Data-bearing instance (class DTO, Error subclass with enumerable props).
     // Walk own enumerable string keys, redact matched ones, recurse into the
     // rest. Return the original by identity when nothing changed so the
-    // documented pass-through for instances holding no masked key is preserved.
+    // documented pass-through for instances holding no masked key is
+    // preserved — UNLESS `forceCopy` is set, in which case a fresh plain
+    // object is always returned even when nothing changed. `forceCopy` exists
+    // for callers (see `serializeBody` in `request-middleware.ts`) that will
+    // mutate the returned value in place afterward (e.g. to apply
+    // `redactPaths`) and must not risk touching a caller-owned object that
+    // `maskKeys` alone left untouched.
     if (seen.has(value as object)) return "[Circular]";
     seen.add(value as object);
 
@@ -119,13 +157,14 @@ export const redactValue = (
         result[key] = REDACTED;
         changed = true;
       } else {
-        const recursed = redactValue(original, maskKeys, seen);
+        const recursed = redactValue(original, maskKeys, seen, forceCopy);
         result[key] = recursed;
         if (recursed !== original) changed = true;
       }
     }
 
-    return changed ? result : value;
+    seen.delete(value as object);
+    return changed || forceCopy ? result : value;
   }
 
   // Plain object branch — always rebuilds a fresh plain object so callers that
@@ -133,15 +172,19 @@ export const redactValue = (
   if (seen.has(value as object)) return "[Circular]";
   seen.add(value as object);
 
-  return Object.entries(value as Record<string, unknown>).reduce<Record<string, unknown>>(
+  const rebuilt = Object.entries(value as Record<string, unknown>).reduce<Record<string, unknown>>(
     (acc, [key, val]) => {
       // Skip prototype-pollution vectors. See FORBIDDEN_KEYS docstring.
       if (FORBIDDEN_KEYS.has(key)) {
         return acc;
       }
-      acc[key] = maskKeys.has(key.toLowerCase()) ? REDACTED : redactValue(val, maskKeys, seen);
+      acc[key] = maskKeys.has(key.toLowerCase())
+        ? REDACTED
+        : redactValue(val, maskKeys, seen, forceCopy);
       return acc;
     },
     {},
   );
+  seen.delete(value as object);
+  return rebuilt;
 };

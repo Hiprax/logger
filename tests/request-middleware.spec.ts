@@ -224,6 +224,39 @@ describe("createRequestLogger", () => {
     expect(payload.http.requestBody).toEqual({ self: "[Circular]" });
   });
 
+  it("renders both occurrences of a shared (non-circular) request-body object instead of collapsing the second into [Circular] (DAG/diamond fix)", () => {
+    // `u` is referenced by TWO sibling keys (`owner`, `editor`) on the same
+    // body object — a diamond, not a cycle. Before the active-path fix, the
+    // `seen` WeakSet inside `redactValue` (threaded through `serializeBody`)
+    // never removed a value once visited, so the second occurrence of `u`
+    // was misclassified as circular and rendered as the literal string
+    // "[Circular]" instead of being redacted — silently dropping real data.
+    const { logger, log } = createMockLogger();
+    const u = { name: "Alice", password: "topsecret" };
+    const body = { owner: u, editor: u };
+
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      maskBodyKeys: ["password"],
+    });
+
+    const { res } = runMiddleware(middleware, { body });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toEqual({
+      owner: { name: "Alice", password: "[REDACTED]" },
+      editor: { name: "Alice", password: "[REDACTED]" },
+    });
+    // Neither occurrence is the literal "[Circular]" string, and the raw
+    // secret must not survive anywhere in the logged payload.
+    expect(payload.http.requestBody.owner).not.toBe("[Circular]");
+    expect(payload.http.requestBody.editor).not.toBe("[Circular]");
+    expect(JSON.stringify(payload.http.requestBody)).not.toContain("topsecret");
+  });
+
   it("falls back to string serialization when JSON conversion fails", () => {
     const { logger, log } = createMockLogger();
 
@@ -844,6 +877,119 @@ describe("createRequestLogger", () => {
 
     const payload = log.mock.calls[0][0];
     expect(payload.http.requestBody).toEqual({ token: "[REDACTED]" });
+  });
+
+  it("applies redactPaths to a nested body field BEFORE truncation so the secret cannot survive inside _preview", () => {
+    // Regression for the redactPaths truncation-leak: previously `redactPaths`
+    // only ran on `entry.requestBody` AFTER an over-limit body had already
+    // collapsed into the `{ _truncated, _originalLength, _preview }` envelope,
+    // so a secret targeted ONLY by `redactPaths` (no matching `maskBodyKeys`)
+    // leaked verbatim inside `_preview`.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      redactPaths: ["body.password"],
+    });
+
+    const body = { password: "SECRET", filler: "x".repeat(4000) };
+    const { res } = runMiddleware(middleware, { body });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    const requestBody = payload.http.requestBody as {
+      _truncated: boolean;
+      _originalLength: number;
+      _preview: string;
+    };
+    expect(requestBody._truncated).toBe(true);
+    expect(requestBody._preview).not.toContain("SECRET");
+    expect(requestBody._preview).toContain("[REDACTED]");
+  });
+
+  it("still redacts a body field via redactPaths when the body is small enough to skip truncation (regression)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      redactPaths: ["body.password"],
+    });
+
+    const body = { password: "SECRET", filler: "small" };
+    const { res } = runMiddleware(middleware, { body });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toEqual({ password: "[REDACTED]", filler: "small" });
+    expect((payload.http.requestBody as { _truncated?: boolean })._truncated).toBeUndefined();
+  });
+
+  it("does not mutate the caller's original class-instance request body when redactPaths targets a field with no matching maskBodyKeys", () => {
+    // Guards against a mutation hazard found during review: `redactValue`
+    // returns a data-bearing class instance BY IDENTITY when no
+    // `maskBodyKeys` entry matches it (see `src/redact.ts`). Applying
+    // `redactPaths` to that identity-shared value without `serializeBody`'s
+    // `forceCopy` guard would mutate the caller's own live object in place.
+    class LoginDto {
+      constructor(
+        public readonly username: string,
+        public readonly password: string,
+      ) {}
+    }
+    const originalBody = new LoginDto("alice", "REALSECRET");
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      redactPaths: ["body.password"],
+    });
+
+    const { res } = runMiddleware(middleware, { body: originalBody });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toEqual({ username: "alice", password: "[REDACTED]" });
+    // The caller's ORIGINAL instance must be untouched.
+    expect(originalBody.password).toBe("REALSECRET");
+    expect(originalBody.username).toBe("alice");
+  });
+
+  it("does not mutate a caller-owned toJSON-defining class-instance body when redactPaths targets its own field", () => {
+    // End-to-end variant of the redactValue forceCopy/toJSON mutation fix: a
+    // class body that ALSO defines toJSON used to bypass the forceCopy guard
+    // (the pass-through early-return fired first) and get mutated in place by
+    // the redactPaths step. The middleware must redact the logged value while
+    // leaving the caller's live `req.body` object untouched.
+    class SessionDto {
+      public password = "REALSECRET";
+      public username = "alice";
+      toJSON() {
+        return { username: this.username, password: this.password };
+      }
+    }
+    const originalBody = new SessionDto();
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      redactPaths: ["body.password"],
+    });
+
+    const { res } = runMiddleware(middleware, { body: originalBody });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toEqual({ username: "alice", password: "[REDACTED]" });
+    expect(JSON.stringify(payload.http.requestBody)).not.toContain("REALSECRET");
+    // The caller's ORIGINAL instance must be untouched.
+    expect(originalBody.password).toBe("REALSECRET");
+    expect(originalBody.username).toBe("alice");
   });
 
   // ---------------------------------------------------------------------------
@@ -1606,6 +1752,53 @@ describe("request middleware internals", () => {
     expect(result.secret).toBe("[REDACTED]");
   });
 
+  it("serializeBody applies the 4th bodyRedactPaths arg to an over-limit body so the secret cannot survive inside _preview", () => {
+    const body = { password: "SECRET", filler: "x".repeat(4000) };
+    const result = serializeBody(body, undefined, 3000, ["body.password"]) as {
+      _truncated: boolean;
+      _originalLength: number;
+      _preview: string;
+    };
+    expect(result._truncated).toBe(true);
+    expect(result._preview).not.toContain("SECRET");
+    expect(result._preview).toContain("[REDACTED]");
+  });
+
+  it("serializeBody's bodyRedactPaths param is opt-in — omitting it leaves the pre-existing truncation behavior unchanged (backward compat)", () => {
+    // Identical over-limit body and target field as the test above, but the
+    // 4th argument is never passed — exactly what every pre-existing call
+    // site does. `serializeBody` has no other way to learn about
+    // `redactPaths`, so the secret is (as before this parameter existed)
+    // still present in `_preview`. Pins that the new parameter only changes
+    // behavior when a caller explicitly opts in.
+    const body = { password: "SECRET", filler: "x".repeat(4000) };
+    const result = serializeBody(body, undefined, 3000) as {
+      _truncated: boolean;
+      _preview: string;
+    };
+    expect(result._truncated).toBe(true);
+    expect(result._preview).toContain("SECRET");
+  });
+
+  it("serializeBody does not mutate a caller-owned class-instance body when applying bodyRedactPaths to an unmasked field", () => {
+    class LoginDto {
+      constructor(
+        public readonly username: string,
+        public readonly password: string,
+      ) {}
+    }
+    const originalBody = new LoginDto("alice", "REALSECRET");
+
+    const result = serializeBody(originalBody, undefined, 3000, ["body.password"]) as Record<
+      string,
+      unknown
+    >;
+
+    expect(result).toEqual({ username: "alice", password: "[REDACTED]" });
+    expect(originalBody.password).toBe("REALSECRET");
+    expect(originalBody.username).toBe("alice");
+  });
+
   it("truncates fallback strings when JSON serialization fails", () => {
     const problematic = {
       toJSON() {
@@ -1968,6 +2161,41 @@ describe("request middleware internals", () => {
     // The inner catch must leave the malformed pair untouched while still
     // redacting the subsequent well-formed masked key.
     expect(redactUrlQuery("/p?%GG=x&token=abc", mask)).toBe("/p?%GG=x&token=[REDACTED]");
+  });
+
+  it("redactUrlQuery returns the URL verbatim when the only `?` lives inside the fragment", () => {
+    const mask = new Set(["token"]);
+    // Before the `qIdx === -1` guard, the fragment-free prefix ("token=secret")
+    // was mis-parsed as a query string: `beforeFragment.slice(0, -1)` dropped
+    // the trailing "t" and `beforeFragment.slice(0)` re-read the whole prefix
+    // as `rawQuery`, producing the corrupted "token=secre?token=[REDACTED]#?x".
+    // The whole-URL `?` check matches (there IS a `?`, inside the fragment),
+    // but the pre-fragment split finds none — there is no real query
+    // component, so the URL must come back unchanged. This is the case that
+    // actually reproduces the bug on pre-fix code.
+    expect(redactUrlQuery("token=secret#?x", mask)).toBe("token=secret#?x");
+  });
+
+  it("redactUrlQuery returns a fragment-only-`?` hash-router URL unchanged", () => {
+    const mask = new Set(["token"]);
+    // Realistic hash-router shape: the `?` belongs to the fragment's own
+    // client-side route, not to a real query component. Note this particular
+    // input happens to survive even on pre-fix code (the mis-sliced prefix
+    // "/dash" contains no "=", so the pre-existing `!mutated` fallback
+    // returns it unchanged by coincidence, not because the old logic was
+    // correct) — it is kept here as a post-fix guard for a realistic shape,
+    // not as the bug's reproduction case (see the preceding test for that).
+    expect(redactUrlQuery("/dash#/r?token=abc", mask)).toBe("/dash#/r?token=abc");
+  });
+
+  it("redactUrlQuery still redacts a real query-before-fragment URL after the qIdx guard", () => {
+    const mask = new Set(["token"]);
+    // Regression guard for the `qIdx === -1` fix above: deliberately
+    // duplicates the "preserves the URL fragment" test's first assertion,
+    // kept local to the new fragment-only-`?` tests so it is obvious the
+    // guard does not affect the ordinary query-before-fragment case (`qIdx`
+    // is a real, non-negative index here, so the new branch never fires).
+    expect(redactUrlQuery("/p?token=abc#section", mask)).toBe("/p?token=[REDACTED]#section");
   });
 
   it("redactEntryPath redacts a top-level path", () => {
@@ -2454,6 +2682,31 @@ describe("request middleware internals", () => {
       expect((out as Payload).data).toBe("hello");
     });
 
+    it("forceCopy=true (4th arg) always returns a fresh copy of a data-bearing instance, even when nothing changed", () => {
+      // Contrasts with the identity-passthrough test above: same inputs, but
+      // with forceCopy requested — used by `serializeBody` to guarantee its
+      // subsequent in-place `redactPaths` mutation never lands on a
+      // caller-owned object (see the comment on the `forceCopy` parameter in
+      // `src/redact.ts`).
+      class Payload {
+        constructor(public readonly data: string) {}
+      }
+      const input = new Payload("hello");
+      const mask = new Set(["password", "token"]); // non-empty but no match
+      const out = redactValue(input, mask, new WeakSet(), true);
+      expect(out).not.toBe(input);
+      expect(out).toEqual({ data: "hello" });
+    });
+
+    it("forceCopy defaults to false when the 4th arg is omitted, preserving identity-passthrough (backward compat)", () => {
+      class Payload {
+        constructor(public readonly data: string) {}
+      }
+      const input = new Payload("hello");
+      const out = redactValue(input, new Set<string>(), new WeakSet());
+      expect(out).toBe(input);
+    });
+
     it("passes through a class instance that defines toJSON even when a key matches (documented limitation)", () => {
       class Timestamped {
         public readonly password = "secret";
@@ -2467,6 +2720,131 @@ describe("request middleware internals", () => {
       // hasToJSON === true → pass-through, no key walk; this is the documented
       // limitation: use `redactPaths` or normalize to a plain object instead.
       expect(out).toBe(input);
+    });
+
+    it("serializeBody does not mutate a caller-owned toJSON-defining class-instance body when redactPaths targets its own field", () => {
+      // Direct reproduction of the confirmed mutation hazard: a class body that
+      // defines toJSON AND exposes `password` as an own field, targeted only by
+      // redactPaths (no matching maskBodyKeys). Pre-fix, `serializeBody`
+      // mutated the caller's live object in place; the toJSON-resolved owned
+      // deep copy now isolates the redaction from the caller.
+      class ToJSONBody {
+        public password = "REALSECRET";
+        public username = "alice";
+        toJSON() {
+          return { username: this.username, password: this.password };
+        }
+      }
+      const originalBody = new ToJSONBody();
+      const out = serializeBody(originalBody, undefined, 3000, ["body.password"]) as Record<
+        string,
+        unknown
+      >;
+      // The logged representation (from toJSON) redacts the secret...
+      expect(out).toEqual({ password: "[REDACTED]", username: "alice" });
+      // ...and the caller's ORIGINAL instance is left completely untouched.
+      expect(originalBody.password).toBe("REALSECRET");
+      expect(originalBody.username).toBe("alice");
+    });
+
+    it("serializeBody does not mutate a NESTED toJSON-defining instance targeted by redactPaths", () => {
+      class Credentials {
+        public password = "NESTEDSECRET";
+        toJSON() {
+          return { password: this.password };
+        }
+      }
+      const creds = new Credentials();
+      const body = { user: "bob", credentials: creds };
+      const out = serializeBody(body, undefined, 3000, ["body.credentials.password"]) as {
+        user: string;
+        credentials: Record<string, unknown>;
+      };
+      expect(out.user).toBe("bob");
+      expect(out.credentials).toEqual({ password: "[REDACTED]" });
+      // The caller's nested instance is untouched.
+      expect(creds.password).toBe("NESTEDSECRET");
+    });
+
+    it("serializeBody + redactPaths redacts (not leaks) a private-field secret exposed only through toJSON", () => {
+      // A secret held in a true private field (`#password`) is surfaced only by
+      // the class's own toJSON(). The toJSON-resolved owned copy exposes it as a
+      // plain key, so redactPaths can redact it in place of the caller — the
+      // secret is neither leaked nor left on the caller's object.
+      class PrivateSecretBody {
+        #password: string;
+        public username = "alice";
+        constructor(pw: string) {
+          this.#password = pw;
+        }
+        toJSON() {
+          return { username: this.username, password: this.#password };
+        }
+        reveal() {
+          return this.#password;
+        }
+      }
+      const originalBody = new PrivateSecretBody("SECRET");
+      const out = serializeBody(originalBody, undefined, 3000, ["body.password"]);
+      // The raw secret never reaches the serialized form; it is redacted.
+      expect(JSON.stringify(out)).not.toContain("SECRET");
+      expect(out).toEqual({ username: "alice", password: "[REDACTED]" });
+      // The caller's private field is untouched.
+      expect(originalBody.reveal()).toBe("SECRET");
+    });
+
+    it("serializeBody resolves an incidental toJSON value via toJSON() (not its internal fields) when redactPaths targets an unrelated field", () => {
+      // Regression guard for the moment-balloon: a value like a moment instance
+      // owns many internal fields (`_d`, `_locale`, …) alongside its toJSON().
+      // Any non-empty redactPaths must NOT cause it to be rebuilt from those
+      // internals — the JSON round-trip resolves toJSON() to its clean output
+      // exactly as the final log serializer would, so the logged value stays
+      // compact, not a multi-field internal-state dump.
+      class MomentLike {
+        public _d = new Date("2024-01-01T00:00:00.000Z");
+        public _locale = { _months: ["January", "February", "…"] };
+        public _isAMomentObject = true;
+        constructor(private readonly iso: string) {}
+        toJSON() {
+          return this.iso;
+        }
+      }
+      const created = new MomentLike("2024-01-01T00:00:00.000Z");
+      const body = { created, note: "hi" };
+      const out = serializeBody(body, undefined, 3000, ["body.note"]) as {
+        created: string;
+        note: string;
+      };
+      // The toJSON output (a clean ISO string), not the internal own fields.
+      expect(out.created).toBe("2024-01-01T00:00:00.000Z");
+      expect(out.note).toBe("[REDACTED]");
+      const serialized = JSON.stringify(out);
+      expect(serialized).not.toContain("_locale");
+      expect(serialized).not.toContain("_isAMomentObject");
+    });
+
+    it("serializeBody resolves a Date body-field to its ISO string under redactPaths (not ballooned, caller untouched)", () => {
+      const created = new Date("2024-01-01T00:00:00.000Z");
+      const body = { created, note: "hi" };
+      const out = serializeBody(body, undefined, 3000, ["body.other"]) as {
+        created: string;
+        note: string;
+      };
+      // The Date resolves to its toJSON() ISO string, exactly as the final log
+      // serializer would render it.
+      expect(out.created).toBe("2024-01-01T00:00:00.000Z");
+      expect(out.note).toBe("hi");
+      // The caller's Date instance is untouched.
+      expect(created.toISOString()).toBe("2024-01-01T00:00:00.000Z");
+    });
+
+    it("serializeBody falls back to String() (no throw, no leak) when a BigInt body cannot be JSON-serialized under redactPaths", () => {
+      // A body carrying a BigInt cannot be JSON.stringify'd; the round-trip
+      // catch leaves the keyword-masked graph in place and the String()
+      // fallback truncates it. The raw numeric value is never emitted.
+      const out = serializeBody({ big: 10n }, undefined, 3000, ["body.big"]);
+      expect(typeof out).toBe("string");
+      expect(out).toBe("[object Object]");
     });
 
     it("does NOT yield [Circular] when the same built-in is referenced by two keys", () => {
@@ -2561,6 +2939,112 @@ describe("request middleware internals", () => {
 
       // The nested self-reference is replaced with "[Circular]".
       expect(out[0]).toBe("[Circular]");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 1 (redact.ts DAG/diamond fix) — active-path cycle detection
+  //
+  // Before this fix, the `seen` WeakSet tracked "every object visited
+  // anywhere in the traversal" rather than "objects on the current active DFS
+  // path", so a shared (non-circular) reference reached via two independent
+  // paths was misclassified as a cycle and rendered as the literal string
+  // "[Circular]" on its second occurrence, silently dropping real
+  // (already-redacted) data. These tests pin the corrected active-path
+  // (add-on-entry, delete-on-unwind) behavior: shared/DAG references render
+  // FULLY on every occurrence, and ONLY a genuine cycle (an object that is
+  // its own ancestor on the active path) still yields "[Circular]".
+  // ---------------------------------------------------------------------------
+  describe("redactValue active-path cycle detection (DAG/diamond fix)", () => {
+    const { redactValue } = __requestInternals;
+
+    it("renders a plain-object diamond referenced by two sibling keys in full (no mask)", () => {
+      const shared = { value: "x" };
+      const body = { a: shared, b: shared };
+      const mask = new Set<string>();
+      const out = redactValue(body, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out.a).toEqual({ value: "x" });
+      expect(out.b).toEqual({ value: "x" });
+      expect(out.a).not.toBe("[Circular]");
+      expect(out.b).not.toBe("[Circular]");
+    });
+
+    it("redacts a plain-object diamond referenced by two sibling keys under a mask", () => {
+      const shared = { password: "topsecret", keep: "visible" };
+      const body = { a: shared, b: shared };
+      const mask = new Set(["password"]);
+      const out = redactValue(body, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out.a).toEqual({ password: "[REDACTED]", keep: "visible" });
+      expect(out.b).toEqual({ password: "[REDACTED]", keep: "visible" });
+    });
+
+    it("renders both occurrences of a shared object inside an array ([shared, shared])", () => {
+      const shared = { password: "topsecret", keep: "visible" };
+      const mask = new Set(["password"]);
+      const out = redactValue([shared, shared], mask, new WeakSet()) as unknown[];
+
+      expect(out[0]).toEqual({ password: "[REDACTED]", keep: "visible" });
+      expect(out[1]).toEqual({ password: "[REDACTED]", keep: "visible" });
+    });
+
+    it("renders a deep diamond where a nested leaf is shared two levels down", () => {
+      const leaf = { secret: "s3cr3t", keep: "ok" };
+      const body = { x: { l: leaf }, y: { l: leaf } };
+      const mask = new Set(["secret"]);
+      const out = redactValue(body, mask, new WeakSet()) as {
+        x: { l: Record<string, unknown> };
+        y: { l: Record<string, unknown> };
+      };
+
+      expect(out.x.l).toEqual({ secret: "[REDACTED]", keep: "ok" });
+      expect(out.y.l).toEqual({ secret: "[REDACTED]", keep: "ok" });
+    });
+
+    it("redacts both occurrences of a shared class-DTO instance referenced by two sibling keys", () => {
+      class Credentials {
+        constructor(
+          public readonly username: string,
+          public readonly password: string,
+        ) {}
+      }
+      const dto = new Credentials("alice", "s3cr3t");
+      const body = { u: dto, v: dto };
+      const mask = new Set(["password"]);
+      const out = redactValue(body, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out.u).toEqual({ username: "alice", password: "[REDACTED]" });
+      expect(out.v).toEqual({ username: "alice", password: "[REDACTED]" });
+      expect(out.u).not.toBe("[Circular]");
+      expect(out.v).not.toBe("[Circular]");
+    });
+
+    it("a true self-referencing plain object still resolves to [Circular] after the active-path fix", () => {
+      const obj: Record<string, unknown> = { label: "root" };
+      obj.self = obj;
+      const mask = new Set<string>();
+      const out = redactValue(obj, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out.label).toBe("root");
+      expect(out.self).toBe("[Circular]");
+    });
+
+    it("a mutual cycle between two plain objects still resolves to [Circular] after the active-path fix", () => {
+      const a: Record<string, unknown> = { name: "a" };
+      const b: Record<string, unknown> = { name: "b" };
+      a.peer = b;
+      b.peer = a;
+      const mask = new Set<string>();
+      const out = redactValue(a, mask, new WeakSet()) as Record<string, unknown>;
+      const peer = out.peer as Record<string, unknown>;
+
+      expect(out.name).toBe("a");
+      expect(peer.name).toBe("b");
+      // The edge that closes the cycle (b.peer -> a) resolves to "[Circular]";
+      // the forward edge (a.peer -> b) is not itself circular and renders as
+      // a proper nested object.
+      expect(peer.peer).toBe("[Circular]");
     });
   });
 });
