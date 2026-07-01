@@ -41,10 +41,13 @@
  *     into a fresh plain object, even when nothing on it changed. Threaded
  *     through every recursive call so nested class instances at any depth are
  *     covered too; plain objects and arrays are unaffected since they already
- *     always rebuild. Intended for callers that will mutate the returned
- *     value in place afterward (`request-middleware.ts`'s `serializeBody`
- *     applies `redactPaths` this way) and must not risk that mutation landing
- *     on a caller-owned object that `maskKeys` alone left untouched.
+ *     always rebuild. It is a general-purpose deep-copy option for callers
+ *     that will mutate the returned value in place afterward and must not risk
+ *     that mutation landing on a caller-owned object that `maskKeys` alone
+ *     left untouched. (Note: `request-middleware.ts`'s `serializeBody` does
+ *     NOT rely on this for `redactPaths`; it applies paths on a
+ *     `toJSON`-resolved `JSON.parse(JSON.stringify(...))` copy instead, which
+ *     is both mutation-safe and renders built-ins via their `toJSON()`.)
  * - **Cycle detection is active-path tracking, not all-visited tracking.**
  *   The per-call `WeakSet` (`seen`) records only the objects on the CURRENT
  *   recursion path: the array, plain-object, and data-bearing-instance

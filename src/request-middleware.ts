@@ -253,38 +253,51 @@ const serializeBody = (
     ? new Set(maskKeys.map((key) => key.toLowerCase()))
     : ((maskKeys as Set<string> | undefined) ?? new Set<string>());
 
-  // `forceCopy: true` (only when `redactPaths` will actually be applied
-  // below) makes `redactValue` always return a FRESH copy of a data-bearing
-  // class instance / Error subclass, even when no `maskKeys` entry matched it
-  // — the case where it would otherwise return the original object BY
-  // IDENTITY (see `src/redact.ts`). Without this, the `redactEntryPath`
-  // mutation a few lines below could reach and mutate a class-instance
-  // request body the caller (e.g. `req.body`) still holds a live reference
-  // to. Plain-object bodies — the overwhelming majority of real HTTP JSON
-  // bodies — are unaffected: `redactValue` always rebuilds those fresh
-  // regardless of this flag.
-  let masked = redactValue(body, maskSet, new WeakSet(), (bodyRedactPaths?.length ?? 0) > 0);
+  // Apply the keyword-based `maskBodyKeys` redaction. Returns a fresh object
+  // for plain/data-bearing shapes but passes built-ins and `toJSON`-defining
+  // instances through by identity (the documented redaction boundary — see
+  // `src/redact.ts`).
+  let masked = redactValue(body, maskSet, new WeakSet());
 
-  // Apply body-scoped `redactPaths` to the (keyword-masked, mutation-safe)
-  // object graph BEFORE the truncation decision below. Without this, a
-  // secret targeted only by `redactPaths` (no matching `maskBodyKeys` entry)
-  // would survive untouched inside the `_preview` string of the truncation
-  // envelope: the post-assembly `redactPaths` pass in `finalize()` runs
-  // AFTER this function returns, by which point an over-limit body has
-  // already collapsed into `{ _truncated, _originalLength, _preview }` — a
-  // shape that no longer has the nested key the path was targeting, so the
-  // redaction silently no-ops. Reuses `redactEntryPath` via a throw-away
-  // `{ requestBody: masked }` wrapper so the `body.` → `requestBody.` alias
-  // and prototype-pollution guards stay centralized in one implementation.
-  // Non-body-scoped paths (`context.*`, header paths) no-op against this
-  // wrapper — they are still applied by the post-assembly loop in
-  // `finalize()`.
+  // Apply body-scoped `redactPaths` BEFORE the truncation decision below, on a
+  // fully-owned, `toJSON`-resolved deep copy of the masked graph. This closes
+  // two problems at once:
+  //   1. `_preview` leak — the post-assembly `redactPaths` pass in `finalize()`
+  //      runs AFTER this function returns, by which point an over-limit body
+  //      has already collapsed into `{ _truncated, _originalLength, _preview }`,
+  //      a shape that no longer has the nested key the path targeted, so the
+  //      redaction silently no-ops and a `redactPaths`-only secret survives
+  //      inside `_preview`. Applying paths here, pre-truncation, closes that.
+  //   2. Caller-object mutation — `redactEntryPath` writes in place, so it must
+  //      never touch a node the caller still owns. `redactValue` shares
+  //      built-ins and `toJSON`-defining instances (e.g. a DTO or a `moment`)
+  //      by identity, so mutating them directly would corrupt the live
+  //      `req.body`. Round-tripping through `JSON.parse(JSON.stringify(...))`
+  //      first yields a graph that is (a) entirely fresh — nothing shared with
+  //      the caller — and (b) shaped exactly as the final log serializer will
+  //      render it: every `toJSON()` is resolved to its output (a
+  //      `moment`/`Date` to its ISO string, a DTO to its serialized form), so
+  //      an incidental built-in is never ballooned into its internal-state
+  //      fields, and a secret exposed only through `toJSON()` (e.g. a private
+  //      `#field`) is redacted rather than leaked.
+  // The throw-away `{ requestBody: owned }` wrapper reuses `redactEntryPath`'s
+  // `body.` → `requestBody.` alias and prototype-pollution guards; non-body
+  // paths (`context.*`, header paths) no-op here and are applied by the
+  // post-assembly loop in `finalize()`. A non-JSON-serializable body (e.g. one
+  // carrying a `BigInt`) throws in `JSON.stringify`; the catch leaves `masked`
+  // as the keyword-masked graph so the `String()` fallback below still runs.
   if (bodyRedactPaths && bodyRedactPaths.length > 0 && masked && typeof masked === "object") {
-    const wrapper: Record<string, unknown> = { requestBody: masked };
-    for (const path of bodyRedactPaths) {
-      redactEntryPath(wrapper, path);
+    try {
+      const owned: unknown = JSON.parse(JSON.stringify(masked));
+      const wrapper: Record<string, unknown> = { requestBody: owned };
+      for (const path of bodyRedactPaths) {
+        redactEntryPath(wrapper, path);
+      }
+      masked = wrapper.requestBody;
+    } catch {
+      // Body is not JSON-serializable (e.g. a `BigInt` value) — leave `masked`
+      // as the keyword-masked graph; the `String()` fallback below handles it.
     }
-    masked = wrapper.requestBody;
   }
 
   if (typeof masked === "string") {

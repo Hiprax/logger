@@ -958,6 +958,40 @@ describe("createRequestLogger", () => {
     expect(originalBody.username).toBe("alice");
   });
 
+  it("does not mutate a caller-owned toJSON-defining class-instance body when redactPaths targets its own field", () => {
+    // End-to-end variant of the redactValue forceCopy/toJSON mutation fix: a
+    // class body that ALSO defines toJSON used to bypass the forceCopy guard
+    // (the pass-through early-return fired first) and get mutated in place by
+    // the redactPaths step. The middleware must redact the logged value while
+    // leaving the caller's live `req.body` object untouched.
+    class SessionDto {
+      public password = "REALSECRET";
+      public username = "alice";
+      toJSON() {
+        return { username: this.username, password: this.password };
+      }
+    }
+    const originalBody = new SessionDto();
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      redactPaths: ["body.password"],
+    });
+
+    const { res } = runMiddleware(middleware, { body: originalBody });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toEqual({ username: "alice", password: "[REDACTED]" });
+    expect(JSON.stringify(payload.http.requestBody)).not.toContain("REALSECRET");
+    // The caller's ORIGINAL instance must be untouched.
+    expect(originalBody.password).toBe("REALSECRET");
+    expect(originalBody.username).toBe("alice");
+  });
+
   // ---------------------------------------------------------------------------
   // Task #12 — Truncation type stability
   // ---------------------------------------------------------------------------
@@ -2686,6 +2720,131 @@ describe("request middleware internals", () => {
       // hasToJSON === true → pass-through, no key walk; this is the documented
       // limitation: use `redactPaths` or normalize to a plain object instead.
       expect(out).toBe(input);
+    });
+
+    it("serializeBody does not mutate a caller-owned toJSON-defining class-instance body when redactPaths targets its own field", () => {
+      // Direct reproduction of the confirmed mutation hazard: a class body that
+      // defines toJSON AND exposes `password` as an own field, targeted only by
+      // redactPaths (no matching maskBodyKeys). Pre-fix, `serializeBody`
+      // mutated the caller's live object in place; the toJSON-resolved owned
+      // deep copy now isolates the redaction from the caller.
+      class ToJSONBody {
+        public password = "REALSECRET";
+        public username = "alice";
+        toJSON() {
+          return { username: this.username, password: this.password };
+        }
+      }
+      const originalBody = new ToJSONBody();
+      const out = serializeBody(originalBody, undefined, 3000, ["body.password"]) as Record<
+        string,
+        unknown
+      >;
+      // The logged representation (from toJSON) redacts the secret...
+      expect(out).toEqual({ password: "[REDACTED]", username: "alice" });
+      // ...and the caller's ORIGINAL instance is left completely untouched.
+      expect(originalBody.password).toBe("REALSECRET");
+      expect(originalBody.username).toBe("alice");
+    });
+
+    it("serializeBody does not mutate a NESTED toJSON-defining instance targeted by redactPaths", () => {
+      class Credentials {
+        public password = "NESTEDSECRET";
+        toJSON() {
+          return { password: this.password };
+        }
+      }
+      const creds = new Credentials();
+      const body = { user: "bob", credentials: creds };
+      const out = serializeBody(body, undefined, 3000, ["body.credentials.password"]) as {
+        user: string;
+        credentials: Record<string, unknown>;
+      };
+      expect(out.user).toBe("bob");
+      expect(out.credentials).toEqual({ password: "[REDACTED]" });
+      // The caller's nested instance is untouched.
+      expect(creds.password).toBe("NESTEDSECRET");
+    });
+
+    it("serializeBody + redactPaths redacts (not leaks) a private-field secret exposed only through toJSON", () => {
+      // A secret held in a true private field (`#password`) is surfaced only by
+      // the class's own toJSON(). The toJSON-resolved owned copy exposes it as a
+      // plain key, so redactPaths can redact it in place of the caller — the
+      // secret is neither leaked nor left on the caller's object.
+      class PrivateSecretBody {
+        #password: string;
+        public username = "alice";
+        constructor(pw: string) {
+          this.#password = pw;
+        }
+        toJSON() {
+          return { username: this.username, password: this.#password };
+        }
+        reveal() {
+          return this.#password;
+        }
+      }
+      const originalBody = new PrivateSecretBody("SECRET");
+      const out = serializeBody(originalBody, undefined, 3000, ["body.password"]);
+      // The raw secret never reaches the serialized form; it is redacted.
+      expect(JSON.stringify(out)).not.toContain("SECRET");
+      expect(out).toEqual({ username: "alice", password: "[REDACTED]" });
+      // The caller's private field is untouched.
+      expect(originalBody.reveal()).toBe("SECRET");
+    });
+
+    it("serializeBody resolves an incidental toJSON value via toJSON() (not its internal fields) when redactPaths targets an unrelated field", () => {
+      // Regression guard for the moment-balloon: a value like a moment instance
+      // owns many internal fields (`_d`, `_locale`, …) alongside its toJSON().
+      // Any non-empty redactPaths must NOT cause it to be rebuilt from those
+      // internals — the JSON round-trip resolves toJSON() to its clean output
+      // exactly as the final log serializer would, so the logged value stays
+      // compact, not a multi-field internal-state dump.
+      class MomentLike {
+        public _d = new Date("2024-01-01T00:00:00.000Z");
+        public _locale = { _months: ["January", "February", "…"] };
+        public _isAMomentObject = true;
+        constructor(private readonly iso: string) {}
+        toJSON() {
+          return this.iso;
+        }
+      }
+      const created = new MomentLike("2024-01-01T00:00:00.000Z");
+      const body = { created, note: "hi" };
+      const out = serializeBody(body, undefined, 3000, ["body.note"]) as {
+        created: string;
+        note: string;
+      };
+      // The toJSON output (a clean ISO string), not the internal own fields.
+      expect(out.created).toBe("2024-01-01T00:00:00.000Z");
+      expect(out.note).toBe("[REDACTED]");
+      const serialized = JSON.stringify(out);
+      expect(serialized).not.toContain("_locale");
+      expect(serialized).not.toContain("_isAMomentObject");
+    });
+
+    it("serializeBody resolves a Date body-field to its ISO string under redactPaths (not ballooned, caller untouched)", () => {
+      const created = new Date("2024-01-01T00:00:00.000Z");
+      const body = { created, note: "hi" };
+      const out = serializeBody(body, undefined, 3000, ["body.other"]) as {
+        created: string;
+        note: string;
+      };
+      // The Date resolves to its toJSON() ISO string, exactly as the final log
+      // serializer would render it.
+      expect(out.created).toBe("2024-01-01T00:00:00.000Z");
+      expect(out.note).toBe("hi");
+      // The caller's Date instance is untouched.
+      expect(created.toISOString()).toBe("2024-01-01T00:00:00.000Z");
+    });
+
+    it("serializeBody falls back to String() (no throw, no leak) when a BigInt body cannot be JSON-serialized under redactPaths", () => {
+      // A body carrying a BigInt cannot be JSON.stringify'd; the round-trip
+      // catch leaves the keyword-masked graph in place and the String()
+      // fallback truncates it. The raw numeric value is never emitted.
+      const out = serializeBody({ big: 10n }, undefined, 3000, ["body.big"]);
+      expect(typeof out).toBe("string");
+      expect(out).toBe("[object Object]");
     });
 
     it("does NOT yield [Circular] when the same built-in is referenced by two keys", () => {
