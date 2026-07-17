@@ -633,6 +633,50 @@ When `includeHttpContext` is enabled, the structured `RequestLogEntry` is attach
 }
 ```
 
+### Printf tokens and metadata (no string interpolation)
+
+This package composes **no** `winston.format.splat()`, matching winston's own default format. Two consequences follow, and the second is a deliberate trade:
+
+**1. Printf-style interpolation is not performed.** A message keeps its tokens literally:
+
+```ts
+logger.info("User %s logged in", "u-42");
+// message: "User %s logged in"   — the "u-42" argument is not substituted
+```
+
+**2. A message containing a printf token causes winston to drop a trailing metadata object.** When the message matches `%s %c %d %j %i %f %o %O %%`, winston routes the metadata into its internal `SPLAT` slot, which nothing in these chains reads:
+
+```ts
+logger.info("route /users", { requestId: "r1" }); // requestId logged
+logger.info("route /a%d", { requestId: "r1" }); // requestId NOT logged
+```
+
+This is identical to bare `winston.createLogger()` with no `format` option — it is winston's documented default, where interpolation "requires `winston.format.splat()`" — not behavior this package adds.
+
+**The message itself is always rendered verbatim and is never rewritten.** That is the reason `splat()` is deliberately not composed in. Adding it would not recover the metadata above (winston consumes the trailing object *as* the `%d` argument, so the metadata is dropped either way) and it would let a `%` token inside message text **alter the recorded text**. The trigger is not exotic: the characters `c`, `d` and `f` are hex digits, so lowercase percent-encoded URL octets (`%c3`, `%d0`, `%f0`) are printf tokens.
+
+```ts
+// With splat() composed in, this URL would be REWRITTEN in the log:
+logger.info("route /caf%c3%a9", { ip }); // -> "route /caf3%a9"
+```
+
+An absent field is visibly absent; a silently rewritten URL is a plausible fabrication. Rendering the message verbatim is the stronger guarantee, so it is the one this package keeps.
+
+**Recommendation — put dynamic values in metadata, not in the message.** This avoids the drop entirely:
+
+```ts
+// Avoid — a printf token in `url` (e.g. "%d", or the "%c3" of an encoded
+// path) silently drops `ip`:
+logger.info(`Unknown route ${url}`, { ip });
+
+// Prefer — a static message with everything structured:
+logger.info("Unknown route", { url, ip });
+```
+
+Beyond avoiding the drop, this keeps messages greppable and aggregatable, which is standard practice for structured logging. If you need interpolation, format the string yourself before logging it.
+
+**`createRequestLogger` is unaffected**, so an attacker-chosen URL containing `%d` cannot strip the context from the HTTP entry recording that request. Note the reason, because it is not the recommendation above: the middleware does put the request URL into its message. It is immune because it logs through winston's single-object form (`logger.log(entry)`), which never populates the `SPLAT` slot and so never reaches the drop.
+
 ## Migration to v1.0.0
 
 v1.0.0 removes the `MaxListenersExceededWarning` that appeared once an app created ~11 module loggers. Fixing it correctly meant this package takes ownership of crash capture instead of delegating to winston's per-logger handlers, which settles three behaviors that could not change without a major version.

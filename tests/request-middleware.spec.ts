@@ -3921,4 +3921,39 @@ describe("request middleware internals", () => {
       expect(peer.peer).toBe("[Circular]");
     });
   });
+
+  describe("printf tokens in a request URL", () => {
+    it("logs the full entry even when the URL contains printf tokens", () => {
+      // Neither format chain composes `winston.format.splat()`, so a message
+      // holding a printf token makes winston route a trailing metadata object
+      // into its unread `SPLAT` slot and drop it. The middleware is IMMUNE to
+      // that by construction: it logs via `logger.log(logEntry)` — winston's
+      // single-object form (`logger.js:233-241`), which never sets `SPLAT` and
+      // never takes the token branch. So an attacker-chosen URL containing
+      // `%d` cannot strip the diagnostic context from the entry recording
+      // their own request.
+      //
+      // This pins that immunity: if the log call at the end of `finalize()` is
+      // ever refactored to the 2-arg `logger.log(level, msg, meta)` form, the
+      // drop becomes reachable here and this test fails.
+      const { logger, log } = createMockLogger();
+      const middleware = createRequestLogger({ logger, includeHttpContext: true });
+
+      const { res } = runMiddleware(middleware, {
+        url: "/report/a%d?q=%s",
+        originalUrl: "/report/a%d?q=%s",
+      });
+      res.emit("finish");
+
+      const payload = log.mock.calls[0][0];
+      // The URL rides through verbatim...
+      expect(payload.message).toContain("/report/a%d?q=%s");
+      expect(payload.message).not.toContain("NaN");
+      // ...and the structured context is fully intact — nothing was dropped.
+      expect(payload.http.url).toBe("/report/a%d?q=%s");
+      expect(payload.http.method).toBe("POST");
+      expect(payload.http.statusCode).toBe(200);
+      expect(payload.http.responseTimeMs).toEqual(expect.any(Number));
+    });
+  });
 });

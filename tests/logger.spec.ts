@@ -6139,3 +6139,160 @@ describe("createLogger", () => {
     });
   });
 });
+
+/**
+ * Characterization suite for a deliberate boundary: neither format chain
+ * composes `winston.format.splat()`, so a message containing a printf token
+ * (`%s %d %j %i %f %o %O %%`) causes winston to route a trailing metadata
+ * object into its `SPLAT` slot — which nothing in these chains reads — and the
+ * metadata is not emitted.
+ *
+ * These tests pin that behavior deliberately rather than fixing it, for a
+ * reason worth restating at the assertion site: adding `splat()` does NOT
+ * recover the metadata for the canonical one-token/one-object call, and it
+ * would forfeit something more valuable than it buys. `logform/splat.js`
+ * computes `extraSplat = (tokens - escapes) - splat.length`; for
+ * `info("route /a%d", meta)` that is `1 - 1 = 0`, so NO merge occurs and
+ * `util.format` instead consumes the metadata object as the `%d` argument —
+ * rewriting the caller's message to `"route /aNaN"` while STILL dropping the
+ * metadata. The status quo is byte-identical to bare winston's own default
+ * format (`winston/lib/winston/logger.js:105` falls back to `logform/json`
+ * with no splat), and winston's own docs mark interpolation opt-in
+ * ("Requires `winston.format.splat()`").
+ *
+ * The invariant these tests defend is therefore stronger than the metadata
+ * they give up: **this logger renders the caller's message text verbatim and
+ * never passes it through `util.format`.** The percent-encoding case below is
+ * the load-bearing canary for that.
+ */
+describe("printf tokens in a message (winston splat parity)", () => {
+  afterEach(() => {
+    // Mirrors the `createLogger` suite's own hook. Every logger below is torn
+    // down via `teardownLogger` (whose `close()` already evicts its registry
+    // entry), so this is belt-and-braces — it keeps the suite honest if a case
+    // is ever added that reuses a `moduleName`.
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  /** Renders one log line through a Stream transport in the given format mode. */
+  const render = (
+    moduleName: string,
+    format: "json" | "pretty",
+    emit: (logger: winston.Logger) => void,
+  ): string => {
+    const stream = new PassThrough();
+    const chunks: string[] = [];
+    stream.on("data", (chunk) => chunks.push(chunk.toString()));
+    const logger = createLogger({
+      moduleName,
+      includeConsole: false,
+      includeFile: false,
+      includeGlobalFile: false,
+      format,
+      additionalTransports: [new winston.transports.Stream({ stream })],
+    });
+    emit(logger);
+    teardownLogger(logger);
+    return chunks.join("");
+  };
+
+  describe.each([["json"], ["pretty"]] as const)("format: %s", (format) => {
+    it("drops the trailing metadata object but renders the message verbatim", () => {
+      const rendered = render(`splat-drop-${format}`, format, (logger) => {
+        logger.info("route /a%d", { requestId: "r1" });
+      });
+
+      // The message survives byte-for-byte — this is the guarantee.
+      expect(rendered).toContain("route /a%d");
+      // The metadata is the documented casualty...
+      expect(rendered).not.toContain("r1");
+      // ...but the message was never run through `util.format`, so the `%d`
+      // did not consume the object and coerce it to NaN.
+      expect(rendered).not.toContain("NaN");
+    });
+
+    it("does not interpolate printf tokens", () => {
+      const rendered = render(`splat-interp-${format}`, format, (logger) => {
+        logger.info("User %s logged in", "u-42");
+      });
+
+      expect(rendered).toContain("User %s logged in");
+      expect(rendered).not.toContain("u-42");
+    });
+
+    it("keeps metadata when the message contains no printf token", () => {
+      // The contrast case: proves the drop above is token-triggered and that
+      // the test is not passing for some unrelated reason.
+      const rendered = render(`splat-control-${format}`, format, (logger) => {
+        logger.info("route /users", { requestId: "r1" });
+      });
+
+      expect(rendered).toContain("route /users");
+      expect(rendered).toContain("r1");
+    });
+
+    it("renders a percent-encoded URL byte-for-byte and never rewrites it", () => {
+      // SECURITY-LOAD-BEARING CANARY. `formatRegExp` is `/%[scdjifoO%]/`, and
+      // `c`, `d`, `f` are HEX DIGITS — so lowercase percent-encoded octets in
+      // a URL (`%c3`, `%d0`, `%f0`) match as printf tokens. If anyone ever
+      // adds `splat()` to a chain, `util.format` will consume the metadata as
+      // the `%c` argument and emit nothing for it, silently rewriting this URL
+      // to "route /caf3%a9" — an attacker-authored lie about which path was
+      // requested. Today the metadata is merely absent and the URL is true;
+      // log omission is recoverable, log forgery is not. This test fails the
+      // day that trade is reversed.
+      const rendered = render(`splat-pct-${format}`, format, (logger) => {
+        logger.info("route /caf%c3%a9", { ip: "1.2.3.4" });
+      });
+
+      expect(rendered).toContain("route /caf%c3%a9");
+      expect(rendered).not.toContain("caf3%a9");
+      expect(rendered).not.toContain("1.2.3.4");
+    });
+
+    it("renders an escaped percent literally", () => {
+      const rendered = render(`splat-escaped-${format}`, format, (logger) => {
+        logger.info("50%% done", { requestId: "r1" });
+      });
+
+      // `%%` is in `formatRegExp` too, so it triggers the same drop.
+      expect(rendered).toContain("50%% done");
+      expect(rendered).not.toContain("r1");
+    });
+  });
+
+  it("matches bare winston's default format byte-for-byte on a token message", () => {
+    // Parity canary, mirroring the winston-canary pattern used by the
+    // crash-capture suite: the drop is winston's own out-of-the-box behavior,
+    // NOT something this package introduces. If a future winston release
+    // starts composing splat() into its default format, this fails and the
+    // documented boundary must be revisited.
+    const stream = new PassThrough();
+    const chunks: string[] = [];
+    stream.on("data", (chunk) => chunks.push(chunk.toString()));
+    const bare = winston.createLogger({
+      level: "info",
+      transports: [new winston.transports.Stream({ stream })],
+    });
+    bare.info("route /a%d", { requestId: "r1" });
+    bare.close();
+    const bareMessage = JSON.parse(chunks.join("").trim()).message;
+
+    const ours = render("splat-parity", "json", (logger) => {
+      logger.info("route /a%d", { requestId: "r1" });
+    });
+    const ourMessage = JSON.parse(ours.trim()).message;
+
+    expect(bareMessage).toBe("route /a%d");
+    expect(ourMessage).toBe(bareMessage);
+    expect(JSON.parse(ours.trim()).requestId).toBeUndefined();
+  });
+
+  it("confirms util.format is what would rewrite the message, if it were ever applied", () => {
+    // Documents the mechanism the canary above defends against, pinned against
+    // the real `util.format` so the rationale cannot rot into folklore.
+    expect(util.format("route /caf%c3%a9", { ip: "1.2.3.4" })).toBe("route /caf3%a9");
+    expect(util.format("route /a%d", { requestId: "r1" })).toBe("route /aNaN");
+  });
+});
