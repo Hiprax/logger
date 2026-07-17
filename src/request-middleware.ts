@@ -1033,8 +1033,6 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
     const externalStart = (req as unknown as Record<symbol, unknown>)[REQUEST_START_SYMBOL];
     const start = typeof externalStart === "bigint" ? externalStart : process.hrtime.bigint();
 
-    const initialContentLength = toNumber(req.headers["content-length"]);
-
     // Snapshot `req.body` at middleware ENTRY time so handler-time mutation
     // (e.g. `req.body = { redacted: true }`) does not change what gets logged.
     // We take a SHALLOW reference rather than a deep clone: deep cloning every
@@ -1118,7 +1116,16 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
           url: loggedUrl,
           statusCode,
           responseTimeMs: Number(durationMs.toFixed(2)),
-          contentLength: toNumber(res.getHeader("content-length")) ?? initialContentLength,
+          // The RESPONSE's declared byte count only. This is a response-side
+          // field (it sits alongside `statusCode` / `responseTimeMs`, all
+          // computed at finalize time), so it must never fall back to the
+          // request's `Content-Length`: a chunked/streamed response carries no
+          // `Content-Length`, and reporting the uploaded request-body size there
+          // mislabels egress (a 5000-byte upload answered by a 2-byte chunked
+          // reply would log 5000) and would report bytes never sent on an abort.
+          // `toNumber` yields `undefined` for a missing/non-finite header, which
+          // is the honest value for a chunked/streamed/aborted response.
+          contentLength: toNumber(res.getHeader("content-length")),
           ip: req.ip ?? req.socket?.remoteAddress ?? undefined,
           userAgent: lookupHeader("user-agent"),
           requestId: lookupHeader("x-request-id"),

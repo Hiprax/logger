@@ -635,6 +635,8 @@ When `includeHttpContext` is enabled, the structured `RequestLogEntry` is attach
 }
 ```
 
+`contentLength` is the **response's** declared byte count, taken from the response `Content-Length` header. It is a response-side figure only: a chunked or streamed response carries no `Content-Length`, and an aborted request sends nothing, so `contentLength` is `undefined` in both cases rather than reporting the uploaded request-body size. If you need the request body size, read it from `requestHeaders["content-length"]` (enable `includeRequestHeaders`).
+
 ### Printf tokens and metadata (no string interpolation)
 
 This package composes **no** `winston.format.splat()`, matching winston's own default format. Two consequences follow, and the second is a deliberate trade:

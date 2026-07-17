@@ -444,6 +444,15 @@ export interface RequestLogEntry {
   url: string;
   statusCode: number;
   responseTimeMs: number;
+  /**
+   * The RESPONSE's declared byte count, parsed from the response
+   * `Content-Length` header. This is a response-side field only — it is
+   * `undefined` for a chunked/streamed response (which carries no
+   * `Content-Length`) and for an aborted request (no bytes sent). It never
+   * falls back to the request's `Content-Length`; reporting the uploaded body
+   * size here would mislabel egress. If you need the request body size, read it
+   * from `requestHeaders["content-length"]` (enable `includeRequestHeaders`).
+   */
   contentLength?: number;
   ip?: string;
   userAgent?: string;

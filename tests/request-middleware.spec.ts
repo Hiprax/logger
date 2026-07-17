@@ -142,7 +142,52 @@ describe("createRequestLogger", () => {
     expect(payload.http.requestBody._originalLength).toBeGreaterThan(10);
     expect(payload.http.requestBody._preview.length).toBe(10);
     expect(payload.http.responseHeaders).toEqual({});
-    expect(payload.http.contentLength).toBe(77);
+    // `contentLength` is a RESPONSE-side field. This request carries a
+    // `content-length: 77` header but the response sets none, so the honest
+    // value is `undefined` — it must NOT fall back to the request's size.
+    expect(payload.http.contentLength).toBeUndefined();
+  });
+
+  it("reports contentLength from the response Content-Length header", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({ logger, includeHttpContext: true });
+
+    // Request carries its own (uploaded) content-length; the response declares a
+    // different one. `contentLength` must reflect the RESPONSE value.
+    const { res } = runMiddleware(middleware, { headers: { "content-length": "5000" } });
+    res.setHeader("content-length", "512");
+    res.emit("finish");
+
+    expect(log.mock.calls[0][0].http.contentLength).toBe(512);
+  });
+
+  it("reports no contentLength for a chunked response even with a request body", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({ logger, includeHttpContext: true });
+
+    // A 5000-byte upload answered by a chunked 2-byte response (no response
+    // Content-Length). The old fallback logged `contentLength: 5000`; the honest
+    // value is `undefined`.
+    const { res } = runMiddleware(middleware, { headers: { "content-length": "5000" } });
+    res.statusCode = 200;
+    res.emit("finish");
+
+    expect(log.mock.calls[0][0].http.contentLength).toBeUndefined();
+  });
+
+  it("reports no phantom contentLength for an aborted request", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({ logger, includeHttpContext: true });
+
+    // The request declared 5000 bytes but the connection aborted before the
+    // response wrote a Content-Length. Nothing was sent, so no size is reported.
+    const { res } = runMiddleware(middleware, { headers: { "content-length": "5000" } });
+    res.statusCode = 503;
+    res.emit("close");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.event).toBe("aborted");
+    expect(payload.http.contentLength).toBeUndefined();
   });
 
   it("supports request header allowlists", () => {
