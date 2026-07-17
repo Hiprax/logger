@@ -108,10 +108,10 @@ export const REDACTED = "[REDACTED]";
  * deep rebuild. `__proto__` triggers the prototype setter (corrupts the local
  * object's prototype chain); `constructor` and `prototype` are likewise
  * structural fields whose assignment can break instanceof checks and downstream
- * key enumeration. Centralized here so both this module and the middleware
- * `redactEntryPath` walker share a single deny-list.
+ * key enumeration. Centralized here so both this module and `logger.ts`'s
+ * `buildMetaRedactor` rebuild loop share a single deny-list.
  */
-const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+export const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 /**
  * Maximum nesting depth `redactValue` will walk before substituting

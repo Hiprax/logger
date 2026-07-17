@@ -4,7 +4,7 @@ import winston from "winston";
 import DailyRotateFile from "winston-daily-rotate-file";
 import moment from "moment-timezone";
 import { InvalidTimezoneError, LoggerOptionError } from "./errors";
-import { redactValue } from "./redact";
+import { redactValue, FORBIDDEN_KEYS } from "./redact";
 import { registerCrashCapture, deregisterCrashCapture, resetCrashCapture } from "./crash-capture";
 import { acquireSharedGlobalFile, resetSharedFileRegistry } from "./shared-file-transport";
 import type { LoggerOptions, TimestampContext, LogLevel, RotationStrategy } from "./types";
@@ -586,9 +586,45 @@ const buildTimestampCapture = (clock: () => Date) =>
  * untouched; every other own key is treated as caller-supplied metadata and
  * walked recursively to mask matched values.
  *
+ * **It builds and returns a FRESH info object; it must never assign back onto
+ * `info`.** On winston's single-object log form (`logger.info({ message,
+ * ...meta })`, `create-logger.js:76-82`) and its 2-arg object form
+ * (`logger.log("info", meta)`, `logger.js:252-256`), the info object winston
+ * hands the format chain **is the caller's own object, uncloned**. Assigning
+ * `info[key] = "[REDACTED]"` there does not redact a log line — it overwrites
+ * live application state, so `logger.info(creds)` would leave `creds.password`
+ * holding the literal string `"[REDACTED]"` and the real secret gone. Code that
+ * logs a DTO and then persists or returns it would write the placeholder to its
+ * database or HTTP response. Returning a copy is safe because a winston format
+ * may return a new object — `Logger._transform` pushes whatever `transform`
+ * returns, and `format.combine` threads it to the next format. `formatMessage`
+ * (the pretty-mode counterpart) has always been non-mutating; this keeps the
+ * two modes honest about the same contract.
+ *
+ * The copy is deliberately a PLAIN object: `errors({ stack: true })` runs ahead
+ * of this format in both chains and has already flattened any `Error` info to a
+ * plain object, and the only consumer downstream is `winston.format.json()`, so
+ * a plain rebuild is output-equivalent. This mirrors `redactValue`'s own
+ * plain-rebuild rule for data-bearing instances.
+ *
+ * Note the boundary: winston itself still writes `level` / `[LEVEL]` onto the
+ * caller's object before any format runs, and `timestamp` is added by
+ * `buildTimestampCapture` upstream. Those are additive, engine-owned fields
+ * this package does not control. What this format guarantees is that no
+ * caller-supplied VALUE is destroyed.
+ *
+ * Because the rebuild targets a fresh object, own keys named `__proto__` /
+ * `constructor` / `prototype` (`FORBIDDEN_KEYS`) are skipped rather than
+ * assigned — the same prototype-pollution guard `redactValue` applies to every
+ * nested rebuild. This matters specifically BECAUSE we rebuild instead of
+ * mutating in place: `next["__proto__"] = …` on a plain `{}` would invoke
+ * `Object.prototype`'s `__proto__` setter, silently dropping the key and
+ * repointing `next`'s prototype; the old in-place code was immune only because
+ * `info` already owned that key.
+ *
  * When `maskMetaKeys` is empty (no redaction configured) the format is a
  * no-op pass-through — winston's pipeline still sees the original `info`
- * shape with zero allocation in the hot path.
+ * object by identity, with zero allocation in the hot path.
  */
 const RESERVED_INFO_KEYS = new Set(["level", "message", "timestamp", "stack"]);
 
@@ -616,25 +652,39 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
       return info;
     }
     let seen = new WeakSet<object>();
-    const ownKeys = Object.keys(info);
-    for (const key of ownKeys) {
-      if (RESERVED_INFO_KEYS.has(key)) {
+    const source = info as unknown as Record<string, unknown>;
+    const next: Record<string | symbol, unknown> = {};
+    for (const key of Object.keys(info)) {
+      if (FORBIDDEN_KEYS.has(key)) {
+        // Prototype-pollution vectors are NEVER copied onto the fresh object —
+        // the same deny-list `redactValue` applies to every nested rebuild
+        // (`src/redact.ts`). This is load-bearing precisely BECAUSE we now
+        // rebuild instead of mutating in place: a caller-supplied own key named
+        // `"__proto__"` (trivially reachable via `logger.info(JSON.parse(body))`,
+        // where `JSON.parse` mints a genuine own enumerable `"__proto__"` data
+        // property) would make `next["__proto__"] = …` invoke `Object.prototype`'s
+        // `__proto__` setter on the fresh `{}` — silently dropping the key from
+        // the emitted line AND repointing `next`'s prototype for the rest of the
+        // pipeline. The old mutate-in-place code was immune only because `info`
+        // already OWNED that key (an own data property shadows the accessor).
         continue;
       }
-      const original = (info as Record<string, unknown>)[key];
+      if (RESERVED_INFO_KEYS.has(key)) {
+        next[key] = source[key];
+        continue;
+      }
       if (maskMetaKeys.has(key.toLowerCase())) {
-        (info as Record<string, unknown>)[key] = "[REDACTED]";
+        // Written without reading `source[key]` first: the value is discarded
+        // either way, and not reading it means a throwing getter on a MASKED
+        // key cannot take the log line down.
+        next[key] = "[REDACTED]";
         continue;
       }
       try {
-        (info as Record<string, unknown>)[key] = redactValue(
-          original,
-          maskMetaKeys as Set<string>,
-          seen,
-        );
+        next[key] = redactValue(source[key], maskMetaKeys as Set<string>, seen);
       } catch {
         // Fail closed on this key only — the rest of the line still renders.
-        (info as Record<string, unknown>)[key] = REDACTION_FAILED;
+        next[key] = REDACTION_FAILED;
         // The throw unwound out of the walk without running the `seen.delete`
         // that each branch performs on its way out, so the abandoned subtree's
         // objects are still recorded as "on the active path". Reusing that
@@ -643,7 +693,16 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
         seen = new WeakSet<object>();
       }
     }
-    return info;
+    // Carry every Symbol-keyed slot across by reference. Winston's engine
+    // bookkeeping lives here — `LEVEL` is set by `Logger._transform` BEFORE the
+    // format chain runs and is what `winston-transport`'s `_write` gates on,
+    // `SPLAT` carries the interpolation arguments, and `MESSAGE` holds any
+    // already-rendered output. Dropping them silently breaks downstream
+    // serialization and transport level-filtering.
+    for (const slot of Object.getOwnPropertySymbols(info)) {
+      next[slot] = (source as unknown as Record<symbol, unknown>)[slot];
+    }
+    return next as unknown as winston.Logform.TransformableInfo;
   })();
 
 /**

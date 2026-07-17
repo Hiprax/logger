@@ -4269,6 +4269,314 @@ describe("createLogger", () => {
       expect(parsed.later).toEqual({ password: "[REDACTED]", keep: "visible" });
       expect(parsed.later).not.toBe("[Circular]");
     });
+
+    // -----------------------------------------------------------------------
+    // Phase 4 — the redaction must not mutate the caller's own object.
+    //
+    // Winston hands the format chain the CALLER'S object, uncloned, on three
+    // reachable log forms (verified against the installed winston):
+    //   - `logger.info(obj)` with a truthy `obj.message`
+    //     (create-logger.js:76 — `const info = msg && msg.message && msg || ...`)
+    //   - `logger.log("info", obj)` (logger.js:252 — `msg[LEVEL] = msg.level = level`)
+    //   - `logger.info("msg", meta)` — here winston builds a fresh info and
+    //     merges `meta`'s keys onto it, so the top level is safe, but the
+    //     NESTED objects are still shared by reference with the caller.
+    // A format that assigns `info[key] = "[REDACTED]"` therefore overwrites
+    // live application state rather than a log line. `buildMetaRedactor`
+    // returns a fresh info object instead; `formatMessage` (pretty mode) has
+    // always been non-mutating and is pinned here against regression.
+    //
+    // Note what is deliberately NOT asserted: winston itself writes `level`
+    // (and the `LEVEL` Symbol) onto the caller's object before any format
+    // runs, and `buildTimestampCapture` adds `timestamp`. Those are additive,
+    // engine-owned fields outside this package's control. The contract under
+    // test is that no caller-supplied VALUE is destroyed.
+    // -----------------------------------------------------------------------
+
+    /** Builds the payload used by every mutation-safety case below. */
+    const buildCreds = (): Record<string, any> => ({
+      message: "connecting",
+      host: "db",
+      password: "hunter2",
+      nested: { password: "nested-secret", keep: "visible" },
+    });
+
+    /**
+     * Asserts the caller's object still holds every original value, and that
+     * the nested object is still the SAME object it started as (a redactor
+     * that swapped in a redacted copy would leave the original intact but
+     * unreachable — the same data loss, one level down).
+     */
+    const expectCredsIntact = (creds: Record<string, any>, nested: object): void => {
+      expect(creds.password).toBe("hunter2");
+      expect(creds.host).toBe("db");
+      expect(creds.message).toBe("connecting");
+      expect(creds.nested).toBe(nested);
+      expect(creds.nested.password).toBe("nested-secret");
+      expect(creds.nested.keep).toBe("visible");
+    };
+
+    /**
+     * Renders one log line through a Stream transport in the requested format
+     * mode with `maskMetaKeys: ["password"]`, letting the caller drive the
+     * exact winston log form under test.
+     */
+    const renderWithMask = (
+      moduleName: string,
+      format: "json" | "pretty",
+      emit: (logger: winston.Logger) => void,
+    ): string => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format,
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      emit(logger);
+      teardownLogger(logger);
+      return chunks.join("");
+    };
+
+    describe.each([["json"], ["pretty"]] as const)("format: %s", (format) => {
+      it("does not mutate the caller's object on the single-object form", () => {
+        const creds = buildCreds();
+        const nested = creds.nested;
+
+        const rendered = renderWithMask(`mask-mutate-single-${format}`, format, (logger) => {
+          logger.info(creds);
+        });
+
+        // The caller's live object is untouched...
+        expectCredsIntact(creds, nested);
+        // ...while the emitted line is fully redacted at both levels.
+        expect(rendered).not.toContain("hunter2");
+        expect(rendered).not.toContain("nested-secret");
+        expect(rendered).toContain("[REDACTED]");
+        expect(rendered).toContain("db");
+        expect(rendered).toContain("visible");
+      });
+
+      it("does not mutate the caller's object on the 2-arg object form", () => {
+        const creds = buildCreds();
+        const nested = creds.nested;
+
+        const rendered = renderWithMask(`mask-mutate-2arg-${format}`, format, (logger) => {
+          logger.info("Connecting", creds);
+        });
+
+        expectCredsIntact(creds, nested);
+        expect(rendered).not.toContain("hunter2");
+        expect(rendered).not.toContain("nested-secret");
+        expect(rendered).toContain("[REDACTED]");
+      });
+
+      it('does not mutate the caller\'s object on logger.log("info", obj)', () => {
+        const creds = buildCreds();
+        const nested = creds.nested;
+
+        const rendered = renderWithMask(`mask-mutate-log-${format}`, format, (logger) => {
+          logger.log("info", creds);
+        });
+
+        expectCredsIntact(creds, nested);
+        expect(rendered).not.toContain("hunter2");
+        expect(rendered).not.toContain("nested-secret");
+        expect(rendered).toContain("[REDACTED]");
+      });
+    });
+
+    it("buildMetaRedactor returns a fresh object and leaves the input untouched", () => {
+      // Unit-level counterpart to the end-to-end cases above: the redactor's
+      // OWN contract is "read `info`, return a new one".
+      const formatter = __loggerInternals.buildMetaRedactor(new Set(["password"]));
+      const input: Record<string, unknown> = {
+        level: "info",
+        message: "connecting",
+        password: "hunter2",
+        nested: { password: "nested-secret" },
+      };
+
+      const transformed = formatter.transform(input as any) as Record<string, unknown>;
+
+      expect(transformed).not.toBe(input);
+      expect(input.password).toBe("hunter2");
+      expect(input.nested).toEqual({ password: "nested-secret" });
+      expect(transformed.password).toBe("[REDACTED]");
+      expect(transformed.nested).toEqual({ password: "[REDACTED]" });
+      // Reserved fields ride across onto the copy.
+      expect(transformed.level).toBe("info");
+      expect(transformed.message).toBe("connecting");
+    });
+
+    it("buildMetaRedactor carries Symbol slots across to the returned object", () => {
+      // `LEVEL` is written by `Logger._transform` BEFORE the format chain runs
+      // and is what `winston-transport`'s `_write` gates the level filter on;
+      // `SPLAT` carries interpolation args. Dropping either while returning a
+      // copy would silently break downstream serialization / filtering, so the
+      // copy must carry every Symbol-keyed slot.
+      const LEVEL = Symbol.for("level");
+      const SPLAT = Symbol.for("splat");
+      const formatter = __loggerInternals.buildMetaRedactor(new Set(["password"]));
+      const input: Record<string | symbol, unknown> = {
+        level: "info",
+        message: "connecting",
+        password: "hunter2",
+        [LEVEL]: "info",
+        [SPLAT]: ["a", 1],
+      };
+
+      const transformed = formatter.transform(input as any) as unknown as Record<
+        string | symbol,
+        unknown
+      >;
+
+      expect(transformed).not.toBe(input);
+      expect(transformed[LEVEL]).toBe("info");
+      expect(transformed[SPLAT]).toEqual(["a", 1]);
+    });
+
+    it("buildMetaRedactor returns the input by identity on the empty-mask fast path", () => {
+      // The zero-allocation fast path is load-bearing for the default config:
+      // with no `maskMetaKeys` the redactor must not copy the info at all.
+      const formatter = __loggerInternals.buildMetaRedactor(new Set<string>());
+      const input: Record<string, unknown> = { level: "info", message: "hi", password: "hunter2" };
+
+      expect(formatter.transform(input as any)).toBe(input);
+      expect(input.password).toBe("hunter2");
+    });
+
+    it("a masked key whose getter throws is redacted without taking the line down", () => {
+      // The masked value is discarded either way, so the redactor never reads
+      // it — a throwing getter on a masked key cannot reach the caller.
+      const creds: Record<string, unknown> = { message: "connecting", host: "db" };
+      Object.defineProperty(creds, "password", {
+        enumerable: true,
+        get() {
+          throw new Error("hostile getter");
+        },
+      });
+
+      let rendered = "";
+      expect(() => {
+        rendered = renderWithMask("mask-hostile-getter", "json", (logger) => {
+          logger.info(creds);
+        });
+      }).not.toThrow();
+
+      const parsed = JSON.parse(rendered.trim()) as Record<string, unknown>;
+      expect(parsed.password).toBe("[REDACTED]");
+      expect(parsed.host).toBe("db");
+    });
+
+    it("an accessor-only own key whose nested value throws fails closed without a set-on-getter TypeError", () => {
+      // Checklist 4.3, the second required accessor-only case: a NON-masked own
+      // property defined with only a getter (no setter), whose value carries a
+      // nested throwing getter so `redactValue` throws and the redactor takes
+      // its fail-closed branch. In the pre-fix code that branch wrote
+      // `info[key] = "[RedactionFailed]"` back onto the caller's own object —
+      // which, for a getter-only property, raises
+      // `TypeError: Cannot set property … which has only a getter` in strict
+      // mode. That TypeError escaped the format and was thrown out of the
+      // application's `logger.info(...)`. Returning a fresh object removes the
+      // write entirely, so the line renders and the caller never sees the throw.
+      const payload: Record<string, unknown> = { message: "connecting", host: "db" };
+      Object.defineProperty(payload, "detail", {
+        enumerable: true,
+        // Getter-only: assigning `payload.detail = …` would throw. Each read
+        // yields an object whose non-masked `token` getter throws, so the
+        // deep walk raises before it can finish this key.
+        get() {
+          const inner: Record<string, unknown> = {};
+          Object.defineProperty(inner, "token", {
+            enumerable: true,
+            get() {
+              throw new Error("nested boom");
+            },
+          });
+          return inner;
+        },
+      });
+
+      let rendered = "";
+      expect(() => {
+        rendered = renderWithMask("mask-accessor-nested-throw", "json", (logger) => {
+          logger.info(payload);
+        });
+      }).not.toThrow();
+
+      const parsed = JSON.parse(rendered.trim()) as Record<string, unknown>;
+      // The hostile key fails closed to the marker; every sibling still renders.
+      expect(parsed.detail).toBe("[RedactionFailed]");
+      expect(parsed.host).toBe("db");
+      expect(parsed.message).toBe("connecting");
+    });
+
+    // -----------------------------------------------------------------------
+    // Prototype-pollution hardening for the fresh-object rebuild.
+    //
+    // Returning a FRESH object (Phase 4) means a caller-supplied own key named
+    // "__proto__" is no longer written onto an object that already owns it.
+    // `next["__proto__"] = …` on a plain `{}` invokes `Object.prototype`'s
+    // `__proto__` SETTER — silently dropping the key from the emitted line and
+    // repointing `next`'s prototype for the rest of the pipeline. Such a key is
+    // trivially reachable via `logger.info(JSON.parse(body))`, where JSON.parse
+    // mints a genuine own enumerable "__proto__" data property. `buildMetaRedactor`
+    // therefore skips FORBIDDEN_KEYS, exactly as `redactValue` does on every
+    // nested rebuild.
+    // -----------------------------------------------------------------------
+
+    it("buildMetaRedactor drops a __proto__ metadata key without corrupting the returned object", () => {
+      const formatter = __loggerInternals.buildMetaRedactor(new Set(["password"]));
+      // JSON.parse creates a real own enumerable "__proto__" data property.
+      const input = JSON.parse(
+        '{"level":"info","message":"hi","__proto__":{"password":"leak"},"keep":"visible"}',
+      ) as Record<string, unknown>;
+      expect(Object.prototype.hasOwnProperty.call(input, "__proto__")).toBe(true);
+
+      const out = formatter.transform(input as any) as unknown as Record<string, unknown>;
+
+      // The prototype-pollution key is skipped entirely...
+      expect(Object.prototype.hasOwnProperty.call(out, "__proto__")).toBe(false);
+      // ...the fresh object's prototype is untouched (not repointed by a setter)...
+      expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+      // ...and every legitimate key still rides across.
+      expect(out.message).toBe("hi");
+      expect(out.keep).toBe("visible");
+    });
+
+    it("logs a __proto__-bearing payload cleanly without breaking the json line", () => {
+      // Integration smoke test: a payload carrying an own "__proto__" key must
+      // not throw, must still render its legitimate siblings, and must not
+      // surface the injected object as a data field. The DISCRIMINATING guard
+      // for the prototype skip is the unit test above (it asserts the returned
+      // object's prototype is untouched) — a value planted on an object's
+      // prototype is never emitted by `JSON.stringify`, so the difference the
+      // skip makes is not observable in the rendered line, only on the object.
+      const payload = JSON.parse(
+        '{"message":"connecting","__proto__":{"role":"admin"},"keep":"visible"}',
+      ) as Record<string, unknown>;
+
+      let rendered = "";
+      expect(() => {
+        rendered = renderWithMask("mask-proto-key", "json", (logger) => {
+          logger.info(payload);
+        });
+      }).not.toThrow();
+
+      const parsed = JSON.parse(rendered.trim()) as Record<string, unknown>;
+      expect(parsed.keep).toBe("visible");
+      expect(parsed.message).toBe("connecting");
+      // The injected key is not surfaced as a data field, and its contents
+      // never leak into the line.
+      expect(Object.prototype.hasOwnProperty.call(parsed, "__proto__")).toBe(false);
+      expect(rendered).not.toContain("admin");
+    });
   });
 
   // ---------------------------------------------------------------------------
