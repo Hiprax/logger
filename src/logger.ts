@@ -662,13 +662,87 @@ const resolveColorizeFlags = (
  * Builds a Winston `format.timestamp()` formatter that captures the event time
  * via the supplied `clock` (or the live `Date` constructor when no clock is
  * provided) and writes the canonical `TIMESTAMP_FORMAT`-formatted UTC string
- * to `info.timestamp`. Capturing here — at the moment `logger.info()` runs
- * and pushes the entry through the pipeline — guarantees the rendered string
- * reflects the call time, NOT the format/flush time.
+ * to `timestamp`. Capturing here — at the moment `logger.info()` runs and
+ * pushes the entry through the pipeline — guarantees the rendered string
+ * reflects the call time, NOT the format/flush time. Formats run synchronously
+ * inside `Logger._transform`, so this fires exactly once per log call and its
+ * position within the logger-level chain does not shift the captured instant.
+ *
+ * **Copy-on-write for a PLAIN-object info: it returns a fresh object and never
+ * assigns onto the caller's.** On winston's single-object log form
+ * (`logger.info({ ... })`, `create-logger.js:78`) and its 2-arg-object form
+ * (`logger.log("info", obj)`, `logger.js:246`) the info winston hands the chain
+ * IS the caller's own object, uncloned — so an in-place `info.timestamp = …`
+ * destroys a caller-supplied `timestamp` field on live application state
+ * (`logger.info({ message, id, timestamp })` would overwrite `event.timestamp`).
+ * The rebuild leaves the caller's object untouched while writing the captured
+ * value into the log line. `timestamp` is a reserved slot rendered as the log's
+ * own `UTC:` line (and re-parsed for every `extraTimezones` mirror), so honoring
+ * a caller-supplied value is not an option: the log always reflects the captured
+ * instant, never a caller-forged one.
+ *
+ * **Own properties are transplanted by DESCRIPTOR, not by value (getter-safe).**
+ * A plain-object info can carry accessor metadata — `logger.info({ get password()
+ * { … } })` — and a getter is caller code that may throw or carry side effects. A
+ * value spread (`{ ...info }`) would INVOKE every getter here, letting a throwing
+ * getter escape into `logger.log()` and double-firing a side-effecting one when
+ * the redactor reads it downstream. Copying the descriptor keeps the accessor
+ * lazy, so this capture performs zero value reads — exactly the discipline
+ * `buildModuleFieldInjector` follows. `timestamp` is skipped in the copy and
+ * written fresh as a plain data property, so a caller's own `timestamp` accessor
+ * is neither invoked nor preserved (it is always overwritten anyway). A
+ * caller-supplied own `__proto__` key is carried via `Object.defineProperty`,
+ * which defines an own data property WITHOUT invoking the prototype setter — so
+ * this is not a prototype-pollution vector (the copy's prototype stays
+ * `Object.prototype`) and it matches the historical in-place behavior, which
+ * likewise kept such a key; downstream rebuilds still skip `FORBIDDEN_KEYS`.
+ *
+ * **Non-plain infos are written in place, matching the historical behavior.** An
+ * ARRAY info (`logger.log("info", ["a","b"])`) and a class instance / `toJSON`
+ * DTO (`logger.info(dto)`) must keep their exact shape and prototype for the
+ * downstream module-injector, redactor, and `winston.format.json()` serializer,
+ * which deliberately preserve arrays as arrays and resolve a `toJSON` on the
+ * value — a plain rebuild would strip the prototype (losing the `toJSON`) and
+ * turn an array into an index-keyed object. Those payloads are not the proven
+ * caller-mutation case (a plain `{ message, timestamp, ... }` object whose
+ * `timestamp` gets destroyed); at most an in-place write adds a stray `timestamp`
+ * a `toJSON`/array serialization ignores. The branch is on the info's prototype
+ * being `Object.prototype` (or `null`), i.e. a genuine plain bag.
+ *
+ * **This is why it is sequenced AFTER `winston.format.errors({ stack: true })`
+ * in both chains.** `errors()` flattens a logged `Error` into a fresh plain
+ * object whose `message` / `stack` are OWN ENUMERABLE (`logform/errors.js:15`),
+ * so by the time this runs a logged `Error` is already a plain object taking the
+ * copy-on-write branch — the copy is of the engine-owned `errors()` result, not
+ * the caller's `Error`, so the original `Error` (including any own enumerable
+ * `timestamp` `errors()` copied across) is left intact. Placed BEFORE `errors()`
+ * (the historical order) a rebuild would instead see the raw `Error` — whose
+ * `message` / `stack` are own NON-enumerable — and drop them, defeating
+ * `errors.js`'s `instanceof Error` gate. Ordering it after `errors()` removes
+ * the need for any `instanceof Error` special-case here. The only remaining
+ * writes onto the caller's object are winston's own `level` / `[LEVEL]` (and
+ * `defaultMeta`), assigned before ANY format runs — unavoidable and matching
+ * bare winston.
  */
 const buildTimestampCapture = (clock: () => Date) =>
   winston.format((info) => {
-    info.timestamp = moment.utc(clock()).format(TIMESTAMP_FORMAT);
+    const timestamp = moment.utc(clock()).format(TIMESTAMP_FORMAT);
+    const proto = Object.getPrototypeOf(info);
+    if (proto === Object.prototype || proto === null) {
+      const next: Record<string | symbol, unknown> = {};
+      for (const key of Reflect.ownKeys(info)) {
+        if (key === "timestamp") {
+          continue;
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(info, key);
+        if (descriptor) {
+          Object.defineProperty(next, key, descriptor);
+        }
+      }
+      next.timestamp = timestamp;
+      return next as unknown as winston.Logform.TransformableInfo;
+    }
+    info.timestamp = timestamp;
     return info;
   })();
 
@@ -702,37 +776,29 @@ const buildTimestampCapture = (clock: () => Date) =>
  * a plain rebuild is output-equivalent. This mirrors `redactValue`'s own
  * plain-rebuild rule for data-bearing instances.
  *
- * **Boundary — two RESERVED slots are written on the caller's object, and both
- * sit outside this format's guarantee.** Neither is "additive" (each overwrites
- * a caller-owned key of that name) and only the first is engine-owned:
- * - `level` / the `LEVEL` Symbol — written by WINSTON itself, onto the caller's
- *   object, before any format runs (`create-logger.js:79`, `logger.js:237`).
- * - `timestamp` — written by THIS package's own `buildTimestampCapture`, the
- *   first format in both chains. It unconditionally overwrites a caller-supplied
- *   `timestamp` in place. That is deliberate and is exact parity with
- *   `winston.format.timestamp({ format })`, whose `opts.format` branch
- *   (`logform/timestamp.js:15-19`) performs the identical in-place overwrite —
- *   logform's `if (!info.timestamp)` preservation at `:21` applies only to the
- *   no-`format` configuration this package does not use. Preserving a caller's
- *   value is not an option: `timestamp` is a `RESERVED_INFO_KEYS` member that
- *   `formatMessage` renders as the log's own `UTC:` line and re-parses to derive
- *   every `extraTimezones` mirror, so honoring it would let caller data forge
- *   the log's own timestamp column.
+ * **Boundary — the `level` reserved slot is written on the caller's object,
+ * outside this format's guarantee.** `level` / the `LEVEL` Symbol is written by
+ * WINSTON itself, onto the caller's object, before any format runs
+ * (`create-logger.js:79`, `logger.js:237`) — engine-owned and unavoidable. The
+ * `timestamp` slot is NO LONGER an in-place overwrite: `buildTimestampCapture`
+ * is copy-on-write (`{ ...info, timestamp }`) and sequenced AFTER
+ * `errors({ stack: true })`, so a caller-supplied `timestamp` on live state is
+ * left intact while the log still renders the captured instant (see that
+ * helper's JSDoc). The rendered value is still the captured one, not the
+ * caller's: `timestamp` is a `RESERVED_INFO_KEYS` member that `formatMessage`
+ * renders as the log's own `UTC:` line and re-parses for every `extraTimezones`
+ * mirror, so honoring a caller-forged value was never an option — the fix is
+ * simply to stop mutating the caller's object to achieve that.
  *
- * So the guarantee is narrower than "the caller's object is untouched": no
- * caller-supplied METADATA value is destroyed — this format never writes
- * `[REDACTED]`, `REDACTION_FAILED`, or a rebuilt copy onto the caller's object.
- * The two reserved slots above are overwritten in place, matching bare winston.
+ * So the guarantee is: no caller-supplied METADATA value is destroyed — this
+ * format never writes `[REDACTED]`, `REDACTION_FAILED`, or a rebuilt copy onto
+ * the caller's object, and neither does the timestamp capture. Only winston's
+ * own `level` / `[LEVEL]` write lands on caller state, matching bare winston.
  *
- * `buildTimestampCapture` is deliberately NOT made copy-on-write to close its
- * overwrite, and this format's rebuild is not a precedent for doing so: it runs
- * BEFORE `errors({ stack: true })`, so on `logger.error(new Error(...))` its
- * `info` IS the `Error` instance (`create-logger.js:78` — an `Error` has a
- * truthy `.message`). Returning `{ ...info }` there would drop `message` and
- * `stack` (own NON-enumerable on an `Error`) and defeat `errors.js:15`'s
- * `instanceof Error` gate, emitting a line with no message and no stack —
- * verified. This format can safely rebuild only because it runs AFTER `errors()`
- * has already flattened the `Error` into a plain object.
+ * This format can safely rebuild because it runs AFTER `errors()` has already
+ * flattened any logged `Error` into a plain object (`errors.js:15` returns a
+ * fresh copy whose `message` / `stack` are own ENUMERABLE); rebuilding a raw
+ * `Error` into a plain `{}` would instead drop those non-enumerable slots.
  *
  * Because the rebuild targets a fresh object, own keys named `__proto__` /
  * `constructor` / `prototype` (`FORBIDDEN_KEYS`) are skipped rather than
@@ -1092,6 +1158,64 @@ const safeStringify = (value: unknown, space?: number): string => {
   }
 };
 
+/**
+ * Registered `triple-beam` slot holding the already-rendered log line. It is the
+ * process-wide registered symbol `Symbol.for("message")` (see
+ * `triple-beam/index.js`, which winston / logform / winston-transport all key
+ * on), so referencing it via `Symbol.for(...)` is identical to importing
+ * `triple-beam`'s `MESSAGE` and avoids a runtime dependency on that undeclared
+ * transitive package.
+ */
+const MESSAGE_SLOT = Symbol.for("message");
+
+/** Marker key on a json sentinel line whose payload no serializer could express. */
+const JSON_SERIALIZE_FAILED = "_unserializable";
+
+/**
+ * Wraps `winston.format.json()` so a serializer throw degrades to a sentinel
+ * JSON line instead of propagating out of `logger.log()`.
+ *
+ * In `format: "json"` mode the line is serialized by winston's own `json()`
+ * (`logform/json.js`), which `JSON`-stringifies the whole info with no depth
+ * bound. A payload nested deeply enough to exhaust `JSON.stringify` itself
+ * (~8000 levels) throws `RangeError` from inside `json()`; winston's
+ * `Logger._transform` runs the logger-level format in `try { … } finally { … }`
+ * with NO catch, so the throw surfaces synchronously at the caller's own
+ * `logger.info(...)`. The pretty branch has no equivalent hole (its stringify
+ * sites route through {@link safeStringify}); this closes the json branch. The
+ * crash is unreachable whenever `maskMetaKeys` is configured — `buildMetaRedactor`
+ * bounds the graph to `MAX_REDACT_DEPTH` first — and only fires where
+ * `JSON.stringify` itself dies, so absent this wrap it is parity with bare
+ * winston rather than a package-added crash. A log call must never take the
+ * process down.
+ *
+ * The happy path delegates to the wrapped `json()` transform unchanged, so its
+ * output (and the `info[MESSAGE]` it writes) is byte-identical to the un-wrapped
+ * format. On a throw it writes a minimal, guaranteed-serializable sentinel into
+ * the SAME `info[MESSAGE]` slot `json()` uses — carrying the level, the captured
+ * timestamp, and the module label when present, plus an `_unserializable: true`
+ * marker. Because the json-mode Console transport carries no format and reads
+ * that same `info[MESSAGE]`, the file and console lines stay identical on the
+ * failure path too.
+ */
+const buildSafeJsonFormat = (): winston.Logform.Format => {
+  const jsonFormat = winston.format.json();
+  return winston.format((info) => {
+    try {
+      return jsonFormat.transform(info, jsonFormat.options);
+    } catch {
+      const source = info as unknown as Record<string | symbol, unknown>;
+      source[MESSAGE_SLOT] = safeStringify({
+        level: source.level,
+        timestamp: source.timestamp,
+        module: source[MODULE_FIELD],
+        [JSON_SERIALIZE_FAILED]: true,
+      });
+      return info;
+    }
+  })();
+};
+
 const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
   winston.format.printf((info) => {
     const {
@@ -1182,13 +1306,21 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
         typeof capturedTimestamp === "string"
           ? capturedTimestamp
           : moment.utc().format(TIMESTAMP_FORMAT);
-      // Parse the captured UTC string back into a moment instant so extra
-      // timezones reflect the SAME captured event time, not the live clock.
-      const capturedMoment = moment.utc(utcString, TIMESTAMP_FORMAT);
-      const additionalZones = ctx.timezones.map(
-        (zone) => `${zone}: ${capturedMoment.clone().tz(zone).format(TIMESTAMP_FORMAT)}`,
-      );
-      lines.push(`UTC: ${utcString}`, ...additionalZones.map((entry) => entry));
+      lines.push(`UTC: ${utcString}`);
+      // Only parse the captured UTC string back into a moment instant when there
+      // are extra timezones to render — the parse + format is on the order of
+      // ~9µs and the default config has no `extraTimezones`, so guarding it
+      // roughly halves a default pretty file log's cost (measured ~21µs → ~9µs
+      // per log on the development machine) with byte-identical output (the
+      // empty-timezones branch pushed only the `UTC:` line before too). The parse
+      // re-reads the CAPTURED string, not the live clock, so every mirror
+      // reflects the same event time.
+      if (ctx.timezones.length > 0) {
+        const capturedMoment = moment.utc(utcString, TIMESTAMP_FORMAT);
+        for (const zone of ctx.timezones) {
+          lines.push(`${zone}: ${capturedMoment.clone().tz(zone).format(TIMESTAMP_FORMAT)}`);
+        }
+      }
     }
 
     // When a level colorizer is supplied (console pipeline with
@@ -1642,78 +1774,66 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
       : undefined;
 
   let sharedFormat: winston.Logform.Format;
-  let consoleFormat: winston.Logform.Format;
+  // Undefined in json mode: the Console transport carries no per-transport
+  // format there and reuses the logger-level `sharedFormat`'s output (see below).
+  let consoleFormat: winston.Logform.Format | undefined;
 
   if (format === "json") {
     // JSON branch — emit one JSON object per log line for log shippers like
-    // Datadog, Loki, ELK, Splunk, Vector. The timestamp capture writes the
-    // canonical `info.timestamp` first; `errors({ stack: true })` resolves
-    // Error instances to `{ message, stack, ...rest }` so the stack survives
-    // the JSON serialization; `buildModuleFieldInjector` stamps the module
-    // label as a top-level `module` field so the shared `all-logs` file can
-    // attribute each line to its module (the pretty chain renders `(label)`
-    // instead); `buildMetaRedactor` runs the shared deep redaction over
-    // caller-supplied metadata BEFORE `json()` serializes — so secrets never
-    // reach the line. The injector runs AFTER `errors()` (so a logged Error is
-    // already a plain object) and BEFORE `buildMetaRedactor` (so the field is a
-    // normal key the redactor threads through).
+    // Datadog, Loki, ELK, Splunk, Vector. `errors({ stack: true })` resolves an
+    // Error instance to a plain `{ message, stack, ...rest }` FIRST so the stack
+    // survives JSON serialization and so `timestampCapture` (which follows) sees
+    // a plain object it can copy-on-write; `timestampCapture` writes the captured
+    // `timestamp` via the single `clock()` call without mutating the caller's
+    // object; `buildModuleFieldInjector` stamps the module label as a top-level
+    // `module` field so the shared `all-logs` file can attribute each line to its
+    // module (the pretty chain renders `(label)` instead); `buildMetaRedactor`
+    // runs the shared deep redaction over caller-supplied metadata BEFORE the
+    // line is serialized — so secrets never reach it. The injector runs AFTER
+    // `errors()` (so a logged Error is already a plain object) and BEFORE
+    // `buildMetaRedactor` (so the field is a normal key the redactor threads
+    // through). The final `buildSafeJsonFormat()` is `winston.format.json()`
+    // wrapped so a serializer throw (a ~8000-deep payload that exhausts
+    // `JSON.stringify` itself) degrades to a sentinel line instead of
+    // propagating out of `logger.log()`.
     //
-    // KNOWN BOUNDARY: `json()` is winston's own serializer and is not wrapped,
-    // so a payload nested deeply enough to exhaust `JSON.stringify` itself
-    // (~8000 levels) still throws `RangeError` out of `logger.log()` here. It
-    // is unreachable whenever `maskMetaKeys` is configured — `buildMetaRedactor`
-    // bounds the graph to `MAX_REDACT_DEPTH` first — and only fires where the
-    // data is genuinely un-JSON-able, matching bare winston rather than adding
-    // a crash of our own. The pretty branch has no equivalent hole: its
-    // stringify sites all route through `safeStringify`.
-    //
-    // The Console transport receives a SEPARATE format chain that intentionally
-    // omits `timestampCapture`. Winston applies the logger-level `sharedFormat`
-    // first (writing `info.timestamp` via the single `clock()` call), then
-    // pipes a shallow clone of the transformed info to each transport's own
-    // format. If the Console transport's format also included `timestampCapture`,
-    // `clock()` would fire a second time and overwrite `info.timestamp` with a
-    // new value — making the console JSON timestamp diverge from the file JSON
-    // timestamp. Omitting it here means `json()` serializes the timestamp that
-    // was already captured at log-call time, keeping all outputs identical.
-    // The module-field injector lives ONLY on the logger-level `sharedFormat`,
-    // NOT on the Console transport's own chain. Winston runs `sharedFormat`
-    // first and then hands each transport a shallow clone (`Object.assign({},
-    // info)`, `winston-transport/modern.js:91`) of the result — and the injected
-    // `module` is an ordinary own enumerable string key, so the clone carries it
-    // into the console's own serialization for free. Adding a second injector to
-    // the console chain would instead REINTRODUCE a file/console divergence for a
-    // single-object `toJSON` DTO: `sharedFormat`'s injector correctly skips it
-    // (it still carries its `toJSON`), but the clone the console sees has already
-    // lost that `toJSON` (a shallow clone drops the prototype), so a console-side
-    // injector would no longer skip and would stamp a `module` the file line
-    // lacks. Injecting once, upstream, keeps the console and file lines identical.
+    // The Console transport carries NO per-transport format in json mode. Winston
+    // applies this logger-level `sharedFormat` first — which serializes the whole
+    // line into `info[MESSAGE]` — and `winston-transport`'s `_write` writes
+    // `info[MESSAGE]` directly for any transport without a format
+    // (`modern.js`: `if (info && !this.format) return this.log(info)`). So the
+    // Console line is the SAME serialized string the file transports emit:
+    // byte-identical (timestamp and `module` included), with the deep redaction
+    // walk and the full `json()` serialization run exactly ONCE per log rather
+    // than a second time on the console's own duplicate chain. It also makes the
+    // clock-once and console==file guarantees structural: there is no second
+    // format to re-read the clock or re-serialize, so the console cannot diverge
+    // from the file.
     sharedFormat = winston.format.combine(
-      timestampCapture,
       winston.format.errors({ stack: true }),
+      timestampCapture,
       buildModuleFieldInjector(label),
       buildMetaRedactor(maskMetaKeySet),
-      winston.format.json(),
+      buildSafeJsonFormat(),
     );
-    consoleFormat = winston.format.combine(
-      winston.format.errors({ stack: true }),
-      buildMetaRedactor(maskMetaKeySet),
-      winston.format.json(),
-    );
+    consoleFormat = undefined;
   } else {
     // Pretty branch — preserves the existing human-readable printf output
-    // for backward compatibility. The timestamp capture runs FIRST so
-    // `info.timestamp` is set at log-call time, before any subsequent
-    // formatter (errors, printf) can be deferred by back-pressured
-    // transports. The printf in `formatMessage` then prefers the captured
-    // `info.timestamp` over a live `moment.utc()` read.
+    // for backward compatibility. `errors({ stack: true })` runs FIRST so a
+    // logged Error is flattened to a plain object (with own-enumerable
+    // `message` / `stack`) before `timestampCapture` copy-on-writes it; the
+    // capture sets `info.timestamp` at log-call time via the single `clock()`
+    // call, and the printf in `formatMessage` prefers that captured value over a
+    // live `moment.utc()` read. All formats run synchronously in one
+    // `Logger._transform`, so ordering `errors()` ahead of the capture does not
+    // shift the captured instant.
     const fileFormat = formatMessage(ctx, {
       maskMetaKeys: maskMetaKeySet,
       escapeMessageNewlines,
     });
     sharedFormat = winston.format.combine(
-      timestampCapture,
       winston.format.errors({ stack: true }),
+      timestampCapture,
       fileFormat,
     );
     // `winston.format.colorize()` returns a Format-shaped object that ALSO
@@ -1774,6 +1894,12 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     registerTransport(
       new winston.transports.Console({
         level: consoleLevel,
+        // In pretty mode this is the console's own timestamp-free, colorized
+        // chain. In json mode it is `undefined`: the transport then has no
+        // format and `winston-transport`'s `_write` emits the logger-level
+        // `sharedFormat`'s already-serialized `info[MESSAGE]` verbatim — the same
+        // bytes the file transports write — so the console and file lines are
+        // identical and the deep redaction + `json()` serialization run once.
         format: consoleFormat,
       }),
     );

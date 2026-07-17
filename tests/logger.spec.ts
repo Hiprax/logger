@@ -8,6 +8,7 @@ import fc from "fast-check";
 import winston from "winston";
 import Transport from "winston-transport";
 import DailyRotateFile from "winston-daily-rotate-file";
+import moment from "moment-timezone";
 import {
   createLogger,
   createNoopLogger,
@@ -5304,9 +5305,11 @@ describe("createLogger", () => {
 
     it("honors a top-level toJSON on the CONSOLE too when a mask is configured", () => {
       // The eager resolve happens in the logger-level chain, so the withheld
-      // field never enters the rebuilt info at all — leaving nothing for the
-      // Console's own second serialization pass to re-expose. (Before the fix
-      // the console leaked `ssn` here as well.)
+      // field never enters the rebuilt info at all. Since Phase 16.1 the Console
+      // transport carries no format in json mode and simply emits the
+      // logger-level `sharedFormat`'s already-serialized `info[MESSAGE]`, so the
+      // console line is byte-identical to the file line. (Before the fix the
+      // console ran its own duplicate chain and leaked `ssn` here.)
       const consoleOut = captureConsole(() => {
         const logger = createLogger({
           moduleName: "tojson-console-mask",
@@ -5323,28 +5326,39 @@ describe("createLogger", () => {
       expect(consoleOut).toContain("user loaded");
     });
 
-    it("does NOT honor a top-level toJSON on the console with NO mask — pinned known boundary", () => {
-      // The one case that remains, and it is PRE-EXISTING (it predates the
-      // redactor rework and reproduces identically against the old code): with
-      // no `maskMetaKeys`, `buildMetaRedactor` is a zero-allocation identity
-      // pass, so the real DTO instance reaches the Console transport — which
-      // `winston-transport`'s `_write` hands `Object.assign({}, info)`, a
-      // shallow clone that cannot carry a prototype, so the console's own
-      // serializer never finds `toJSON`. Consequence of giving Console its own
-      // format chain, which Phase 16.1 already plans to drop; pinned here so the
-      // boundary is a decision on record and 16.1 gets a signal when it changes.
+    it("honors a top-level toJSON on the console with NO mask too (Phase 16.1 closed the console/file divergence)", () => {
+      // PRE-16.1 this was a pinned boundary: with no `maskMetaKeys`,
+      // `buildMetaRedactor` is a zero-allocation identity pass, so the real DTO
+      // instance reached the Console transport, which ran its OWN duplicate json
+      // chain over the shallow clone winston hands it (`Object.assign({}, info)`)
+      // — a clone that cannot carry a prototype, so the console's serializer
+      // never found `toJSON` and re-exposed the `ssn` the DTO withholds, diverging
+      // from the file line. Phase 16.1 dropped that duplicate chain: in json mode
+      // the Console transport carries no format and emits the logger-level
+      // `sharedFormat`'s already-serialized `info[MESSAGE]`, so console and file
+      // are byte-identical and the withheld field stays withheld on both.
+      let fileOut = "";
       const consoleOut = captureConsole(() => {
+        const stream = new PassThrough();
+        stream.on("data", (chunk) => {
+          fileOut += chunk.toString();
+        });
         const logger = createLogger({
           moduleName: "tojson-console-nomask",
+          includeConsole: true,
           includeFile: false,
           includeGlobalFile: false,
           format: "json",
+          additionalTransports: [new winston.transports.Stream({ stream })],
         });
         logger.info(new UserDto());
         teardownLogger(logger);
       });
 
-      expect(consoleOut).toContain("123-45-6789");
+      expect(consoleOut).not.toContain("123-45-6789");
+      expect(consoleOut).toContain("user loaded");
+      // The divergence is gone: the console line equals the file line exactly.
+      expect(consoleOut.trim()).toBe(fileOut.trim());
     });
 
     it("leaves an Error info unaffected (errors() already flattened it)", () => {
@@ -5366,16 +5380,21 @@ describe("createLogger", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Reserved-slot boundary — the documented limit of the mutation-safety
-  // guarantee above, pinned rather than left to an assumption in a comment.
+  // Reserved-slot boundary (Phase 16.5) — the documented limit of the
+  // mutation-safety guarantee above, pinned rather than left to a comment.
   //
-  // `level` and `timestamp` ARE overwritten in place on the caller's object.
-  // The guarantee is about caller-supplied METADATA values, not about those two
-  // reserved slots. These tests exist so the boundary is enforced and honest:
-  // if upstream winston ever stops behaving this way, the parity canary fails
-  // loudly and the deferral is reopened deliberately rather than by drift.
+  // Only `level` / `[LEVEL]` is now overwritten in place on the caller's object,
+  // and that write is WINSTON's own (`create-logger.js:79`), before any format
+  // runs — unavoidable. `timestamp` is NO LONGER an in-place overwrite: Phase
+  // 16.5 made `buildTimestampCapture` copy-on-write for a plain-object info and
+  // sequenced it after `errors({ stack: true })`, so a caller-supplied
+  // `timestamp` on live state is left intact while the log still renders the
+  // captured instant. The bare-winston canary below records the exact hazard
+  // that fix avoids — bare winston still destroys the caller's `timestamp` in
+  // place — so if a winston release ever changes that, the divergence is
+  // revisited on purpose rather than by drift.
   // ---------------------------------------------------------------------------
-  describe("reserved-slot boundary (level / timestamp are overwritten in place)", () => {
+  describe("reserved-slot boundary (level in place; timestamp copy-on-write)", () => {
     const renderTo = (
       moduleName: string,
       format: "json" | "pretty",
@@ -5398,36 +5417,54 @@ describe("createLogger", () => {
     };
 
     describe.each([["json"], ["pretty"]] as const)("format: %s", (format) => {
-      it("overwrites a caller-supplied timestamp in place while leaving other caller values intact", () => {
+      it("leaves a caller-supplied timestamp intact (copy-on-write) while rendering the captured instant", () => {
+        // Branch: plain object WITH an own `timestamp`. The proven Phase 16.5
+        // defect — `logger.info({ message, timestamp, id })` used to overwrite
+        // `event.timestamp` on live state. Copy-on-write leaves it untouched.
         const event = {
           message: "webhook received",
           timestamp: "2024-01-01T00:00:00Z",
           id: 7,
         };
 
-        renderTo(`reserved-ts-${format}`, format, (logger) => {
+        const rendered = renderTo(`reserved-ts-${format}`, format, (logger) => {
           logger.info(event);
         });
 
-        // The reserved slot IS overwritten — this is the boundary, not a bug.
-        expect(event.timestamp).not.toBe("2024-01-01T00:00:00Z");
-        expect(event.timestamp).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
-        // ...and the actual Phase 4 contract still holds around it: the
-        // caller's non-reserved metadata value is untouched.
+        // The caller's object is NOT mutated.
+        expect(event.timestamp).toBe("2024-01-01T00:00:00Z");
         expect(event.id).toBe(7);
         expect(event.message).toBe("webhook received");
+        // ...but the log line still renders the CAPTURED instant, never the
+        // caller-forged value (which does not appear anywhere in the line).
+        expect(rendered).not.toContain("2024-01-01T00:00:00Z");
+        expect(rendered).toMatch(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
       });
 
-      it("still renders an Error's message and stack (guards against a copy-on-write timestampCapture)", () => {
-        // The highest-value test in this suite. `buildTimestampCapture` runs
-        // BEFORE `errors({ stack: true })`, so on this call its `info` IS the
-        // Error instance (`create-logger.js:78` — an Error has a truthy
-        // `.message`). "Fixing" the timestamp overwrite by returning
-        // `{ ...info }` would drop `message`/`stack` (own NON-enumerable on an
-        // Error) and defeat `errors.js:15`'s `instanceof Error` gate, emitting
-        // a line with neither — verified: the whole payload collapsed to
-        // `{"level":"error","timestamp":"..."}`. This fails the moment anyone
-        // tries it.
+      it("does not add a timestamp to a plain-object caller that had none", () => {
+        // Branch: plain object WITHOUT an own `timestamp`. Copy-on-write means
+        // the caller's object never gains a `timestamp` property (only winston's
+        // own `level` lands on it, before any format runs).
+        const event: Record<string, unknown> = { message: "hi", id: 9 };
+
+        renderTo(`reserved-nots-${format}`, format, (logger) => {
+          logger.info(event);
+        });
+
+        expect(Object.prototype.hasOwnProperty.call(event, "timestamp")).toBe(false);
+        expect(event.id).toBe(9);
+      });
+
+      it("still renders an Error's message and stack (errors() flattens before the capture copies)", () => {
+        // The highest-value test in this suite. Phase 16.5 sequences
+        // `errors({ stack: true })` AHEAD of `buildTimestampCapture`, so a logged
+        // Error is flattened to a plain object with own-ENUMERABLE message/stack
+        // before the copy-on-write runs — the copy preserves them. A naive
+        // copy-on-write placed BEFORE `errors()` would instead rebuild the raw
+        // Error into a plain object, dropping its own NON-enumerable message and
+        // stack and defeating `errors.js:15`'s `instanceof Error` gate (verified:
+        // the payload collapses to `{"level":"error","timestamp":"..."}`). This
+        // fails the moment the ordering is reverted.
         const rendered = renderTo(`reserved-err-${format}`, format, (logger) => {
           logger.error(new Error("boom-reserved"));
         });
@@ -5436,12 +5473,33 @@ describe("createLogger", () => {
         expect(rendered).toContain("Error: boom-reserved");
         expect(rendered).toMatch(/\bat\b/);
       });
+
+      it("leaves an Error's own enumerable timestamp intact and still renders it (branch: Error WITH own timestamp)", () => {
+        // Branch: Error WITH an own enumerable `timestamp`. `errors()` copies the
+        // Error's own enumerable props onto its fresh plain object, so the copy
+        // carries `timestamp` — and the copy-on-write capture overwrites it only
+        // on that engine-owned copy, never on the caller's Error. Message/stack
+        // still render.
+        const err = new Error("boom-err-ts") as Error & { timestamp?: string };
+        err.timestamp = "2024-01-01T00:00:00Z";
+
+        const rendered = renderTo(`reserved-err-ts-${format}`, format, (logger) => {
+          logger.error(err);
+        });
+
+        expect(err.timestamp).toBe("2024-01-01T00:00:00Z");
+        expect(rendered).toContain("boom-err-ts");
+        expect(rendered).toContain("Error: boom-err-ts");
+        expect(rendered).not.toContain("2024-01-01T00:00:00Z");
+      });
     });
 
-    it("matches bare winston's own format.timestamp({ format }) parity (canary)", () => {
-      // The deferral rests entirely on this being winston's own behavior rather
-      // than something this package adds. If a winston release ever changes it,
-      // this fails and the decision is reopened on purpose.
+    it("bare winston's own format.timestamp({ format }) still mutates in place (canary the fix diverges from)", () => {
+      // This is the hazard Phase 16.5's copy-on-write avoids. Bare winston's
+      // `format.timestamp({ format })` overwrites the caller's `timestamp` in
+      // place (`logform/timestamp.js:15-19`), destroying live state. This package
+      // deliberately diverges. If a winston release ever stops doing this, the
+      // divergence is revisited on purpose rather than by drift.
       const stream = new PassThrough();
       const bare = winston.createLogger({
         format: winston.format.combine(
@@ -5454,11 +5512,258 @@ describe("createLogger", () => {
 
       bare.info(event);
 
-      // Bare winston destroys the caller's timestamp identically, in place.
+      // Bare winston destroys the caller's timestamp in place — what we avoid.
       expect(event.timestamp).not.toBe("2024-01-01T00:00:00Z");
       expect(event.timestamp).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
       expect(event.id).toBe(7);
       bare.close();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 16 — hot-path performance (byte-identical output)
+  //
+  // 16.1 drops the duplicate json-mode Console format chain (the console now
+  // reuses the logger-level `sharedFormat`'s `info[MESSAGE]`); 16.2 guards the
+  // per-log `moment` timezone parse on `ctx.timezones.length > 0` and removes an
+  // identity `.map`; 16.4 wraps `winston.format.json()` so a serializer throw
+  // degrades to a sentinel line instead of crashing the caller. These tests pin
+  // that none of it changed the emitted bytes on the happy path.
+  // ---------------------------------------------------------------------------
+  describe("Phase 16 — hot-path performance (byte-identical output)", () => {
+    const FIXED_ISO = "2031-03-04T05:06:07Z";
+    const FIXED_TS = "2031-03-04 05:06:07";
+    const fixedClock = (): Date => new Date(FIXED_ISO);
+
+    const captureConsole = (emit: () => void): string => {
+      const written: string[] = [];
+      const target =
+        (console as unknown as { _stdout?: NodeJS.WritableStream })._stdout ?? process.stdout;
+      const original = target.write.bind(target);
+      (target as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
+        written.push(String(chunk));
+        return true;
+      };
+      try {
+        emit();
+      } finally {
+        (target as unknown as { write: unknown }).write = original;
+      }
+      return written.join("");
+    };
+
+    const renderStream = (
+      options: Parameters<typeof createLogger>[0],
+      emit: (logger: winston.Logger) => void,
+    ): string => {
+      const stream = new PassThrough();
+      let out = "";
+      stream.on("data", (chunk) => {
+        out += chunk.toString();
+      });
+      const logger = createLogger({
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        clock: fixedClock,
+        ...options,
+        additionalTransports: [
+          // `eol: "\n"` keeps the byte-for-byte assertions platform-independent
+          // (winston's Stream transport otherwise appends `os.EOL`, i.e. CRLF on
+          // Windows). The formatter's own trailing `\n` is unaffected.
+          new winston.transports.Stream({ stream, eol: "\n" }),
+          ...(options?.additionalTransports ?? []),
+        ],
+      });
+      emit(logger);
+      teardownLogger(logger);
+      return out;
+    };
+
+    it("16.1 json mode: the Console line is byte-identical to the file line", () => {
+      let fileOut = "";
+      const consoleOut = captureConsole(() => {
+        const stream = new PassThrough();
+        stream.on("data", (chunk) => {
+          fileOut += chunk.toString();
+        });
+        const logger = createLogger({
+          moduleName: "perf-json",
+          format: "json",
+          includeConsole: true,
+          includeFile: false,
+          includeGlobalFile: false,
+          clock: fixedClock,
+          additionalTransports: [new winston.transports.Stream({ stream })],
+        });
+        logger.info("hello", { userId: 42, nested: { a: [1, 2, 3] } });
+        teardownLogger(logger);
+      });
+
+      expect(consoleOut.trim()).toBe(fileOut.trim());
+      const parsed = JSON.parse(consoleOut.trim()) as Record<string, unknown>;
+      expect(parsed.message).toBe("hello");
+      expect(parsed.module).toBe("perf-json");
+      expect(parsed.userId).toBe(42);
+      expect(parsed.timestamp).toBe(FIXED_TS);
+    });
+
+    it("16.1 json mode with maskMetaKeys: console and file lines stay byte-identical", () => {
+      let fileOut = "";
+      const consoleOut = captureConsole(() => {
+        const stream = new PassThrough();
+        stream.on("data", (chunk) => {
+          fileOut += chunk.toString();
+        });
+        const logger = createLogger({
+          moduleName: "perf-json-mask",
+          format: "json",
+          includeConsole: true,
+          includeFile: false,
+          includeGlobalFile: false,
+          maskMetaKeys: ["password"],
+          clock: fixedClock,
+          additionalTransports: [new winston.transports.Stream({ stream })],
+        });
+        logger.info("login", { password: "hunter2", userId: 7 });
+        teardownLogger(logger);
+      });
+
+      expect(consoleOut.trim()).toBe(fileOut.trim());
+      expect(consoleOut).toContain('"password":"[REDACTED]"');
+      expect(consoleOut).not.toContain("hunter2");
+    });
+
+    it("16.2 pretty mode with NO extraTimezones: renders exactly the UTC line and nothing more", () => {
+      const out = renderStream({ moduleName: "perf-pretty" }, (logger) => logger.info("hi"));
+      expect(out).toBe(`UTC: ${FIXED_TS}\n[INFO] (perf-pretty)\nhi\n\n`);
+    });
+
+    it("16.2 pretty mode WITH extraTimezones: UTC line then one line per zone, in order (byte-identical)", () => {
+      const zones = ["Europe/London", "America/New_York"];
+      const out = renderStream({ moduleName: "perf-pretty-tz", extraTimezones: zones }, (logger) =>
+        logger.info("hi"),
+      );
+
+      // Build the expected zone lines the same way the formatter does, so the
+      // assertion is DST-robust and still byte-exact.
+      const captured = moment.utc(FIXED_TS, "YYYY-MM-DD HH:mm:ss");
+      const zoneLines = zones
+        .map((zone) => `${zone}: ${captured.clone().tz(zone).format("YYYY-MM-DD HH:mm:ss")}`)
+        .join("\n");
+      expect(out).toBe(`UTC: ${FIXED_TS}\n${zoneLines}\n[INFO] (perf-pretty-tz)\nhi\n\n`);
+    });
+
+    it("16.2 pretty console (no timestamps) is unchanged by the timezone guard", () => {
+      // The console pretty format omits timestamps entirely, so the guard never
+      // runs there; pin that the console line is still the plain colorize-free
+      // `[LEVEL] (label)\nmessage` form.
+      const consoleOut = captureConsole(() => {
+        const logger = createLogger({
+          moduleName: "perf-pretty-console",
+          includeConsole: true,
+          includeFile: false,
+          includeGlobalFile: false,
+          colorize: false,
+          extraTimezones: ["Europe/London"],
+          clock: fixedClock,
+        });
+        logger.info("hi");
+        teardownLogger(logger);
+      });
+      expect(consoleOut.trim()).toBe("[INFO] (perf-pretty-console)\nhi");
+      // The console line never carries a UTC/timezone line.
+      expect(consoleOut).not.toContain("UTC:");
+      expect(consoleOut).not.toContain("Europe/London");
+    });
+
+    it("16.4 json mode: a serializer-exhausting payload degrades to a sentinel line, no throw at the caller", () => {
+      // A payload deep enough to exhaust JSON.stringify itself throws RangeError
+      // from inside winston's own `json()`. With NO maskMetaKeys the redactor's
+      // depth guard never runs, so pre-16.4 this crashed the caller's own
+      // logger.info(...). 16.4 wraps `json()` so it degrades to a sentinel.
+      const deep: Record<string, unknown> = {};
+      let cursor = deep;
+      for (let i = 0; i < 12000; i++) {
+        const child: Record<string, unknown> = {};
+        cursor.next = child;
+        cursor = child;
+      }
+
+      let fileOut = "";
+      let consoleOut = "";
+      expect(() => {
+        consoleOut = captureConsole(() => {
+          const stream = new PassThrough();
+          stream.on("data", (chunk) => {
+            fileOut += chunk.toString();
+          });
+          const logger = createLogger({
+            moduleName: "perf-json-deep",
+            format: "json",
+            includeConsole: true,
+            includeFile: false,
+            includeGlobalFile: false,
+            clock: fixedClock,
+            additionalTransports: [new winston.transports.Stream({ stream })],
+          });
+          logger.info("too deep", { deep });
+          teardownLogger(logger);
+        });
+      }).not.toThrow();
+
+      // Both the file and console lines carry the same sentinel — 16.1 keeps
+      // them identical on the failure path too.
+      expect(consoleOut.trim()).toBe(fileOut.trim());
+      const parsed = JSON.parse(consoleOut.trim()) as Record<string, unknown>;
+      expect(parsed._unserializable).toBe(true);
+      expect(parsed.level).toBe("info");
+      expect(parsed.module).toBe("perf-json-deep");
+      expect(parsed.timestamp).toBe(FIXED_TS);
+    });
+
+    it("16.4 json mode with maskMetaKeys never reaches the sentinel (depth guard bounds first)", () => {
+      // When a mask is configured, buildMetaRedactor bounds the graph to
+      // MAX_REDACT_DEPTH before json() runs, so the serializer never throws and
+      // the line renders normally — the sentinel path is unreachable here.
+      const deep: Record<string, unknown> = {};
+      let cursor = deep;
+      for (let i = 0; i < 12000; i++) {
+        const child: Record<string, unknown> = {};
+        cursor.next = child;
+        cursor = child;
+      }
+      const out = renderStream(
+        { moduleName: "perf-json-deep-mask", format: "json", maskMetaKeys: ["password"] },
+        (logger) => logger.info("deep but masked", { password: "hunter2", deep }),
+      );
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed._unserializable).toBeUndefined();
+      expect(parsed.message).toBe("deep but masked");
+      // The top-level masked key is redacted; the deep payload is bounded by the
+      // redactor's MAX_REDACT_DEPTH guard, so json() never throws.
+      expect(parsed.password).toBe("[REDACTED]");
+    });
+
+    it("16.5 buildTimestampCapture copy-on-writes a null-prototype info without mutating it", () => {
+      // Exercises the `proto === null` arm of the plain-object branch directly:
+      // an `Object.create(null)` info (no `Object.prototype`) is still a plain
+      // bag, so it must be copy-on-written, not mutated in place.
+      const capture = __loggerInternals.buildTimestampCapture(() => new Date(FIXED_ISO));
+      const info = Object.create(null) as Record<string, unknown>;
+      info.level = "info";
+      info.message = "null-proto";
+      info.id = 5;
+
+      const result = capture.transform(info as never) as Record<string, unknown>;
+
+      // A fresh object carrying the captured timestamp and the original fields.
+      expect(result).not.toBe(info);
+      expect(result.timestamp).toBe(FIXED_TS);
+      expect(result.message).toBe("null-proto");
+      expect(result.id).toBe(5);
+      // The caller's null-prototype object is untouched (no timestamp added).
+      expect(Object.prototype.hasOwnProperty.call(info, "timestamp")).toBe(false);
     });
   });
 
@@ -6724,20 +7029,21 @@ describe("createLogger", () => {
       logger.info("ping");
       teardownLogger(logger);
 
-      // The Console transport's per-transport format must NOT re-run
-      // timestampCapture — the logger-level format already captured the
-      // timestamp via the single clock() call. A second call would produce a
-      // different timestamp on the console JSON line than on the file line.
+      // Since Phase 16.1 the json-mode Console transport carries NO format, so
+      // there is no second format to re-run timestampCapture: clock() fires once
+      // in the logger-level format and both the console and file lines carry that
+      // single captured timestamp.
       expect(clockCalls).toBe(1);
     });
 
-    it("json mode console format preserves the timestamp written by the logger-level format", () => {
-      // Drives both format pipelines manually — the same way Winston does it
-      // internally: logger-level format first, then the Console transport's
-      // per-transport format on a shallow clone of the transformed info.
-      // This bypasses stream-timing concerns and directly asserts the format
-      // composition contract: the Console format must NOT call clock() again
-      // or overwrite info.timestamp.
+    it("json mode Console transport has no format and reuses the logger-level MESSAGE (Phase 16.1)", () => {
+      // Phase 16.1: the json-mode Console transport carries NO per-transport
+      // format. winston-transport's `_write` then emits the logger-level format's
+      // already-serialized `info[MESSAGE]` verbatim (`modern.js`: `if (info &&
+      // !this.format) return this.log(info)`), so the console line is
+      // byte-identical to the file line — same captured timestamp — with the
+      // redaction + json() serialization run exactly once and no second clock()
+      // read that could desync it.
       const fixedDate = new Date("2030-06-15T12:34:56Z");
       const clock = () => fixedDate;
 
@@ -6755,8 +7061,11 @@ describe("createLogger", () => {
         (t) => t instanceof winston.transports.Console,
       );
       const consoleTransportFormat = (
-        consoleTransport as unknown as { format: winston.Logform.Format }
+        consoleTransport as unknown as { format?: winston.Logform.Format }
       ).format;
+
+      // The Console transport has NO format in json mode — it reuses MESSAGE.
+      expect(consoleTransportFormat).toBeUndefined();
 
       const syntheticInfo = {
         level: "info",
@@ -6764,17 +7073,11 @@ describe("createLogger", () => {
         [Symbol.for("level")]: "info",
       };
 
-      // Step 1 — logger-level format: runs timestampCapture → sets info.timestamp
+      // The logger-level format serializes the whole line (with the captured
+      // timestamp) into info[MESSAGE]; the formatless Console transport emits
+      // that same slot, so the console line is exactly this.
       const afterLogger = loggerLevelFormat.transform({ ...syntheticInfo } as any);
       expect(afterLogger).not.toBe(false);
-
-      // Step 2 — Console transport format: runs on a clone of the Step 1 result,
-      // mirroring Winston's `Object.assign({}, info)` clone before per-transport
-      // format execution. Must NOT re-run timestampCapture.
-      const afterConsole = consoleTransportFormat.transform({
-        ...(afterLogger as Record<string, unknown>),
-      } as any);
-      expect(afterConsole).not.toBe(false);
 
       teardownLogger(logger);
 
@@ -6782,15 +7085,7 @@ describe("createLogger", () => {
         Reflect.get(afterLogger as Record<PropertyKey, unknown>, Symbol.for("message")) as string,
       ) as Record<string, unknown>;
 
-      const consoleJson = JSON.parse(
-        Reflect.get(afterConsole as Record<PropertyKey, unknown>, Symbol.for("message")) as string,
-      ) as Record<string, unknown>;
-
-      // The console format must carry the timestamp already written by the
-      // logger-level format, not a new clock() read that would differ.
       expect(loggerJson.timestamp).toBe("2030-06-15 12:34:56");
-      expect(consoleJson.timestamp).toBe("2030-06-15 12:34:56");
-      expect(consoleJson.timestamp).toBe(loggerJson.timestamp);
     });
 
     it("pretty mode calls clock() exactly once per log line (regression guard)", () => {
