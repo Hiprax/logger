@@ -1564,11 +1564,106 @@ describe("createLogger", () => {
       expect(lines.length).toBeGreaterThanOrEqual(2);
     });
 
-    it("resolveLogDirectory falls back to path.resolve when the dir does not exist", () => {
-      const ghost = path.join(os.tmpdir(), `adv-logger-ghost-${Date.now()}`);
+    it("resolveLogDirectory canonicalizes via the nearest existing ancestor when the dir does not exist", () => {
+      // The parent exists but the target does not yet. The resolved path must be
+      // the CANONICAL parent (realpath) with the missing tail re-joined, so it
+      // matches what a later call resolves once the directory is created. This
+      // is what keeps the registry key stable across the create-the-directory
+      // boundary when a symlink/junction sits above the target.
+      const parent = createTempDir();
+      const ghost = path.join(parent, "does-not-exist-yet");
       const resolved = __loggerInternals.resolveLogDirectory(ghost);
-      expect(resolved).toBe(path.resolve(ghost));
+      const expected = path.join(fs.realpathSync.native(parent), "does-not-exist-yet");
+      expect(resolved).toBe(expected);
     });
+
+    it("resolveLogDirectory re-joins a multi-segment missing tail onto the nearest existing ancestor", () => {
+      const parent = createTempDir();
+      const ghost = path.join(parent, "a", "b", "c");
+      const resolved = __loggerInternals.resolveLogDirectory(ghost);
+      const expected = path.join(fs.realpathSync.native(parent), "a", "b", "c");
+      expect(resolved).toBe(expected);
+    });
+
+    it("resolveLogDirectory falls back to the plain absolute path when no ancestor can be canonicalized", () => {
+      // Force every realpath to fail so the ancestor walk climbs to the
+      // filesystem root and hits the root guard, exercising the fallback.
+      const spy = jest.spyOn(fs.realpathSync, "native").mockImplementation(() => {
+        throw new Error("realpath unavailable");
+      });
+      try {
+        const input = path.join(createTempDir(), "x", "y");
+        const resolved = __loggerInternals.resolveLogDirectory(input);
+        expect(resolved).toBe(path.resolve(input));
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    // Probe (once) whether this runner is allowed to create a symlink/junction.
+    // Windows can create directory JUNCTIONS without elevation but plain
+    // symlinks usually need it; POSIX allows symlinks. Where neither is
+    // permitted the junction test is skipped EXPLICITLY (jest reports it as
+    // skipped) rather than silently passing.
+    const symlinkProbe = ((): { ok: boolean; type: "junction" | undefined } => {
+      const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "adv-logger-symprobe-"));
+      const type = process.platform === "win32" ? ("junction" as const) : undefined;
+      try {
+        const target = path.join(probeRoot, "target");
+        fs.mkdirSync(target);
+        fs.symlinkSync(target, path.join(probeRoot, "link"), type);
+        return { ok: true, type };
+      } catch {
+        return { ok: false, type };
+      } finally {
+        fs.rmSync(probeRoot, { recursive: true, force: true });
+      }
+    })();
+
+    const junctionIt = symlinkProbe.ok ? it : it.skip;
+
+    junctionIt(
+      "resolves one logger and one shared global file across the create-the-directory boundary through a junction/symlink",
+      () => {
+        const root = fs.realpathSync.native(createTempDir());
+        const realDir = path.join(root, "real");
+        fs.mkdirSync(realDir);
+        const linkDir = path.join(root, "link");
+        fs.symlinkSync(realDir, linkDir, symlinkProbe.type);
+
+        // The target under the link does NOT exist yet, so the FIRST call runs
+        // before its own ensureDirectory materializes it — the exact ordering
+        // that used to split one physical file across two registry keys.
+        const logDirectory = path.join(linkDir, "logs");
+        expect(fs.existsSync(logDirectory)).toBe(false);
+
+        const first = createLogger({
+          logDirectory,
+          moduleName: "svc",
+          includeConsole: false,
+        });
+        // Now the directory exists (physically under realDir), so the second
+        // call's realpath succeeds and — with the fix — resolves to the same
+        // canonical path the first call registered under.
+        expect(fs.existsSync(logDirectory)).toBe(true);
+
+        const second = createLogger({
+          logDirectory,
+          moduleName: "svc",
+          includeConsole: false,
+        });
+
+        // Same cached instance => a single registry key across the boundary.
+        expect(second).toBe(first);
+        // Exactly ONE shared global-file transport => the shared-file key did
+        // not diverge either (its key is derived from the same resolved dir).
+        expect(__sharedFileInternals.sharedFileRegistry.size).toBe(1);
+        // And exactly one module-scoped rotating-file handle backs the file.
+        expect(moduleRotatingTransports(first)).toHaveLength(1);
+
+        teardownLogger(first);
+      },
+    );
 
     it("buildRegistryKey is case-insensitive on Windows and case-sensitive on POSIX", () => {
       const moduleName = "auth";

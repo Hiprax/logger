@@ -300,8 +300,27 @@ const evictRegistryEntry = (logger: winston.Logger): void => {
  * Resolves a `logDirectory` to a stable absolute form suitable for cache key
  * comparisons. The resolved path:
  * - Is absolute (`path.resolve`).
- * - Collapses symlinks via `fs.realpathSync.native` when the directory exists.
- * - Is lowercased on Windows for case-insensitive equality.
+ * - Collapses symlinks/junctions via `fs.realpathSync.native`, **whether or not
+ *   the directory exists yet** — when the target itself is missing, the nearest
+ *   existing ancestor is canonicalized and the missing tail is re-joined onto
+ *   it.
+ * - Preserves original case (lowercasing is applied ONLY inside
+ *   `buildRegistryKey`, and ONLY on Windows).
+ *
+ * **Why canonicalize before the directory exists.** The first `createLogger()`
+ * call runs *before* its own `ensureDirectory` creates `logDirectory`, while
+ * every later call runs *after*. If a missing directory fell back to the raw
+ * (un-canonicalized) absolute path, a symlink/junction anywhere in the path
+ * would make the first call register under `.../link/logs` and a later call —
+ * once the directory exists and `realpathSync` succeeds — under the resolved
+ * `.../real/logs`. Those are two different registry keys AND two different
+ * shared-global-file keys for one physical file, so the guarantees the registry
+ * and `shared-file-transport.ts` exist to provide (one `DailyRotateFile` handle,
+ * one rotation state machine per path) silently break. Walking to the nearest
+ * existing ancestor and re-joining the tail makes the resolved path identical on
+ * both sides of the create-the-directory boundary. This hits macOS by default,
+ * where `os.tmpdir()` is `/var/folders/...` and `/var` is a symlink to
+ * `/private/var`.
  *
  * The lowercased form must NEVER be used for filesystem operations — those use
  * the resolved-but-original-case path returned by `resolveLogDirectory`.
@@ -311,7 +330,29 @@ const resolveLogDirectory = (logDirectory: string): string => {
   try {
     return fs.realpathSync.native(absolute);
   } catch {
-    return absolute;
+    // The target does not exist yet. Walk up to the nearest existing ancestor,
+    // canonicalize it, then re-join the missing tail so the result is stable
+    // once the directory is created (see the "Why canonicalize" note above).
+    const missing: string[] = [];
+    let cur = absolute;
+    for (;;) {
+      const parent = path.dirname(cur);
+      if (parent === cur) {
+        // Reached the filesystem root without resolving any ancestor — fall
+        // back to the plain absolute path (case-preserving, as the old code
+        // did for the whole missing-directory case).
+        return absolute;
+      }
+      missing.push(path.basename(cur));
+      try {
+        const realParent = fs.realpathSync.native(parent);
+        missing.reverse();
+        return path.join(realParent, ...missing);
+      } catch {
+        // `parent` does not exist either — keep climbing.
+        cur = parent;
+      }
+    }
   }
 };
 
