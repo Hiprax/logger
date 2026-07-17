@@ -84,11 +84,16 @@ jobs:
       - name: Format check
         run: npm run format:check
 
-      - name: Test
-        run: npm test
-
+      # Build BEFORE Test so tests/packaging.spec.ts's on-disk declaration-file
+      # assertions (dist/index.d.ts, dist/index.d.cts) actually run instead of
+      # skipping on the fresh checkout where dist/ is gitignored. This is the
+      # publish path, so it is exactly where a tsup regression that stopped
+      # emitting index.d.cts must be caught before the tarball ships.
       - name: Build
         run: npm run build
+
+      - name: Test
+        run: npm test
 
       - name: Verify package.json version matches tag
         if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''

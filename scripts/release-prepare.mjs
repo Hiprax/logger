@@ -102,6 +102,14 @@ main(async () => {
   await writePkg(pkg);
   log.ok(`package.json bumped to ${newVersion}`);
 
+  // Keep package-lock.json's version in lockstep with package.json. Without
+  // this the lockfile's root version silently drifts, and the `git add
+  // package-lock.json` below stages nothing. --package-lock-only touches only
+  // the lockfile (no node_modules write); --ignore-scripts avoids running any
+  // install lifecycle script during a release prep.
+  await run("npm", ["install", "--package-lock-only", "--ignore-scripts"]);
+  log.ok("package-lock.json synced to the new version");
+
   const changelog = await readChangelog();
   if (changelog) {
     const date = today();
