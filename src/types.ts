@@ -325,11 +325,34 @@ export interface LoggerOptions {
    * gracefully (replaced with `"[Circular]"`).
    *
    * **Redaction boundary.** Deep redaction covers plain objects, arrays, and
-   * the enumerable own fields of class/Error instances. Values that define
-   * their own `toJSON()` (such as `Date`, `URL`, and custom serializable
-   * classes) or that carry no enumerable own keys (`Map`, `Set`, `RegExp`,
-   * etc.) are serialized via their built-in method and are **not** key-
-   * redacted — use `redactPaths` or normalize to a plain object for those.
+   * the enumerable own fields of class/Error instances. NESTED values that
+   * define their own `toJSON()` (such as `Date`, `URL`, and custom
+   * serializable classes) or that carry no enumerable own keys (`Map`, `Set`,
+   * `RegExp`, etc.) are serialized via their built-in method and are **not**
+   * key-redacted — use `redactPaths` or normalize to a plain object for those.
+   * A `toJSON`-defining object passed as the log call's own subject
+   * (`logger.info(dto)` in `format: "json"`) is the exception: its `toJSON()`
+   * is resolved first and the resulting fields ARE key-redacted, so enabling
+   * the mask never emits more than logging the same object without it would.
+   *
+   * **Known console boundary (pre-existing, and only when NO mask is set).**
+   * In `format: "json"` the Console transport receives a shallow clone of the
+   * info (`Object.assign({}, info)` in `winston-transport`), which cannot carry
+   * a prototype — so the console's own serializer never finds a `toJSON` on the
+   * log subject. With `maskMetaKeys` configured this does not bite: the
+   * redaction resolves `toJSON` in the logger-level chain, so the withheld
+   * fields never reach the console clone and console output matches the file.
+   * With NO `maskMetaKeys` the redaction is a zero-allocation identity pass, so
+   * `logger.info(dto)` renders the DTO's own fields on the console while the
+   * file honors its `toJSON()`. The same shape divergence remains WITH a mask
+   * for the narrower set of `toJSON` outputs the redaction hands back
+   * untouched — a primitive, or a `Date` / `Map` / already-unchanged instance —
+   * since those also reach the console clone with their prototype intact. Only
+   * a top-level `toJSON`'s field SELECTION or SHAPE is ever affected; masked
+   * keys themselves are redacted before the console's pass runs, on every one
+   * of these paths, so nothing secret differs between the two pipelines. Use
+   * `includeConsole: false`, or normalize such objects to plain objects, if
+   * console output must match the file output exactly.
    */
   maskMetaKeys?: string[];
   /**
@@ -444,6 +467,28 @@ export interface RequestLogEntry {
   requestBody?: unknown;
   requestHeaders?: Record<string, unknown>;
   responseHeaders?: Record<string, unknown>;
+  /**
+   * Whatever {@link RequestLoggerOptions.enrich} returned, as a **fully-owned
+   * copy** — never the caller's object by identity. That ownership is what lets
+   * {@link RequestLoggerOptions.redactPaths} write `"[REDACTED]"` into
+   * `context.*` without destroying the live `req.session` / `req.user` it came
+   * from.
+   *
+   * The copy is taken with a `toJSON`-resolving round-trip, so the value here is
+   * what the log serializer would render, not the original graph. Observable
+   * consequences worth knowing if you read `context` back in a custom
+   * `messageBuilder`:
+   * - A `Date` becomes its ISO string; a class DTO / Mongoose document becomes
+   *   its `toJSON()` output (a plain object, no methods or prototype).
+   * - `undefined`-valued keys and functions drop out, exactly as they would in
+   *   the emitted line.
+   * - A `BigInt` becomes its decimal string (the plain round-trip is retried
+   *   through a BigInt-coercing replacer).
+   * - A context that no round-trip can express — a circular reference, or a
+   *   value whose getter / `toJSON` throws — degrades to the owned sentinel
+   *   `{ _unserializable: true }` rather than sharing the caller's live graph or
+   *   letting the failure drop the whole log entry.
+   */
   context?: Record<string, unknown>;
   /**
    * Captured value of `res.writableEnded` at finalize time. `true` indicates

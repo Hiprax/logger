@@ -1217,6 +1217,206 @@ describe("createRequestLogger", () => {
     expect(session.userId).toBe(7);
   });
 
+  // ---------------------------------------------------------------------------
+  // redactPaths must not mutate the caller's live HEADER values.
+  //
+  // `normalizeHeaders` rebuilds the header BAG, and the code once claimed that
+  // made the header sub-graph package-owned. It did not: each VALUE was copied
+  // by reference, and `redactEntryPath` writes IN PLACE — so a path reaching
+  // into a multi-value (array) header wrote "[REDACTED]" into the running
+  // application's own headers. `set-cookie` hid it (it is in
+  // DEFAULT_MASKED_HEADER_KEYS, so the whole array was already replaced by a
+  // string); every array-valued header outside that list was exposed.
+  // ---------------------------------------------------------------------------
+
+  it("redactPaths into a multi-value REQUEST header redacts the line without mutating req.headers", () => {
+    const liveTags = ["TAG-SECRET", "b"];
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestHeaders: true,
+      redactPaths: ["requestHeaders.x-tags.0"],
+    });
+
+    const { res } = runMiddleware(middleware, { headers: { "x-tags": liveTags } });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    // The log line IS redacted...
+    expect(payload.http.requestHeaders["x-tags"]).toEqual(["[REDACTED]", "b"]);
+    // ...and the caller's live array is untouched. Before `ownHeaderValue` this
+    // array read ["[REDACTED]", "b"] in the running app.
+    expect(liveTags).toEqual(["TAG-SECRET", "b"]);
+  });
+
+  it("redactPaths into a multi-value RESPONSE header does not mutate the app's own array", () => {
+    // Node documents `res.getHeaders()` as returning a shallow copy whose array
+    // values "may be mutated without additional calls to various header-related
+    // http module methods" — i.e. the array reached here is the very array the
+    // application handed to `res.setHeader`. This asserts on that original
+    // variable, not on `getHeaders()`'s copy.
+    const appOwnedArray = ["RES-TAG-SECRET", "b"];
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeResponseHeaders: true,
+      redactPaths: ["responseHeaders.x-tags.0"],
+    });
+
+    const { res } = runMiddleware(
+      middleware,
+      {},
+      { getHeaders: () => ({ "x-tags": appOwnedArray }) },
+    );
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.responseHeaders["x-tags"]).toEqual(["[REDACTED]", "b"]);
+    expect(appOwnedArray).toEqual(["RES-TAG-SECRET", "b"]);
+  });
+
+  it("the allow-list header path owns its values too (covers the filtered branch)", () => {
+    // The allow-list branch reads out of `normalized`, so the single
+    // `ownHeaderValue` site must cover it. If it ever stops doing so, this goes
+    // red while the `include: true` test above stays green.
+    const liveTags = ["ALLOW-SECRET", "b"];
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestHeaders: ["x-tags"],
+      redactPaths: ["requestHeaders.x-tags.0"],
+    });
+
+    const { res } = runMiddleware(middleware, { headers: { "x-tags": liveTags } });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestHeaders["x-tags"]).toEqual(["[REDACTED]", "b"]);
+    expect(liveTags).toEqual(["ALLOW-SECRET", "b"]);
+  });
+
+  it("redactPaths into an OBJECT-valued response header does not mutate the app's object", () => {
+    // Node's docs: `setHeader()` stores "non-string values without
+    // modification", and `getHeaders()` hands the same reference back — so an
+    // object-valued header is reachable in PLAIN Node, not just via an exotic
+    // adapter. A one-level array copy would have left this shared; owning the
+    // value through `redactValue`'s `forceCopy` mode closes it at every depth.
+    const liveObj = { secret: "OBJ-SECRET", other: 1 };
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeResponseHeaders: true,
+      redactPaths: ["responseHeaders.x-meta.secret"],
+    });
+
+    const { res } = runMiddleware(middleware, {}, { getHeaders: () => ({ "x-meta": liveObj }) });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.responseHeaders["x-meta"]).toEqual({ secret: "[REDACTED]", other: 1 });
+    expect(liveObj).toEqual({ secret: "OBJ-SECRET", other: 1 });
+  });
+
+  it("a scalar header value redacts without mutation (covers the non-array ownHeaderValue branch)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestHeaders: true,
+      redactPaths: ["requestHeaders.x-scalar"],
+    });
+
+    const headers = { "x-scalar": "SCALAR-SECRET" };
+    const { res } = runMiddleware(middleware, { headers });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestHeaders["x-scalar"]).toBe("[REDACTED]");
+    // A string is immutable, so the caller's bag simply keeps its own value.
+    expect(headers["x-scalar"]).toBe("SCALAR-SECRET");
+  });
+
+  it("does NOT zero a byte of a Buffer-valued response header the caller still holds", () => {
+    // `redactValue` passes a binary view through BY IDENTITY (its `forceCopy`
+    // mode does not copy `ArrayBuffer.isView` values), so `entry.responseHeaders`
+    // shares the caller's live Buffer. A Buffer has WRITABLE integer-index own
+    // properties, so `hasOwnProperty("0")` + a writable descriptor alone would
+    // let this path coerce and zero a byte of the application's own Buffer.
+    // `redactEntryPath` must refuse to write into any non-plain, non-array
+    // target — this pins that guard. Reachable in plain Node: `res.setHeader`
+    // stores non-string values unmodified and `res.getHeaders()` returns them by
+    // reference.
+    const liveDigest = Buffer.from([0x01, 0x02, 0x03, 0x04]);
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeResponseHeaders: true,
+      redactPaths: ["responseHeaders.x-digest.0"],
+    });
+
+    const { res } = runMiddleware(
+      middleware,
+      {},
+      { getHeaders: () => ({ "x-digest": liveDigest }) },
+    );
+    res.emit("finish");
+
+    // The entry is still logged in full — the skipped write is a no-op, not a
+    // dropped line.
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.method).toBeDefined();
+    // And the caller's live Buffer is byte-for-byte intact.
+    expect([...liveDigest]).toEqual([0x01, 0x02, 0x03, 0x04]);
+  });
+
+  it("does NOT overwrite a RegExp's lastIndex on a response header the caller still holds", () => {
+    // A `RegExp` has no enumerable own keys, so `redactValue` returns it by
+    // identity; `lastIndex` is a writable (non-enumerable) own property, so a
+    // bare `hasOwnProperty` + writable check would clobber it. Same guard.
+    const liveRe = /secret/g;
+    liveRe.lastIndex = 3;
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeResponseHeaders: true,
+      redactPaths: ["responseHeaders.x-re.lastIndex"],
+    });
+
+    const { res } = runMiddleware(middleware, {}, { getHeaders: () => ({ "x-re": liveRe }) });
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(liveRe.lastIndex).toBe(3);
+  });
+
+  it("copying a header array changes nothing a consumer sees (output equivalence)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestHeaders: true,
+    });
+
+    const { res } = runMiddleware(middleware, { headers: { "x-tags": ["a", "b", "c"] } });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestHeaders["x-tags"]).toEqual(["a", "b", "c"]);
+  });
+
   it("redactPaths:['context.*'] on a FROZEN context still logs the entry and does not throw", () => {
     // A frozen context is an ordinary defensive pattern. Because entry.context
     // is copied before the redactPaths loop, the copy is writable, so the
@@ -3717,6 +3917,30 @@ describe("request middleware internals", () => {
       const node = new Node();
       node.parent = node;
       const out = serializeBody({ token: "SUPER-SECRET", node }, undefined, 3000, ["body.token"]);
+      expect(out).toBe("[UNSERIALIZABLE]");
+      expect(String(out)).not.toContain("SUPER-SECRET");
+    });
+
+    it("degrades an unserializable body even when redactPaths holds ONLY non-body paths", () => {
+      // The fail-closed guard tests `bodyRedactPaths.length > 0`, not whether
+      // any path actually targets the body — so a list of purely non-body paths
+      // (`context.*`, header paths) degrades an unserializable body too. Both
+      // `src/request-middleware.ts` and `CLAUDE.md` assert this is deliberate
+      // (the direction is conservative, and the alternative renderings here are
+      // worthless anyway); nothing pinned it until now, so the "deliberate"
+      // claim rested on prose alone.
+      class Node {
+        public parent: unknown = null;
+        toJSON() {
+          return { parent: this.parent };
+        }
+      }
+      const node = new Node();
+      node.parent = node;
+
+      const out = serializeBody({ token: "SUPER-SECRET", node }, undefined, 3000, [
+        "context.token",
+      ]);
       expect(out).toBe("[UNSERIALIZABLE]");
       expect(String(out)).not.toContain("SUPER-SECRET");
     });

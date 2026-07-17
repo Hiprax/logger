@@ -460,6 +460,72 @@ const applyHeaderMask = (
   }, {});
 };
 
+/**
+ * Returns a header value the package fully owns, so a later `redactEntryPath`
+ * write cannot reach the caller's live state.
+ *
+ * **Rebuilding the header BAG was not enough, and the claim that it was is the
+ * bug this closes.** `normalizeHeaders` rebuilds the bag but used to copy each
+ * VALUE by reference, while `finalize()`'s post-assembly `redactPaths` pass
+ * writes IN PLACE via `redactEntryPath`. So
+ * `redactPaths: ["requestHeaders.x-tags.0"]` over
+ * `req.headers["x-tags"] = ["TAG-SECRET", "b"]` wrote `"[REDACTED]"` into the
+ * RUNNING APPLICATION's live request headers, not merely into the log line —
+ * verified. The response side is the same and is worse by Node's own contract:
+ * `res.getHeaders()` is documented as returning "a shallow copy of the current
+ * outgoing headers… Since a shallow copy is used, array values may be mutated
+ * without additional calls to various header-related http module methods" — so
+ * the array reached from it is the very array the application handed to
+ * `res.setHeader`.
+ *
+ * `set-cookie` hid this for a long time: it is in
+ * {@link DEFAULT_MASKED_HEADER_KEYS}, so `applyHeaderMask` had already swapped
+ * the whole array for a string before any path could walk into it. Every
+ * array-valued header OUTSIDE that list was exposed.
+ *
+ * **One level is the whole realistic surface, not a partial fix.** Node types a
+ * header value as `string | string[] | number | undefined`, so an array is the
+ * only reference-typed shape that reaches here and its elements are strings.
+ * **A one-level array copy is NOT enough, because a non-string header value is
+ * reachable in plain Node.** Node's docs for `response.setHeader()` state that
+ * "non-string values will be stored without modification. Therefore,
+ * `response.getHeader()` may return non-string values" — verified: after
+ * `res.setHeader("x-meta", live)` with an object, `res.getHeaders()["x-meta"]`
+ * IS `live`, the same reference. So `redactPaths: ["responseHeaders.x-meta.a"]`
+ * would write into the application's own object. `redactValue`'s `forceCopy`
+ * mode exists for exactly this caller ("will mutate the returned value in place
+ * afterward and must not risk that mutation landing on a caller-owned object"),
+ * so it is reused here rather than hand-rolling a second deep-copy: it owns
+ * plain objects, arrays, and class instances at every depth, renders cycles as
+ * `"[Circular]"` instead of throwing, and strips `FORBIDDEN_KEYS`.
+ *
+ * Cost is negligible on the realistic surface: `redactValue` returns any
+ * primitive from its first statement, so an ordinary all-string header bag is
+ * walk-free, and only a reference-typed value pays for a copy. The mask set is
+ * empty here — this call is purely for ownership; keyword masking is
+ * `applyHeaderMask`'s job, and it runs afterwards over the owned bag.
+ *
+ * Boundary: `redactValue` returns `toJSON`-defining values (`Date`), binary
+ * views (`Buffer` / typed arrays), and values with no enumerable own keys
+ * (`Map`, `Set`, `RegExp`) by identity — its documented rule for values owning
+ * no key-addressable *string* secret. Those are therefore still shared with the
+ * caller by reference. That sharing is safe ONLY because {@link redactEntryPath}
+ * refuses to write into any target that is not an owned plain object or array:
+ * a `Buffer`'s writable integer indices and a `RegExp`'s writable `lastIndex`
+ * DO pass a bare `hasOwnProperty` + writable-descriptor check, so the earlier
+ * claim that "such a value exposes none a path would target" was false — the
+ * guarantee is enforced at the write site, not by the shape of these values.
+ */
+const EMPTY_HEADER_MASK = new Set<string>();
+
+const ownHeaderValue = (value: unknown): unknown =>
+  redactValue(value, EMPTY_HEADER_MASK, new WeakSet(), true);
+
+/**
+ * Normalizes the header bag for logging. Returns a bag that shares no reference
+ * with the caller, one level deep — see {@link ownHeaderValue} for why the
+ * value copy (not just the bag rebuild) is load-bearing.
+ */
 const normalizeHeaders = (
   headers: Record<string, unknown> | undefined,
   include?: boolean | string[],
@@ -487,7 +553,11 @@ const normalizeHeaders = (
     if (FORBIDDEN_OBJECT_KEYS.has(key)) {
       return acc;
     }
-    acc[key.toLowerCase()] = val;
+    // Own the VALUE, not just the key. This single site covers both the
+    // `include === true` path and the allow-list path below, because the latter
+    // reads out of `normalized`. `applyHeaderMask` deliberately does NOT repeat
+    // the copy — it consumes `normalized`, whose values are already owned.
+    acc[key.toLowerCase()] = ownHeaderValue(val);
     return acc;
   }, {});
 
@@ -731,6 +801,34 @@ const redactEntryPath = (entry: Record<string, unknown>, path: string): void => 
   // `redactPaths:["body.tags.length"]` would throw and `finalize()`'s catch
   // would drop the ENTIRE log entry over a single path.
   if (Array.isArray(target) && finalKey === "length") {
+    return;
+  }
+  // Only ever write into a container the package FULLY OWNS: a plain object
+  // (produced by the `ownContext` / `serializeBody` JSON round-trips or the
+  // `normalizeHeaders` bag rebuild) or an array (an owned header/body array).
+  // Every other reachable target is a value that `redactValue` handed back BY
+  // IDENTITY — a `Date`, a `Buffer` / typed-array, a `RegExp`, a bare `Error`,
+  // a `Map` / `Set` — i.e. STILL SHARED with the caller. Those are pass-through
+  // precisely because they own no key-addressable *string* secret, but that is
+  // not the same as owning no writable own key a numeric/reserved path could
+  // hit: a binary view exposes writable integer-index data properties
+  // (`Object.keys(Buffer.from([1,2,3]))` → `["0","1","2"]`) and a `RegExp` a
+  // writable `lastIndex`, both of which pass the `hasOwnProperty` + writable-
+  // descriptor guards below. Without this check
+  // `redactPaths:["responseHeaders.x-buf.0"]` over a `Buffer`-valued response
+  // header — reachable in plain Node, since `res.setHeader` stores non-string
+  // values unmodified and `res.getHeaders()` hands the same reference back —
+  // would coerce and zero a byte of the application's LIVE Buffer, the exact
+  // caller-mutation `ownHeaderValue` exists to prevent. Restricting the write
+  // to owned plain containers closes that whole class centrally and excludes
+  // nothing legitimate: every value the package owns for redaction (after the
+  // round-trips and the `forceCopy` header rebuild) is a plain object or an
+  // array, never one of these pass-through built-ins. (`redactValue` rebuilds
+  // every plain object into a fresh `{}` with `Object.prototype`, even an
+  // `Object.create(null)` input, so a null-prototype target is unreachable here
+  // and is not admitted — that keeps the guard's branches exactly the reachable
+  // ones: array, `Object.prototype`, or skip.)
+  if (!Array.isArray(target) && Object.getPrototypeOf(target) !== Object.prototype) {
     return;
   }
   // Only overwrite a writable data property. A frozen target
@@ -1098,12 +1196,32 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
         // place `context.*` / `requestHeaders.*` / `responseHeaders.*` paths
         // are redacted, and it still runs LAST so it can override anything
         // that survived the keyword-based body/header masks. Every sub-graph it
-        // writes into is package-owned — `entry.requestBody` from
-        // `serializeBody`, `entry.requestHeaders` / `entry.responseHeaders`
-        // from `normalizeHeaders`, and `entry.context` from the copy taken
-        // above — so `redactEntryPath`'s in-place writes can never reach the
-        // caller's live objects. Missing intermediate segments, non-writable
-        // slots, and array `length` targets are all graceful no-ops.
+        // writes into is package-owned:
+        //   - `entry.requestBody` — `serializeBody` applies body paths on a
+        //     `JSON.parse(JSON.stringify(...))` copy, and its guard is the SAME
+        //     predicate as this loop's (`redactPaths` non-empty), so the
+        //     round-trip has always run whenever this loop can write at all.
+        //   - `entry.requestHeaders` / `entry.responseHeaders` —
+        //     `normalizeHeaders` rebuilds the bag AND copies each value via
+        //     `ownHeaderValue`. The bag rebuild alone was NOT enough, and the
+        //     previous claim here that it was is the bug that fix closed:
+        //     header values were shared by reference, so
+        //     `redactPaths: ["requestHeaders.x-tags.0"]` wrote into the
+        //     caller's live `req.headers` array, and Node documents
+        //     `res.getHeaders()` as a shallow copy whose array values are the
+        //     app's own arrays.
+        //   - `entry.context` — `ownContext`'s round-trip copy.
+        // So `redactEntryPath`'s in-place writes cannot reach the caller's live
+        // objects. Missing intermediate segments, non-writable slots, and array
+        // `length` targets are all graceful no-ops. BOUNDARY: `ownHeaderValue`
+        // owns plain objects, arrays, and class instances at every depth, but
+        // leaves `Date` / `Buffer` / `RegExp` / `Map`-shaped values shared by
+        // identity — `redactValue`'s own rule for values owning no key-
+        // addressable string secret. That is safe because `redactEntryPath`
+        // writes ONLY into an owned plain object or array and refuses every
+        // other target, so a path aimed at a shared `Buffer`'s writable integer
+        // index (or a `RegExp`'s `lastIndex`) is a no-op instead of a write into
+        // the caller's live value.
         if (resolvedRedactPaths.length > 0) {
           resolvedRedactPaths.forEach((path) =>
             redactEntryPath(entry as unknown as Record<string, unknown>, path),

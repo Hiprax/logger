@@ -4281,17 +4281,38 @@ describe("createLogger", () => {
     });
 
     it("json mode: a key redacted AFTER a throwing one is not misreported as [Circular]", () => {
-      // Regression guard for `seen` contamination. The throw unwinds out of the
-      // walk without running the `seen.delete` each branch performs on its way
-      // out, so the abandoned subtree's objects stay marked "on the active
-      // path". If that WeakSet were reused, a later key legitimately holding
-      // one of those objects would render as "[Circular]" and its real data
-      // would vanish. `buildMetaRedactor` swaps in a fresh set on failure.
-      const shared = { password: "topsecret", keep: "visible" };
-      const hostile = buildHostileMeta();
-      // Put `shared` INSIDE the subtree the throw abandons, then reference it
-      // again from a later top-level key.
-      Object.defineProperty(hostile, "trap", { enumerable: true, value: shared });
+      // Regression guard for `seen` contamination, and it only has teeth with a
+      // very specific shape — an earlier version of this test had none.
+      //
+      // The throw unwinds out of the walk without running the `seen.delete` each
+      // branch performs on its way out, so the objects on the abandoned path stay
+      // marked "on the active path". `buildMetaRedactor` swaps in a fresh WeakSet
+      // on failure; if it reused the contaminated one, a later key legitimately
+      // holding one of those objects would render "[Circular]" and its real data
+      // would vanish.
+      //
+      // Two constraints make that state reachable, and both were learned the hard
+      // way (removing the reset left the previous version of this test green):
+      //  1. The contaminated object must be an ANCESTOR of the thrower, not a
+      //     sibling under it. Both walk branches read their children eagerly
+      //     (`Object.entries` / `value[key]`), so a throwing getter detonates
+      //     BEFORE any of its siblings are added to `seen` — only the objects on
+      //     the path ABOVE it are left behind.
+      //  2. The later key's re-walk must SUCCEED, or both branches yield a
+      //     sentinel and the assertion cannot tell them apart. Hence a getter
+      //     that fails only on its first read — modelling a lazily-initialised
+      //     field (a lazy decrypt, a cache miss on a briefly-unavailable
+      //     resource) whose second read resolves.
+      let reads = 0;
+      const inner = {
+        get lazy(): string {
+          if (reads++ === 0) {
+            throw new Error("first read fails");
+          }
+          return "REAL-DATA";
+        },
+      };
+      const ancestor = { password: "topsecret", keep: "visible", inner };
 
       const stream = new PassThrough();
       const chunks: string[] = [];
@@ -4305,14 +4326,21 @@ describe("createLogger", () => {
         maskMetaKeys: ["password"],
         additionalTransports: [new winston.transports.Stream({ stream })],
       });
-      // Key order matters: `evil` is walked (and throws) before `later`.
-      logger.info("Trap", { evil: hostile, later: shared });
+      // Key order matters: `evil` is walked (and throws, contaminating `seen`
+      // with `ancestor` and `inner`) before `later` re-references `ancestor`.
+      logger.info("Trap", { evil: ancestor, later: ancestor });
       teardownLogger(logger);
 
       const parsed = JSON.parse(chunks.join("")) as Record<string, any>;
       expect(parsed.evil).toBe("[RedactionFailed]");
-      expect(parsed.later).toEqual({ password: "[REDACTED]", keep: "visible" });
+      // The load-bearing assertion: WITHOUT the fresh WeakSet this is the string
+      // "[Circular]" and every field below is lost.
       expect(parsed.later).not.toBe("[Circular]");
+      expect(parsed.later).toEqual({
+        password: "[REDACTED]",
+        keep: "visible",
+        inner: { lazy: "REAL-DATA" },
+      });
     });
 
     // -----------------------------------------------------------------------
@@ -4331,11 +4359,24 @@ describe("createLogger", () => {
     // returns a fresh info object instead; `formatMessage` (pretty mode) has
     // always been non-mutating and is pinned here against regression.
     //
-    // Note what is deliberately NOT asserted: winston itself writes `level`
-    // (and the `LEVEL` Symbol) onto the caller's object before any format
-    // runs, and `buildTimestampCapture` adds `timestamp`. Those are additive,
-    // engine-owned fields outside this package's control. The contract under
-    // test is that no caller-supplied VALUE is destroyed.
+    // Note what is deliberately NOT asserted, and why the payload below owns no
+    // `timestamp` key. TWO reserved slots are written onto the caller's object,
+    // neither of them additive (each overwrites a caller-owned key of that
+    // name), and only one of them engine-owned:
+    //   - `level` / the `LEVEL` Symbol — written by WINSTON before any format
+    //     runs (`create-logger.js:79`, `logger.js:237`).
+    //   - `timestamp` — written by THIS package's own `buildTimestampCapture`,
+    //     the first format in both chains, which overwrites a caller-supplied
+    //     `timestamp` in place. That is exact parity with
+    //     `winston.format.timestamp({ format })` (`logform/timestamp.js:15-19`)
+    //     and is mandatory: `timestamp` is a RESERVED_INFO_KEY rendered as the
+    //     log's own `UTC:` line, so honoring a caller's value would let caller
+    //     data forge the log's timestamp column.
+    // Both are pinned by the "reserved-slot boundary" suite below rather than
+    // left to an assumption in a comment.
+    //
+    // The contract under test HERE is therefore the narrower, real one: no
+    // caller-supplied METADATA value is destroyed.
     // -----------------------------------------------------------------------
 
     /** Builds the payload used by every mutation-safety case below. */
@@ -4621,6 +4662,470 @@ describe("createLogger", () => {
       // never leak into the line.
       expect(Object.prototype.hasOwnProperty.call(parsed, "__proto__")).toBe(false);
       expect(rendered).not.toContain("admin");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // A top-level `toJSON` must be resolved, then redacted.
+  //
+  // `buildMetaRedactor` rebuilds into a plain `{}`, which discards the info's
+  // prototype. On the single-object form the info IS the caller's DTO, so the
+  // rebuild made `json()` stop finding `toJSON` and emit every own field —
+  // including ones the DTO deliberately withheld. Enabling `maskMetaKeys` then
+  // disclosed MORE than leaving it off, which is the exact inversion the option
+  // exists to prevent.
+  //
+  // The fix resolves `toJSON` here (on the real instance, inside a try/catch)
+  // and redacts its OUTPUT. Merely passing a `toJSON`-defining info through by
+  // identity would fix the withholding but silently void `maskMetaKeys` — the
+  // `toJSON`-surfaces-a-masked-key test below is what pins that apart.
+  // ---------------------------------------------------------------------------
+  describe("top-level toJSON is resolved then redacted", () => {
+    const renderJson = (
+      moduleName: string,
+      emit: (logger: winston.Logger) => void,
+      maskMetaKeys?: string[],
+    ): string => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format: "json",
+        ...(maskMetaKeys ? { maskMetaKeys } : {}),
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      emit(logger);
+      teardownLogger(logger);
+      return chunks.join("");
+    };
+
+    class UserDto {
+      public message = "user loaded";
+      public email = "u@example.com";
+      public ssn = "123-45-6789";
+      toJSON(): Record<string, unknown> {
+        // `ssn` is deliberately withheld.
+        return { message: this.message, email: this.email };
+      }
+    }
+
+    it("honors a withheld field when maskMetaKeys is set (regression: enabling the mask leaked it)", () => {
+      const rendered = renderJson("tojson-withhold", (logger) => logger.info(new UserDto()), [
+        "password",
+      ]);
+      expect(rendered).not.toContain("123-45-6789");
+      expect(rendered).toContain("user loaded");
+    });
+
+    it("emits exactly the same line with the mask on as with it off (mask-on ⊆ mask-off canary)", () => {
+      // The load-bearing invariant: turning a redaction feature ON must never
+      // emit MORE than leaving it off.
+      const withMask = renderJson("tojson-on", (logger) => logger.info(new UserDto()), [
+        "password",
+      ]);
+      const withoutMask = renderJson("tojson-off", (logger) => logger.info(new UserDto()));
+      expect(JSON.parse(withMask.trim())).toEqual(JSON.parse(withoutMask.trim()));
+    });
+
+    it("still redacts a masked key that the toJSON output SURFACES", () => {
+      // This is the test that rejects the tempting "just pass a toJSON-defining
+      // info through by identity" fix: that would honor the withholding but
+      // emit this password in cleartext, voiding the operator's explicit
+      // instruction with no `redactPaths` escape hatch on `createLogger`.
+      class CredDto {
+        public message = "connecting";
+        public password = "hunter2";
+        toJSON(): Record<string, unknown> {
+          return { message: this.message, password: this.password };
+        }
+      }
+      const dto = new CredDto();
+      const rendered = renderJson("tojson-surface", (logger) => logger.info(dto), ["password"]);
+
+      expect(rendered).toContain("[REDACTED]");
+      expect(rendered).not.toContain("hunter2");
+      // ...and the caller's own object still holds the real secret.
+      expect(dto.password).toBe("hunter2");
+    });
+
+    it("resolves a toJSON that reads a private #field without crashing the caller", () => {
+      // Pins why the prototype must NOT be copied onto the rebuild
+      // (`Object.create(getPrototypeOf(info))` / `setPrototypeOf` / copying
+      // `toJSON` across): the copy is not a real instance, so a brand check on
+      // `this.#secret` throws a TypeError from inside the unwrapped `json()`,
+      // crashing `logger.info(dto)`. Invoking toJSON on the REAL instance here
+      // is what makes this work.
+      class PrivDto {
+        #secret = "PRIVATE-VAL";
+        public message = "priv";
+        toJSON(): Record<string, unknown> {
+          return { message: this.message, shown: this.#secret };
+        }
+      }
+      let rendered = "";
+      expect(() => {
+        rendered = renderJson("tojson-private", (logger) => logger.info(new PrivDto()), [
+          "password",
+        ]);
+      }).not.toThrow();
+      expect(rendered).toContain("PRIVATE-VAL");
+    });
+
+    it("keeps a top-level ARRAY info an array, with no toJSON involved", () => {
+      // `logger.log("info", ["a","b"])` takes winston's object branch
+      // (`logger.js:245` — an array IS an object), so `info` IS the array and
+      // no `toJSON` is in play. The plain rebuild would render
+      // `{"0":"a","1":"b","level":"info","timestamp":"…"}` while the no-mask
+      // line renders `["a","b"]` (json()'s array branch ignores the level /
+      // timestamp props winston assigned onto the array) — which is why the
+      // delegation is gated on `Array.isArray(subject) || resolvedViaToJSON`
+      // rather than on the toJSON resolve alone.
+      const withMask = renderJson("arrinfo-on", (l) => l.log("info", ["a", "b"] as never), [
+        "password",
+      ]);
+      const withoutMask = renderJson("arrinfo-off", (l) => l.log("info", ["a", "b"] as never));
+      expect(JSON.parse(withMask.trim())).toEqual(["a", "b"]);
+      expect(JSON.parse(withMask.trim())).toEqual(JSON.parse(withoutMask.trim()));
+    });
+
+    it("still redacts a masked key nested inside a top-level array info", () => {
+      const rendered = renderJson(
+        "arrinfo-secret",
+        (l) => l.log("info", [{ password: "pw", keep: "k" }] as never),
+        ["password"],
+      );
+      expect(rendered).toContain("[REDACTED]");
+      expect(rendered).not.toContain("pw");
+    });
+
+    it("keeps a toJSON returning an ARRAY an array (not an index-keyed object)", () => {
+      // The plain rebuild is `Object.keys` into a fresh `{}`, which would render
+      // `{"0":"a","1":"b"}` here while the no-mask line renders `["a","b"]` —
+      // the same mask-diverges-from-no-mask defect in a new shape. Non-plain
+      // toJSON outputs are delegated to `redactValue` instead.
+      class ArrDto {
+        public message = "m";
+        toJSON(): unknown[] {
+          return ["a", "b"];
+        }
+      }
+      const withMask = renderJson("tojson-arr-on", (l) => l.info(new ArrDto()), ["password"]);
+      const withoutMask = renderJson("tojson-arr-off", (l) => l.info(new ArrDto()));
+      expect(JSON.parse(withMask.trim())).toEqual(["a", "b"]);
+      expect(JSON.parse(withMask.trim())).toEqual(JSON.parse(withoutMask.trim()));
+    });
+
+    it("still redacts a masked key nested inside a toJSON that returns an array", () => {
+      // Proves the array delegation redacts rather than passing through: this is
+      // the case a bare `return info` for non-plain outputs would have leaked.
+      class ArrSecret {
+        public message = "m";
+        toJSON(): unknown[] {
+          return [{ password: "pw", keep: "k" }];
+        }
+      }
+      const rendered = renderJson("tojson-arr-secret", (l) => l.info(new ArrSecret()), [
+        "password",
+      ]);
+      expect(rendered).toContain("[REDACTED]");
+      expect(rendered).not.toContain("pw");
+      expect(rendered).toContain("keep");
+    });
+
+    it("hands a toJSON returning a built-in back to the serializer (redactValue identity branch)", () => {
+      // `redactValue` returns a `Date`/`Map` by identity — its own rule for a
+      // value owning no key-addressable secret. We must not attach symbols to a
+      // caller-owned value, so `info` is returned and the serializer resolves it
+      // exactly as the no-mask line does.
+      class DateDto {
+        public message = "m";
+        toJSON(): Date {
+          return new Date("2024-01-01T00:00:00Z");
+        }
+      }
+      const withMask = renderJson("tojson-date-on", (l) => l.info(new DateDto()), ["password"]);
+      const withoutMask = renderJson("tojson-date-off", (l) => l.info(new DateDto()));
+      expect(withMask.trim()).toBe(withoutMask.trim());
+    });
+
+    it("fails closed when redacting a non-plain toJSON output throws", () => {
+      class ArrHostile {
+        public message = "arr-hostile";
+        toJSON(): unknown[] {
+          return [
+            {
+              get boom(): string {
+                throw new Error("element getter exploded");
+              },
+            },
+          ];
+        }
+      }
+      let rendered = "";
+      expect(() => {
+        rendered = renderJson("tojson-arr-throws", (l) => l.info(new ArrHostile()), ["password"]);
+      }).not.toThrow();
+      const parsed = JSON.parse(rendered.trim()) as Record<string, unknown>;
+      expect(parsed._redactionFailed).toBe(true);
+      expect(parsed.message).toBe("arr-hostile");
+    });
+
+    it("passes through a toJSON returning a non-object (no keys to inspect)", () => {
+      class FlatDto {
+        public message = "flat";
+        toJSON(): string {
+          return "flattened";
+        }
+      }
+      const rendered = renderJson("tojson-flat", (logger) => logger.info(new FlatDto()), [
+        "password",
+      ]);
+      // `json()` resolves it downstream, exactly as the no-mask config does.
+      expect(rendered).toContain("flattened");
+    });
+
+    it("fails closed when toJSON throws, without escaping into logger.info", () => {
+      class HostileDto {
+        public message = "hostile";
+        public password = "hunter2";
+        toJSON(): Record<string, unknown> {
+          throw new Error("toJSON exploded");
+        }
+      }
+      let rendered = "";
+      expect(() => {
+        rendered = renderJson("tojson-throws", (logger) => logger.info(new HostileDto()), [
+          "password",
+        ]);
+      }).not.toThrow();
+
+      const parsed = JSON.parse(rendered.trim()) as Record<string, unknown>;
+      expect(parsed._redactionFailed).toBe(true);
+      expect(parsed.message).toBe("hostile");
+      // FAIL CLOSED: rebuilding from the unresolved source would have emitted
+      // the very fields toJSON withholds.
+      expect(rendered).not.toContain("hunter2");
+    });
+
+    it("fails closed when the toJSON GETTER itself throws", () => {
+      const dto: Record<string, unknown> = { message: "getter-hostile", password: "hunter2" };
+      Object.defineProperty(dto, "toJSON", {
+        enumerable: false,
+        get() {
+          throw new Error("toJSON getter exploded");
+        },
+      });
+
+      let rendered = "";
+      expect(() => {
+        rendered = renderJson("tojson-getter", (logger) => logger.info(dto), ["password"]);
+      }).not.toThrow();
+      expect((JSON.parse(rendered.trim()) as Record<string, unknown>)._redactionFailed).toBe(true);
+      expect(rendered).not.toContain("hunter2");
+    });
+
+    it("applies to the 2-arg object form too (logger.log('info', dto))", () => {
+      // `logger.js:246` passes the caller's object by identity just as the
+      // single-object form does, so it carries the same prototype.
+      const rendered = renderJson(
+        "tojson-2arg",
+        (logger) => logger.log("info", new UserDto() as unknown as string),
+        ["password"],
+      );
+      expect(rendered).not.toContain("123-45-6789");
+      expect(rendered).toContain("user loaded");
+    });
+
+    /**
+     * Captures what winston's Console transport actually writes.
+     *
+     * It writes to `console._stdout`, NOT to `process.stdout` directly
+     * (`winston/lib/winston/transports/console.js:85-87` — "Node.js maps
+     * `process.stdout` to `console._stdout`"). Those are the same object in a
+     * bare Node process, but jest replaces the global `console` with its own
+     * buffered Console whose `_stdout` is a different stream — so patching
+     * `process.stdout` captures nothing under a full-suite run while appearing
+     * to work when this file runs alone. Patch the channel winston really uses,
+     * falling back to `process.stdout` if a future winston drops `_stdout`.
+     */
+    const captureConsole = (emit: () => void): string => {
+      const written: string[] = [];
+      const target =
+        (console as unknown as { _stdout?: NodeJS.WritableStream })._stdout ?? process.stdout;
+      const original = target.write.bind(target);
+      (target as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
+        written.push(String(chunk));
+        return true;
+      };
+      try {
+        emit();
+      } finally {
+        (target as unknown as { write: unknown }).write = original;
+      }
+      return written.join("");
+    };
+
+    it("honors a top-level toJSON on the CONSOLE too when a mask is configured", () => {
+      // The eager resolve happens in the logger-level chain, so the withheld
+      // field never enters the rebuilt info at all — leaving nothing for the
+      // Console's own second serialization pass to re-expose. (Before the fix
+      // the console leaked `ssn` here as well.)
+      const consoleOut = captureConsole(() => {
+        const logger = createLogger({
+          moduleName: "tojson-console-mask",
+          includeFile: false,
+          includeGlobalFile: false,
+          format: "json",
+          maskMetaKeys: ["password"],
+        });
+        logger.info(new UserDto());
+        teardownLogger(logger);
+      });
+
+      expect(consoleOut).not.toContain("123-45-6789");
+      expect(consoleOut).toContain("user loaded");
+    });
+
+    it("does NOT honor a top-level toJSON on the console with NO mask — pinned known boundary", () => {
+      // The one case that remains, and it is PRE-EXISTING (it predates the
+      // redactor rework and reproduces identically against the old code): with
+      // no `maskMetaKeys`, `buildMetaRedactor` is a zero-allocation identity
+      // pass, so the real DTO instance reaches the Console transport — which
+      // `winston-transport`'s `_write` hands `Object.assign({}, info)`, a
+      // shallow clone that cannot carry a prototype, so the console's own
+      // serializer never finds `toJSON`. Consequence of giving Console its own
+      // format chain, which Phase 16.1 already plans to drop; pinned here so the
+      // boundary is a decision on record and 16.1 gets a signal when it changes.
+      const consoleOut = captureConsole(() => {
+        const logger = createLogger({
+          moduleName: "tojson-console-nomask",
+          includeFile: false,
+          includeGlobalFile: false,
+          format: "json",
+        });
+        logger.info(new UserDto());
+        teardownLogger(logger);
+      });
+
+      expect(consoleOut).toContain("123-45-6789");
+    });
+
+    it("leaves an Error info unaffected (errors() already flattened it)", () => {
+      // `logform/errors.js:16` copies own ENUMERABLE props onto a plain object,
+      // so a prototype `toJSON` never survives to reach the resolve block.
+      class ErrWithToJSON extends Error {
+        toJSON(): Record<string, unknown> {
+          return { message: "should-not-be-used" };
+        }
+      }
+      const rendered = renderJson(
+        "tojson-error",
+        (logger) => logger.error(new ErrWithToJSON("boom-tojson")),
+        ["password"],
+      );
+      expect(rendered).toContain("boom-tojson");
+      expect(rendered).not.toContain("should-not-be-used");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Reserved-slot boundary — the documented limit of the mutation-safety
+  // guarantee above, pinned rather than left to an assumption in a comment.
+  //
+  // `level` and `timestamp` ARE overwritten in place on the caller's object.
+  // The guarantee is about caller-supplied METADATA values, not about those two
+  // reserved slots. These tests exist so the boundary is enforced and honest:
+  // if upstream winston ever stops behaving this way, the parity canary fails
+  // loudly and the deferral is reopened deliberately rather than by drift.
+  // ---------------------------------------------------------------------------
+  describe("reserved-slot boundary (level / timestamp are overwritten in place)", () => {
+    const renderTo = (
+      moduleName: string,
+      format: "json" | "pretty",
+      emit: (logger: winston.Logger) => void,
+    ): string => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      emit(logger);
+      teardownLogger(logger);
+      return chunks.join("");
+    };
+
+    describe.each([["json"], ["pretty"]] as const)("format: %s", (format) => {
+      it("overwrites a caller-supplied timestamp in place while leaving other caller values intact", () => {
+        const event = {
+          message: "webhook received",
+          timestamp: "2024-01-01T00:00:00Z",
+          id: 7,
+        };
+
+        renderTo(`reserved-ts-${format}`, format, (logger) => {
+          logger.info(event);
+        });
+
+        // The reserved slot IS overwritten — this is the boundary, not a bug.
+        expect(event.timestamp).not.toBe("2024-01-01T00:00:00Z");
+        expect(event.timestamp).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+        // ...and the actual Phase 4 contract still holds around it: the
+        // caller's non-reserved metadata value is untouched.
+        expect(event.id).toBe(7);
+        expect(event.message).toBe("webhook received");
+      });
+
+      it("still renders an Error's message and stack (guards against a copy-on-write timestampCapture)", () => {
+        // The highest-value test in this suite. `buildTimestampCapture` runs
+        // BEFORE `errors({ stack: true })`, so on this call its `info` IS the
+        // Error instance (`create-logger.js:78` — an Error has a truthy
+        // `.message`). "Fixing" the timestamp overwrite by returning
+        // `{ ...info }` would drop `message`/`stack` (own NON-enumerable on an
+        // Error) and defeat `errors.js:15`'s `instanceof Error` gate, emitting
+        // a line with neither — verified: the whole payload collapsed to
+        // `{"level":"error","timestamp":"..."}`. This fails the moment anyone
+        // tries it.
+        const rendered = renderTo(`reserved-err-${format}`, format, (logger) => {
+          logger.error(new Error("boom-reserved"));
+        });
+
+        expect(rendered).toContain("boom-reserved");
+        expect(rendered).toContain("Error: boom-reserved");
+        expect(rendered).toMatch(/\bat\b/);
+      });
+    });
+
+    it("matches bare winston's own format.timestamp({ format }) parity (canary)", () => {
+      // The deferral rests entirely on this being winston's own behavior rather
+      // than something this package adds. If a winston release ever changes it,
+      // this fails and the decision is reopened on purpose.
+      const stream = new PassThrough();
+      const bare = winston.createLogger({
+        format: winston.format.combine(
+          winston.format.timestamp({ format: __loggerInternals.TIMESTAMP_FORMAT }),
+          winston.format.json(),
+        ),
+        transports: [new winston.transports.Stream({ stream })],
+      });
+      const event = { message: "m", timestamp: "2024-01-01T00:00:00Z", id: 7 };
+
+      bare.info(event);
+
+      // Bare winston destroys the caller's timestamp identically, in place.
+      expect(event.timestamp).not.toBe("2024-01-01T00:00:00Z");
+      expect(event.timestamp).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+      expect(event.id).toBe(7);
+      bare.close();
     });
   });
 

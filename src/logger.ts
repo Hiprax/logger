@@ -611,11 +611,37 @@ const buildTimestampCapture = (clock: () => Date) =>
  * a plain rebuild is output-equivalent. This mirrors `redactValue`'s own
  * plain-rebuild rule for data-bearing instances.
  *
- * Note the boundary: winston itself still writes `level` / `[LEVEL]` onto the
- * caller's object before any format runs, and `timestamp` is added by
- * `buildTimestampCapture` upstream. Those are additive, engine-owned fields
- * this package does not control. What this format guarantees is that no
- * caller-supplied VALUE is destroyed.
+ * **Boundary — two RESERVED slots are written on the caller's object, and both
+ * sit outside this format's guarantee.** Neither is "additive" (each overwrites
+ * a caller-owned key of that name) and only the first is engine-owned:
+ * - `level` / the `LEVEL` Symbol — written by WINSTON itself, onto the caller's
+ *   object, before any format runs (`create-logger.js:79`, `logger.js:237`).
+ * - `timestamp` — written by THIS package's own `buildTimestampCapture`, the
+ *   first format in both chains. It unconditionally overwrites a caller-supplied
+ *   `timestamp` in place. That is deliberate and is exact parity with
+ *   `winston.format.timestamp({ format })`, whose `opts.format` branch
+ *   (`logform/timestamp.js:15-19`) performs the identical in-place overwrite —
+ *   logform's `if (!info.timestamp)` preservation at `:21` applies only to the
+ *   no-`format` configuration this package does not use. Preserving a caller's
+ *   value is not an option: `timestamp` is a `RESERVED_INFO_KEYS` member that
+ *   `formatMessage` renders as the log's own `UTC:` line and re-parses to derive
+ *   every `extraTimezones` mirror, so honoring it would let caller data forge
+ *   the log's own timestamp column.
+ *
+ * So the guarantee is narrower than "the caller's object is untouched": no
+ * caller-supplied METADATA value is destroyed — this format never writes
+ * `[REDACTED]`, `REDACTION_FAILED`, or a rebuilt copy onto the caller's object.
+ * The two reserved slots above are overwritten in place, matching bare winston.
+ *
+ * `buildTimestampCapture` is deliberately NOT made copy-on-write to close its
+ * overwrite, and this format's rebuild is not a precedent for doing so: it runs
+ * BEFORE `errors({ stack: true })`, so on `logger.error(new Error(...))` its
+ * `info` IS the `Error` instance (`create-logger.js:78` — an `Error` has a
+ * truthy `.message`). Returning `{ ...info }` there would drop `message` and
+ * `stack` (own NON-enumerable on an `Error`) and defeat `errors.js:15`'s
+ * `instanceof Error` gate, emitting a line with no message and no stack —
+ * verified. This format can safely rebuild only because it runs AFTER `errors()`
+ * has already flattened the `Error` into a plain object.
  *
  * Because the rebuild targets a fresh object, own keys named `__proto__` /
  * `constructor` / `prototype` (`FORBIDDEN_KEYS`) are skipped rather than
@@ -657,8 +683,131 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
     }
     let seen = new WeakSet<object>();
     const source = info as unknown as Record<string, unknown>;
+
+    // Resolve a top-level `toJSON` BEFORE rebuilding, and redact its OUTPUT.
+    //
+    // On winston's single-object form (`create-logger.js:78`) and its 2-arg
+    // object form (`logger.js:246`), `info` IS the caller's object, and
+    // `logform/errors.js:28` returns a non-Error info by identity — so a class
+    // DTO arrives here with its prototype, and its `toJSON`, still attached.
+    // The rebuild below targets a plain `{}`, which discards that prototype;
+    // `winston.format.json()`'s serializer looks `toJSON` up ON THE VALUE
+    // (`safe-stable-stringify`), so the rebuild made `json()` emit every own
+    // field of the DTO — INCLUDING ones its `toJSON` deliberately withheld.
+    // That made enabling `maskMetaKeys` disclose MORE than leaving it off: the
+    // exact inversion this option exists to prevent.
+    //
+    // Resolving here — rather than passing `info` through by identity — is what
+    // keeps BOTH guarantees at once: a withheld field stays withheld, AND a
+    // masked key present in the `toJSON` OUTPUT is still redacted. Pass-through
+    // would satisfy the first and silently void the second (a `toJSON` that
+    // surfaces `password` would emit it in cleartext), and unlike `redact.ts`'s
+    // NESTED `toJSON` boundary there is no `redactPaths` escape hatch on
+    // `createLogger` to fall back on — so the two are deliberately asymmetric.
+    //
+    // Never restore the prototype onto the rebuild instead
+    // (`Object.create(Object.getPrototypeOf(info))`, `setPrototypeOf`, or
+    // copying `toJSON` across as an own key): the copy is not a real instance,
+    // so a `toJSON` reading a private `#field` throws a brand `TypeError` from
+    // inside `json()` — which this package deliberately does not wrap (see the
+    // KNOWN BOUNDARY note in `createLogger`) — turning an ordinary
+    // `logger.info(dto)` into an application crash. Invoking `toJSON` HERE calls
+    // it on the real instance (`this === source`), so private fields work, and
+    // it runs inside our own try/catch, so a hostile `toJSON` fails closed
+    // rather than escaping. This mirrors the resolve-then-redact precedent
+    // `ownContext` / `serializeBody` already set in `request-middleware.ts`.
+    let subject: Record<string, unknown> = source;
+    let resolvedViaToJSON = false;
+    let resolveFailed = false;
+    try {
+      const toJSON = source.toJSON;
+      if (typeof toJSON === "function") {
+        const produced = (toJSON as (key: string) => unknown).call(source, "");
+        if (produced === null || typeof produced !== "object") {
+          // A primitive / `null` `toJSON` result has no keys to inspect, so
+          // `maskMetaKeys` is definitionally inapplicable — and this is exactly
+          // the line the no-mask config emits. Mirrors `redact.ts`'s primitive
+          // `toJSON` boundary. `json()` resolves it downstream.
+          return info;
+        }
+        subject = produced as Record<string, unknown>;
+        resolvedViaToJSON = true;
+      }
+    } catch {
+      // Reading or invoking `toJSON` threw — it is caller code. We cannot prove
+      // what the unresolved object would emit, so FAIL CLOSED rather than
+      // rebuild from `source` (which would emit the fields `toJSON` withholds)
+      // or pass `info` through (which would let the same throw escape from
+      // `json()` and crash the caller's own `logger.info(...)`).
+      resolveFailed = true;
+    }
+
+    // The rebuild below is a PLAIN-object rebuild (`Object.keys` into a fresh
+    // `{}`), which is only faithful when the subject really is a plain object.
+    // Two subjects are not, and both would otherwise diverge from the no-mask
+    // line — reintroducing, in a new shape, the very
+    // mask-on-emits-something-else defect this resolve exists to close:
+    //  - an ARRAY, whether it arrived as the info itself
+    //    (`logger.log("info", ["a","b"])` — `logger.js:245` takes the object
+    //    branch, so `info` IS the array) or as a `toJSON` output. `Object.keys`
+    //    on it yields index keys, so the rebuild renders `{"0":"a","1":"b"}`
+    //    plus the `level`/`timestamp` props winston assigned onto the array,
+    //    where the no-mask line renders `["a","b"]` (`json()`'s array branch
+    //    ignores those extra props).
+    //  - any other non-plain `toJSON` OUTPUT (a `Map`, a class instance).
+    // Delegate both to `redactValue`, which already holds the right rule per
+    // shape, and read its RETURN IDENTITY to decide what to do:
+    //  - a fresh value (arrays always; instances where a key actually matched)
+    //    is package-owned, so the Symbol slots can be carried onto it safely;
+    //  - the SAME value back means `redactValue` classified it as owning no
+    //    key-addressable secret (a `toJSON` bypass, a binary view, or no
+    //    enumerable own keys), so there is nothing for the mask to do and
+    //    nothing we may mutate — hand `info` back and let the serializer resolve
+    //    it exactly as the no-mask line does.
+    // The non-array half is scoped to `resolvedViaToJSON` deliberately: an
+    // ordinary non-`toJSON` class instance (`logger.info(new Hostile())`) must
+    // keep the rebuild path below, which preserves RESERVED_INFO_KEYS unredacted
+    // and degrades per-key rather than failing the whole line.
+    if (!resolveFailed && (Array.isArray(subject) || resolvedViaToJSON)) {
+      const proto = Object.getPrototypeOf(subject);
+      if (proto !== null && proto !== Object.prototype) {
+        let redacted: unknown;
+        try {
+          redacted = redactValue(subject, maskMetaKeys as Set<string>, seen);
+        } catch {
+          resolveFailed = true;
+          redacted = subject;
+        }
+        if (!resolveFailed) {
+          if (redacted === subject) {
+            return info;
+          }
+          const owned = redacted as Record<string | symbol, unknown>;
+          for (const slot of Object.getOwnPropertySymbols(info)) {
+            owned[slot] = (source as unknown as Record<symbol, unknown>)[slot];
+          }
+          return owned as unknown as winston.Logform.TransformableInfo;
+        }
+      }
+    }
+
     const next: Record<string | symbol, unknown> = {};
-    for (const key of Object.keys(info)) {
+    if (resolveFailed) {
+      // `level` is winston's own write. `message` is a caller slot, so reading
+      // it can in principle re-enter caller code — but `errors.js:28` reads
+      // `.message` on this same object on every reachable path before this
+      // format runs, so a getter that throws on read has already detonated
+      // upstream. Keeping the line identifiable is worth that narrow residual.
+      next.level = source.level;
+      next.message = source.message;
+      next._redactionFailed = true;
+      for (const slot of Object.getOwnPropertySymbols(info)) {
+        next[slot] = (source as unknown as Record<symbol, unknown>)[slot];
+      }
+      return next as unknown as winston.Logform.TransformableInfo;
+    }
+
+    for (const key of Object.keys(subject)) {
       if (FORBIDDEN_KEYS.has(key)) {
         // Prototype-pollution vectors are NEVER copied onto the fresh object —
         // the same deny-list `redactValue` applies to every nested rebuild
@@ -674,18 +823,18 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
         continue;
       }
       if (RESERVED_INFO_KEYS.has(key)) {
-        next[key] = source[key];
+        next[key] = subject[key];
         continue;
       }
       if (maskMetaKeys.has(key.toLowerCase())) {
-        // Written without reading `source[key]` first: the value is discarded
+        // Written without reading `subject[key]` first: the value is discarded
         // either way, and not reading it means a throwing getter on a MASKED
         // key cannot take the log line down.
         next[key] = "[REDACTED]";
         continue;
       }
       try {
-        next[key] = redactValue(source[key], maskMetaKeys as Set<string>, seen);
+        next[key] = redactValue(subject[key], maskMetaKeys as Set<string>, seen);
       } catch {
         // Fail closed on this key only — the rest of the line still renders.
         next[key] = REDACTION_FAILED;

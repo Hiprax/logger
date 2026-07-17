@@ -91,12 +91,22 @@
  *   human would read anyway. Primitives are never affected: the depth check
  *   sits after the primitive fast-path, so a scalar leaf always renders.
  *
- * **Redaction boundary (limitation).** Values that define their own `toJSON()`
- * (including `Date`, `URL`, and any class with a custom serializer) are
- * returned by identity and NOT key-redacted — the downstream serializer will
- * invoke `toJSON` and the resulting primitive bypasses key inspection. Use
+ * **Redaction boundary (limitation).** NESTED values that define their own
+ * `toJSON()` (including `Date`, `URL`, and any class with a custom serializer)
+ * are returned by identity and NOT key-redacted — the downstream serializer
+ * will invoke `toJSON` and the resulting primitive bypasses key inspection. Use
  * `redactPaths` for surgical path-based replacement of such values, or
  * normalize them to a plain object before passing to the logger.
+ *
+ * Note the deliberate asymmetry: `logger.ts`'s `buildMetaRedactor` does NOT
+ * inherit this limitation at the TOP level. It resolves a top-level `toJSON`
+ * itself and redacts the output, because (a) a plain rebuild there would
+ * otherwise discard the info's prototype and emit the fields `toJSON`
+ * withheld — making `maskMetaKeys` disclose more when enabled than when off —
+ * and (b) `createLogger` has no `redactPaths` escape hatch, so the remedy this
+ * boundary points at does not exist for `maskMetaKeys`. Here the escape hatch
+ * does exist, and the value is reached mid-walk where invoking a caller's
+ * `toJSON` for every nested built-in would be both costly and surprising.
  *
  * The result is always a fresh object/array (or the original value when no
  * redaction is needed); the input is never mutated.
@@ -158,9 +168,15 @@ export const redactValue = (
     // Pass built-ins through by identity WITHOUT adding to `seen`. This fixes
     // a latent bug where the same Date/URL/etc. referenced by two keys in an
     // outer plain object would yield "[Circular]" on the second reference.
-    // `forceCopy` does NOT apply here: these values own no key `redactEntryPath`
-    // could ever redact (no enumerable own keys, or a `toJSON` bypass), so
-    // identity-sharing them back to the caller is always safe.
+    // `forceCopy` does NOT deep-copy these — they are returned by identity by
+    // design (a `toJSON` output bypasses key inspection downstream, or there are
+    // no enumerable own keys to walk). Note the safety of handing them back to a
+    // `forceCopy` caller that later applies in-place path writes is NOT that they
+    // own no key such a write could reach: a `Buffer`'s integer indices and a
+    // `RegExp`'s `lastIndex` are writable own properties. It is that the sole
+    // in-place write site — `request-middleware.ts`'s `redactEntryPath` — writes
+    // ONLY into an owned plain object or array and treats any other target
+    // (these pass-throughs included) as a graceful no-op.
     const hasToJSON = typeof (value as Record<string, unknown>).toJSON === "function";
     if (hasToJSON || ArrayBuffer.isView(value) || Object.keys(value as object).length === 0) {
       return value;
