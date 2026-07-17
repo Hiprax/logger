@@ -483,9 +483,11 @@ export interface RequestLoggerOptions {
    */
   skip?: (req: LoggableRequest, res: LoggableResponse) => boolean;
   /**
-   * Injects additional context into the structured payload. The returned
-   * object becomes `entry.context` on the resolved {@link RequestLogEntry};
-   * returning `null` / `undefined` leaves `entry.context` unset.
+   * Injects additional context into the structured payload. A fully-owned copy
+   * of the returned object becomes `entry.context` on the resolved
+   * {@link RequestLogEntry} (the value is never held by identity, so a
+   * `redactPaths` write can never mutate the caller's live object); returning
+   * `null` / `undefined` leaves `entry.context` unset.
    *
    * @param req The {@link LoggableRequest} (Express `Request`-compatible) the
    *   middleware received.

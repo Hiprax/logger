@@ -1105,6 +1105,249 @@ describe("createRequestLogger", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Phase 5 — redactPaths must not destroy the caller's live context, and must
+  // not drop the whole log line when a single path assignment fails.
+  // ---------------------------------------------------------------------------
+
+  it("redactPaths:['context.*'] redacts the log line but leaves the caller's live context object intact", () => {
+    // The post-assembly redactPaths pass used to write [REDACTED] straight into
+    // the object enrich() returned by identity (e.g. req.session), destroying
+    // the real value in the running app. entry.context is now an owned copy.
+    const session = { token: "REALSECRET", userId: 7 };
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => session,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ token: "[REDACTED]", userId: 7 });
+    // The caller's live object must still hold the real value.
+    expect(session.token).toBe("REALSECRET");
+    expect(session.userId).toBe(7);
+  });
+
+  it("redactPaths:['context.*'] on a FROZEN context still logs the entry and does not throw", () => {
+    // A frozen context is an ordinary defensive pattern. Because entry.context
+    // is copied before the redactPaths loop, the copy is writable, so the
+    // redaction lands on the copy and the frozen caller object is untouched.
+    const frozen = Object.freeze({ userId: 7, token: "SECRET" });
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => frozen,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ userId: 7, token: "[REDACTED]" });
+    // The caller's frozen object is untouched.
+    expect(frozen.token).toBe("SECRET");
+  });
+
+  it("redactPaths:['context.*'] targeting a getter-only context prop still logs the entry", () => {
+    // JSON.stringify resolves the getter into a plain data field on the copy,
+    // so the redaction applies to the copy; the caller's accessor is untouched.
+    const context = { userId: 7 };
+    Object.defineProperty(context, "token", {
+      get: () => "SECRET",
+      enumerable: true,
+      configurable: false,
+    });
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => context as Record<string, unknown>,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ userId: 7, token: "[REDACTED]" });
+    // The caller's getter is still intact.
+    expect((context as Record<string, unknown>).token).toBe("SECRET");
+  });
+
+  it("redactPaths:['context.*'] redacts a toJSON-defining context (DTO / Mongoose-style) without mutating the caller", () => {
+    // enrich commonly returns req.user — a class instance with a toJSON. The
+    // JSON round-trip copy resolves toJSON so the field stays redactable AND
+    // the caller's live instance is never touched (it would otherwise be
+    // passed through by identity and mutated in place).
+    class UserDoc {
+      public token = "REALSECRET";
+      public id = 42;
+      toJSON() {
+        return { id: this.id, token: this.token };
+      }
+    }
+    const user = new UserDoc();
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => user as unknown as Record<string, unknown>,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ id: 42, token: "[REDACTED]" });
+    expect(JSON.stringify(payload.http.context)).not.toContain("REALSECRET");
+    // The caller's live document is untouched.
+    expect(user.token).toBe("REALSECRET");
+  });
+
+  it("redactPaths:['body.tags.length'] does not throw and still logs the entry with the array intact", () => {
+    // Assigning [REDACTED] to an array's length throws RangeError; the length
+    // guard turns it into a no-op so the whole entry is not dropped.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      redactPaths: ["body.tags.length"],
+    });
+
+    const { res } = runMiddleware(middleware, { body: { tags: ["a", "b"] } });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toEqual({ tags: ["a", "b"] });
+  });
+
+  it("redacts a BigInt-carrying context (owned copy, caller untouched) instead of dropping it", () => {
+    // A BigInt makes the primary JSON.stringify throw; the BigInt-coercing
+    // retry still yields a fully-owned, redactable copy.
+    const context: Record<string, unknown> = { id: 100n, token: "REALSECRET" };
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => context,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ id: "100", token: "[REDACTED]" });
+    // The caller's live object is untouched — its BigInt and secret survive.
+    expect(context.id).toBe(100n);
+    expect(context.token).toBe("REALSECRET");
+  });
+
+  it("redacts a toJSON-defining context that carries a BigInt without mutating the caller (judge regression)", () => {
+    // Composite case: a class instance that defines toJSON AND whose serialized
+    // form is not JSON-expressible (a BigInt field). redactValue's forceCopy
+    // would pass such an instance through BY IDENTITY (toJSON boundary), so the
+    // redactPaths write would mutate the caller. The BigInt-coercing round-trip
+    // resolves toJSON into a fresh owned object, closing that hole.
+    class Ctx {
+      token = "REALSECRET";
+      toJSON() {
+        return { token: this.token, amount: 100n };
+      }
+    }
+    const ctx = new Ctx();
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => ctx as unknown as Record<string, unknown>,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ token: "[REDACTED]", amount: "100" });
+    expect(JSON.stringify(payload.http.context)).not.toContain("REALSECRET");
+    // The caller's live instance MUST be untouched.
+    expect(ctx.token).toBe("REALSECRET");
+  });
+
+  it("degrades a circular context to an owned sentinel and still logs (no throw, caller untouched)", () => {
+    // A circular context cannot be expressed by either round-trip; it degrades
+    // to a fresh owned { _unserializable: true } sentinel rather than sharing
+    // the caller's live graph or dropping the line.
+    const circular: Record<string, unknown> = { token: "REALSECRET" };
+    circular.self = circular;
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => circular,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ _unserializable: true });
+    // The caller's live circular object is untouched.
+    expect(circular.token).toBe("REALSECRET");
+    expect(circular.self).toBe(circular);
+  });
+
+  it("degrades a context whose getter throws to an owned sentinel and still logs the entry", () => {
+    // A throwing getter makes both round-trips throw; the line must still be
+    // logged (never dropped) and the caller is never mutated.
+    const context = { userId: 7 };
+    Object.defineProperty(context, "token", {
+      get: () => {
+        throw new Error("getter boom");
+      },
+      enumerable: true,
+      configurable: false,
+    });
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => context as Record<string, unknown>,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ _unserializable: true });
+  });
+
+  // ---------------------------------------------------------------------------
   // Task #12 — Truncation type stability
   // ---------------------------------------------------------------------------
 
@@ -2348,6 +2591,59 @@ describe("request middleware internals", () => {
     const entry = { requestBody: { user: "alice" } } as unknown as Record<string, unknown>;
     redactEntryPath(entry, "body.user.password");
     expect(entry.requestBody).toEqual({ user: "alice" });
+  });
+
+  it("redactEntryPath is a no-op on an array `length` target (does not throw)", () => {
+    const entry = { requestBody: { tags: ["a", "b"] } } as unknown as Record<string, unknown>;
+    expect(() => redactEntryPath(entry, "body.tags.length")).not.toThrow();
+    expect(entry.requestBody).toEqual({ tags: ["a", "b"] });
+    expect((entry.requestBody as { tags: string[] }).tags.length).toBe(2);
+  });
+
+  it("redactEntryPath is a no-op on a non-writable (frozen) property (does not throw)", () => {
+    const entry = { context: Object.freeze({ token: "SECRET" }) } as unknown as Record<
+      string,
+      unknown
+    >;
+    expect(() => redactEntryPath(entry, "context.token")).not.toThrow();
+    expect((entry.context as { token: string }).token).toBe("SECRET");
+  });
+
+  it("redactEntryPath is a no-op on a getter-only / accessor property (does not throw)", () => {
+    const context = {};
+    Object.defineProperty(context, "token", {
+      get: () => "SECRET",
+      enumerable: true,
+      configurable: true,
+    });
+    const entry = { context } as unknown as Record<string, unknown>;
+    expect(() => redactEntryPath(entry, "context.token")).not.toThrow();
+    expect((entry.context as { token: string }).token).toBe("SECRET");
+  });
+
+  it("redactEntryPath swallows an assignment that throws (Proxy with a throwing set trap)", () => {
+    // Defense-in-depth: even a slot reported as a writable data property can
+    // throw on assignment. The final try/catch turns that into a no-op instead
+    // of dropping the whole log entry.
+    const throwing = new Proxy(
+      { token: "SECRET" },
+      {
+        set() {
+          throw new Error("set trap boom");
+        },
+        getOwnPropertyDescriptor(target, key) {
+          return {
+            value: (target as Record<string, unknown>)[key as string],
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          };
+        },
+      },
+    );
+    const entry = { context: throwing } as unknown as Record<string, unknown>;
+    expect(() => redactEntryPath(entry, "context.token")).not.toThrow();
+    expect((throwing as { token: string }).token).toBe("SECRET");
   });
 
   it("resolveMaskHeaderKeys returns undefined when option is false and the default set otherwise", () => {

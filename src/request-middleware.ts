@@ -327,6 +327,47 @@ const serializeBody = (
 };
 
 /**
+ * Returns a **fully-owned** copy of the `enrich()` context so the post-assembly
+ * `redactPaths` pass — which writes in place via `redactEntryPath` — can never
+ * mutate the caller's live object (typically `req.session` / `req.user`). The
+ * result shares no reference with the caller, and this function never throws.
+ *
+ * A `JSON.parse(JSON.stringify(...))` round-trip is the primary strategy
+ * (matching `serializeBody`'s body path): it yields a graph that shares nothing
+ * with the caller and is `toJSON`-resolved exactly as the downstream log
+ * serializer renders it, so a context that defines `toJSON` (a Mongoose
+ * document, a class DTO, `req.user`) is copied BY VALUE — its fields stay
+ * redactable by `redactPaths` instead of being passed through by identity and
+ * mutated. A context carrying a `BigInt` (a snowflake id, a monetary amount)
+ * makes the plain round-trip throw, so it is retried through a BigInt-coercing
+ * replacer — still a fully-owned, `toJSON`-resolved copy. A context that
+ * neither round-trip can express (a circular reference, or a value whose getter
+ * / `toJSON` throws) degrades to a fresh owned `{ _unserializable: true }`
+ * sentinel rather than sharing the caller's live graph or letting the failure
+ * escape and drop the whole log line. `redactValue`'s `forceCopy` is
+ * deliberately NOT used here: it passes a `toJSON`-defining instance through by
+ * identity (a documented `redact.ts` boundary), which would leave a `toJSON`
+ * DTO carrying a `BigInt` field shared with — and mutable on — the caller.
+ */
+const ownContext = (enriched: Record<string, unknown>): Record<string, unknown> => {
+  try {
+    return JSON.parse(JSON.stringify(enriched)) as Record<string, unknown>;
+  } catch {
+    // Fall through: a value is not JSON-expressible as-is (commonly a BigInt).
+  }
+  try {
+    return JSON.parse(
+      JSON.stringify(enriched, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value,
+      ),
+    ) as Record<string, unknown>;
+  } catch {
+    // A circular reference, or a value whose getter / `toJSON` throws.
+    return { _unserializable: true };
+  }
+};
+
+/**
  * Property names that must NEVER be assigned through `acc[key] = …` when
  * rebuilding a header bag or walking a `redactPaths` segment. `__proto__`
  * invokes the prototype setter (mutating the local object's prototype chain
@@ -506,6 +547,17 @@ const redactUrlQuery = (url: string, maskQueryKeys: ReadonlySet<string> | undefi
  *   field name on `RequestLogEntry`).
  * - `requestBody.user.password` is also accepted as the explicit form.
  * - `context.user.token` → `entry.context.user.token = "[REDACTED]"`.
+ *
+ * The final assignment is **best-effort and never throws**: an array `length`
+ * target, a getter-only / accessor property, a non-writable (frozen) slot, or
+ * any other value whose write would raise (a `Proxy` with a throwing `set`
+ * trap) is skipped rather than allowed to propagate. This is load-bearing —
+ * `finalize()` applies these paths inside the same try block that assembles the
+ * whole entry, so a throwing redaction would otherwise drop the ENTIRE log line
+ * (method, url, status included) over one path. Callers that must guarantee the
+ * caller's own object is never mutated by these in-place writes should pass a
+ * fully-owned copy of the target sub-graph (as `finalize()` does for
+ * `entry.context` and `serializeBody()` does for `entry.requestBody`).
  */
 const redactEntryPath = (entry: Record<string, unknown>, path: string): void => {
   if (!path) {
@@ -557,7 +609,32 @@ const redactEntryPath = (entry: Record<string, unknown>, path: string): void => 
   if (!Object.prototype.hasOwnProperty.call(target, finalKey)) {
     return;
   }
-  target[finalKey] = REDACTED;
+  // Never overwrite an array's `length`. `hasOwnProperty(arr, "length")` is
+  // `true`, but assigning a non-numeric value throws
+  // `RangeError: Invalid array length`; without this guard
+  // `redactPaths:["body.tags.length"]` would throw and `finalize()`'s catch
+  // would drop the ENTIRE log entry over a single path.
+  if (Array.isArray(target) && finalKey === "length") {
+    return;
+  }
+  // Only overwrite a writable data property. A frozen target
+  // (`writable === false`), a getter-only / accessor property (`get` / `set`),
+  // or any other non-assignable slot cannot be written — in strict mode the
+  // assignment throws, and that throw would propagate to `finalize()`'s catch
+  // and drop the whole entry. Logging is best-effort, so a redaction that
+  // cannot be applied degrades to a no-op on that path instead.
+  const descriptor = Object.getOwnPropertyDescriptor(target, finalKey);
+  if (!descriptor || descriptor.get || descriptor.set || descriptor.writable === false) {
+    return;
+  }
+  // Defense-in-depth: even a writable data property can throw on assignment
+  // (an exotic host object, or a `Proxy` with a throwing `set` trap). A failed
+  // redaction must never take the log line down with it.
+  try {
+    target[finalKey] = REDACTED;
+  } catch {
+    // best-effort: leave the value in place rather than dropping the entry
+  }
 };
 
 /**
@@ -888,7 +965,13 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
         if (enrich) {
           // `enrich(...) ?? undefined` collapses a `null` or `undefined` return
           // value to `undefined` so `entry.context` is never set to `null`.
-          entry.context = enrich(req, res, durationMs) ?? undefined;
+          // `ownContext` then takes a fully-owned copy (see its doc): the
+          // post-assembly `redactPaths` loop writes in place, so `entry.context`
+          // must never be the object `enrich()` returned BY IDENTITY, or
+          // `redactPaths:["context.token"]` would overwrite the caller's live
+          // `req.session` / `req.user` in the running app.
+          const enriched = enrich(req, res, durationMs) ?? undefined;
+          entry.context = enriched === undefined ? undefined : ownContext(enriched);
         }
 
         // Surgical path-based redaction. Body-scoped paths (`body.*` /
@@ -898,8 +981,13 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
         // them here is a harmless idempotent no-op. This pass remains the ONLY
         // place `context.*` / `requestHeaders.*` / `responseHeaders.*` paths
         // are redacted, and it still runs LAST so it can override anything
-        // that survived the keyword-based body/header masks. Missing
-        // intermediate segments are a graceful no-op.
+        // that survived the keyword-based body/header masks. Every sub-graph it
+        // writes into is package-owned — `entry.requestBody` from
+        // `serializeBody`, `entry.requestHeaders` / `entry.responseHeaders`
+        // from `normalizeHeaders`, and `entry.context` from the copy taken
+        // above — so `redactEntryPath`'s in-place writes can never reach the
+        // caller's live objects. Missing intermediate segments, non-writable
+        // slots, and array `length` targets are all graceful no-ops.
         if (resolvedRedactPaths.length > 0) {
           resolvedRedactPaths.forEach((path) =>
             redactEntryPath(entry as unknown as Record<string, unknown>, path),
