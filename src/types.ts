@@ -281,7 +281,12 @@ export interface LoggerOptions {
    * Set `exitOnUncaught: false` to keep logging fatals without exiting (the
    * pre-v1.0.0 behavior). Only meaningful when {@link captureUncaught} is
    * `true`. When several capture-enabled loggers set different values, the
-   * value of the elected primary logger governs the process-level decision.
+   * process-level decision is a **consensus**: the process exits only when
+   * every registered logger allows it, so a single `exitOnUncaught: false` on
+   * any logger vetoes the exit for the whole process, regardless of which
+   * logger is elected to record the crash or the order the loggers were
+   * created. A process has one lifetime, so a per-logger opt-out can only mean
+   * "keep the whole process alive".
    *
    * This option governs BOTH `uncaughtException` and `unhandledRejection`.
    */
@@ -325,11 +330,26 @@ export interface LoggerOptions {
    * gracefully (replaced with `"[Circular]"`).
    *
    * **Redaction boundary.** Deep redaction covers plain objects, arrays, and
-   * the enumerable own fields of class/Error instances. Values that define
-   * their own `toJSON()` (such as `Date`, `URL`, and custom serializable
-   * classes) or that carry no enumerable own keys (`Map`, `Set`, `RegExp`,
-   * etc.) are serialized via their built-in method and are **not** key-
-   * redacted — use `redactPaths` or normalize to a plain object for those.
+   * the enumerable own fields of class/Error instances. NESTED values that
+   * define their own `toJSON()` (such as `Date`, `URL`, and custom
+   * serializable classes) or that carry no enumerable own keys (`Map`, `Set`,
+   * `RegExp`, etc.) are serialized via their built-in method and are **not**
+   * key-redacted — use `redactPaths` or normalize to a plain object for those.
+   * A `toJSON`-defining object passed as the log call's own subject
+   * (`logger.info(dto)` in `format: "json"`) is the exception: its `toJSON()`
+   * is resolved first and the resulting fields ARE key-redacted, so enabling
+   * the mask never emits more than logging the same object without it would.
+   *
+   * **Console/file parity (`format: "json"`).** The json-mode Console transport
+   * carries no per-transport format, so `winston-transport` writes the
+   * logger-level chain's already-serialized `info[MESSAGE]` verbatim — the same
+   * bytes the file transports emit. Console and file output are therefore
+   * byte-identical for every payload shape (including a `toJSON`-defining log
+   * subject), with the deep redaction and JSON serialization run exactly once,
+   * whether or not `maskMetaKeys` is configured. No `includeConsole: false`
+   * workaround is needed. (Earlier versions ran a duplicate console format over
+   * a shallow clone that dropped the prototype and could diverge on a `toJSON`
+   * subject; that duplicate chain no longer exists.)
    */
   maskMetaKeys?: string[];
   /**
@@ -360,9 +380,11 @@ export interface LoggerOptions {
   format?: "pretty" | "json";
   /**
    * When `true`, replaces every `\r` and `\n` character in a string-typed
-   * `info.message` with the literal escape sequences `"\\r"` and `"\\n"` BEFORE
-   * the printf concatenates the message into the rendered log line. Defaults
-   * to `false` for backward compatibility.
+   * `info.message` — and in a string-typed `info.stack` — with the literal
+   * escape sequences `"\\r"` and `"\\n"` BEFORE the printf concatenates them
+   * into the rendered log line. Defaults to `false` for backward
+   * compatibility. Applies to the `pretty` format only; `json` output escapes
+   * newlines inherently.
    *
    * **Threat model.** Most loggers — including Winston by default — write the
    * caller-supplied `message` verbatim. When the message string is built from
@@ -377,8 +399,26 @@ export interface LoggerOptions {
    * Setting `escapeMessageNewlines: true` flips the default to safe: embedded
    * newlines render as the visible literal sequences `\\n` / `\\r`, preserving
    * the original message contents for debugging while making forged log lines
-   * obvious. Non-string messages (objects, errors) are unaffected — they are
-   * already serialized through `JSON.stringify`, which escapes newlines.
+   * obvious.
+   *
+   * **The escape covers the rendered `stack` line too**, and must: wrapping the
+   * untrusted string in an `Error` (`logger.error(new Error(username))`) is
+   * otherwise a complete bypass. `winston.format.errors({ stack: true })`
+   * flattens the `Error` into a string message plus a string stack whose first
+   * line repeats that same message, so the payload escaped on the message line
+   * was re-injected raw one line below it, forging the same fake `[ERROR]`
+   * entry the option exists to prevent.
+   *
+   * **Trade-off (opt-in only).** With this option ON, a genuine multi-line
+   * stack trace renders as a SINGLE line whose frame separators appear as the
+   * literal `\\n` sequence. Every frame is still present and greppable, nothing
+   * is dropped, and this is inherent to the guarantee — a real stack frame and
+   * a forged log line are the same bytes to a log parser, so newlines from
+   * caller-supplied data cannot be trusted selectively. Consumers whose
+   * pipeline depends on multi-line stack rendering should leave the option at
+   * its `false` default, in which both the message and the stack render exactly
+   * as they always have. Values that are not strings on either branch are
+   * serialized through `JSON.stringify`, which escapes newlines regardless.
    *
    * Mature production loggers (pino, bunyan, application-log shippers) ship
    * the equivalent of this option enabled by default; this package keeps it
@@ -401,6 +441,19 @@ export interface RequestLogEntry {
   url: string;
   statusCode: number;
   responseTimeMs: number;
+  /**
+   * The RESPONSE's declared byte count, parsed from the response
+   * `Content-Length` header. This is a response-side field only — it reflects
+   * whatever value the response's `Content-Length` header holds at log time, or
+   * `undefined` when the response declared none (a chunked/streamed response, or
+   * a request aborted before any `Content-Length` was set). It is the *declared*
+   * size, not a count of bytes actually transmitted: a response aborted
+   * mid-body after its `Content-Length` was set still reports that declared
+   * figure. It never falls back to the request's `Content-Length`; reporting the
+   * uploaded body size here would mislabel egress. If you need the request body
+   * size, read it from `requestHeaders["content-length"]` (enable
+   * `includeRequestHeaders`).
+   */
   contentLength?: number;
   ip?: string;
   userAgent?: string;
@@ -424,6 +477,28 @@ export interface RequestLogEntry {
   requestBody?: unknown;
   requestHeaders?: Record<string, unknown>;
   responseHeaders?: Record<string, unknown>;
+  /**
+   * Whatever {@link RequestLoggerOptions.enrich} returned, as a **fully-owned
+   * copy** — never the caller's object by identity. That ownership is what lets
+   * {@link RequestLoggerOptions.redactPaths} write `"[REDACTED]"` into
+   * `context.*` without destroying the live `req.session` / `req.user` it came
+   * from.
+   *
+   * The copy is taken with a `toJSON`-resolving round-trip, so the value here is
+   * what the log serializer would render, not the original graph. Observable
+   * consequences worth knowing if you read `context` back in a custom
+   * `messageBuilder`:
+   * - A `Date` becomes its ISO string; a class DTO / Mongoose document becomes
+   *   its `toJSON()` output (a plain object, no methods or prototype).
+   * - `undefined`-valued keys and functions drop out, exactly as they would in
+   *   the emitted line.
+   * - A `BigInt` becomes its decimal string (the plain round-trip is retried
+   *   through a BigInt-coercing replacer).
+   * - A context that no round-trip can express — a circular reference, or a
+   *   value whose getter / `toJSON` throws — degrades to the owned sentinel
+   *   `{ _unserializable: true }` rather than sharing the caller's live graph or
+   *   letting the failure drop the whole log entry.
+   */
   context?: Record<string, unknown>;
   /**
    * Captured value of `res.writableEnded` at finalize time. `true` indicates
@@ -483,9 +558,11 @@ export interface RequestLoggerOptions {
    */
   skip?: (req: LoggableRequest, res: LoggableResponse) => boolean;
   /**
-   * Injects additional context into the structured payload. The returned
-   * object becomes `entry.context` on the resolved {@link RequestLogEntry};
-   * returning `null` / `undefined` leaves `entry.context` unset.
+   * Injects additional context into the structured payload. A fully-owned copy
+   * of the returned object becomes `entry.context` on the resolved
+   * {@link RequestLogEntry} (the value is never held by identity, so a
+   * `redactPaths` write can never mutate the caller's live object); returning
+   * `null` / `undefined` leaves `entry.context` unset.
    *
    * @param req The {@link LoggableRequest} (Express `Request`-compatible) the
    *   middleware received.

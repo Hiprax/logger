@@ -36,20 +36,34 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # eslint@10 requires Node ^20.19.0 || ^22.13.0 || >=24 and its stylish
+      # formatter calls util.styleText (Node 20.12+), so it hard-crashes on the
+      # 18.x leg the instant there is a real violation to print. Scope lint and
+      # format:check to a leg whose Node satisfies eslint's engines; the 18.x leg
+      # still runs build/test/type-check, which genuinely exercise engines >=18.
+      # Step-level `if:` does not change the job name, so the branch ruleset's
+      # required status-check names stay stable.
       - name: Lint
+        if: matrix.node == '22.x'
         run: npm run lint
 
       - name: Type check
         run: npm run type-check
 
       - name: Format check
+        if: matrix.node == '22.x'
         run: npm run format:check
+
+      # Build BEFORE Test on every leg: tests/packaging.spec.ts asserts the
+      # dist/*.d.ts and dist/*.d.cts declaration files exist on disk, and skips
+      # when dist/ is absent. On a fresh checkout dist/ is gitignored, so running
+      # Test first made those assertions silently skip. Building first (tsup takes
+      # ~2s) makes them execute.
+      - name: Build
+        run: npm run build
 
       - name: Test
         run: npm test
-
-      - name: Build
-        run: npm run build
 
       - name: Runtime audit
         if: matrix.os == 'ubuntu-latest' && matrix.node == '22.x'

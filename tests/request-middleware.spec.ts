@@ -142,7 +142,52 @@ describe("createRequestLogger", () => {
     expect(payload.http.requestBody._originalLength).toBeGreaterThan(10);
     expect(payload.http.requestBody._preview.length).toBe(10);
     expect(payload.http.responseHeaders).toEqual({});
-    expect(payload.http.contentLength).toBe(77);
+    // `contentLength` is a RESPONSE-side field. This request carries a
+    // `content-length: 77` header but the response sets none, so the honest
+    // value is `undefined` — it must NOT fall back to the request's size.
+    expect(payload.http.contentLength).toBeUndefined();
+  });
+
+  it("reports contentLength from the response Content-Length header", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({ logger, includeHttpContext: true });
+
+    // Request carries its own (uploaded) content-length; the response declares a
+    // different one. `contentLength` must reflect the RESPONSE value.
+    const { res } = runMiddleware(middleware, { headers: { "content-length": "5000" } });
+    res.setHeader("content-length", "512");
+    res.emit("finish");
+
+    expect(log.mock.calls[0][0].http.contentLength).toBe(512);
+  });
+
+  it("reports no contentLength for a chunked response even with a request body", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({ logger, includeHttpContext: true });
+
+    // A 5000-byte upload answered by a chunked 2-byte response (no response
+    // Content-Length). The old fallback logged `contentLength: 5000`; the honest
+    // value is `undefined`.
+    const { res } = runMiddleware(middleware, { headers: { "content-length": "5000" } });
+    res.statusCode = 200;
+    res.emit("finish");
+
+    expect(log.mock.calls[0][0].http.contentLength).toBeUndefined();
+  });
+
+  it("reports no phantom contentLength for an aborted request", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({ logger, includeHttpContext: true });
+
+    // The request declared 5000 bytes but the connection aborted before the
+    // response wrote a Content-Length. Nothing was sent, so no size is reported.
+    const { res } = runMiddleware(middleware, { headers: { "content-length": "5000" } });
+    res.statusCode = 503;
+    res.emit("close");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.event).toBe("aborted");
+    expect(payload.http.contentLength).toBeUndefined();
   });
 
   it("supports request header allowlists", () => {
@@ -266,6 +311,37 @@ describe("createRequestLogger", () => {
       includeRequestBody: true,
     });
 
+    // A throwing `toJSON` is a genuine serialization failure. (A BigInt is NOT
+    // one — `bigintSafeReplacer` renders it — see the test below.) No
+    // `redactPaths` are configured, so nothing was mandated and the loose
+    // String() rendering carries no unredacted secret.
+    const { res } = runMiddleware(middleware, {
+      body: [
+        {
+          toJSON() {
+            throw new Error("boom");
+          },
+        },
+      ] as unknown,
+    });
+
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toBe("[object Object]");
+  });
+
+  it("renders a BigInt body rather than collapsing it into the String() fallback", () => {
+    // Regression guard: a BigInt used to make both stringify calls throw, so
+    // this body was emitted as the string "42" instead of the real array.
+    const { logger, log } = createMockLogger();
+
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+    });
+
     const { res } = runMiddleware(middleware, {
       body: [42n] as unknown,
     });
@@ -273,7 +349,120 @@ describe("createRequestLogger", () => {
     res.emit("finish");
 
     const payload = log.mock.calls[0][0];
-    expect(payload.http.requestBody).toBe("42");
+    expect(payload.http.requestBody).toEqual([42n]);
+    expect(payload.http.requestBody).not.toBe("42");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Depth-bounded body redaction — a deep body must not make the request
+  // structurally invisible in the HTTP log.
+  //
+  // `serializeBody` runs the recursive redaction walk over `req.body`. Unbounded,
+  // that walk overflows the stack on a ~3000-deep body (~18KB — well under
+  // `express.json()`'s 100kb default), `finalize()`'s catch swallowed the
+  // RangeError, and ZERO log entries were emitted for the request — not even the
+  // method/url/status, which never touched the body. That is a cheap way for an
+  // attacker to erase their own requests from the log.
+  // ---------------------------------------------------------------------------
+
+  /** Builds a `{child:{child:…}}` chain `depth` levels deep with a secret leaf. */
+  const buildDeepBody = (depth: number): Record<string, unknown> => {
+    const root: Record<string, unknown> = {};
+    let cursor = root;
+    for (let i = 0; i < depth; i += 1) {
+      const next: Record<string, unknown> = {};
+      cursor.child = next;
+      cursor = next;
+    }
+    cursor.password = "topsecret";
+    return root;
+  };
+
+  it("still logs the entry for a 3000-deep request body instead of dropping it", () => {
+    const { logger, log } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      maskBodyKeys: ["password"],
+      maxBodyLength: 100_000,
+    });
+
+    const { res } = runMiddleware(middleware, {
+      method: "POST",
+      originalUrl: "/deep",
+      body: buildDeepBody(3000),
+    });
+    res.emit("finish");
+
+    // Pre-fix: zero calls — the RangeError from the walk hit finalize()'s catch.
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.method).toBe("POST");
+    expect(payload.http.url).toBe("/deep");
+    expect(payload.http.statusCode).toBe(200);
+    // The body renders, bounded by the depth sentinel; the over-deep secret is
+    // never reached and so cannot leak.
+    expect(JSON.stringify(payload.http.requestBody)).toContain("[MaxDepth]");
+    expect(JSON.stringify(payload.http.requestBody)).not.toContain("topsecret");
+    // The entry was logged normally, not via the never-crash error path.
+    expect(errSpy).not.toHaveBeenCalled();
+  });
+
+  it("redacts a body nested 255 levels deep normally (the depth guard must not fire early)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      maskBodyKeys: ["password"],
+      maxBodyLength: 100_000,
+    });
+
+    const { res } = runMiddleware(middleware, { body: buildDeepBody(255) });
+    res.emit("finish");
+
+    let cursor: any = log.mock.calls[0][0].http.requestBody;
+    for (let i = 0; i < 255; i += 1) cursor = cursor.child;
+    expect(cursor.password).toBe("[REDACTED]");
+    expect(JSON.stringify(log.mock.calls[0][0].http.requestBody)).not.toContain("[MaxDepth]");
+  });
+
+  it("degrades only the body to a sentinel when serialization fails, still logging the entry", () => {
+    // A body whose own enumerable getter throws: the redaction walk reads own
+    // keys, so reading it detonates inside `serializeBody`. Pre-fix that
+    // exception reached finalize()'s catch and took the WHOLE entry with it.
+    const { logger, log } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const body = { safe: "visible" };
+    Object.defineProperty(body, "boom", {
+      enumerable: true,
+      get() {
+        throw new Error("getter exploded");
+      },
+    });
+
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      maskBodyKeys: ["password"],
+    });
+
+    const { res } = runMiddleware(middleware, { method: "POST", originalUrl: "/boom", body });
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    // Everything that never touched the body still survives...
+    expect(payload.http.method).toBe("POST");
+    expect(payload.http.url).toBe("/boom");
+    expect(payload.http.statusCode).toBe(200);
+    // ...and only the body degrades.
+    expect(payload.http.requestBody).toBe("[UNSERIALIZABLE]");
+    expect(errSpy).not.toHaveBeenCalled();
   });
 
   it("omits http metadata unless includeHttpContext is true", () => {
@@ -841,6 +1030,58 @@ describe("createRequestLogger", () => {
     });
   });
 
+  it("does not leak a redactPaths target end-to-end when the body carries a BigInt", () => {
+    // The proven end-to-end leak: a single BigInt made the redactPaths
+    // round-trip throw, so every mandated path was skipped and String(body)
+    // joined the array into "1,SUPER-SECRET,5" straight into the log.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      redactPaths: ["body.1"],
+    });
+
+    const { res } = runMiddleware(middleware, {
+      method: "POST",
+      originalUrl: "/orders",
+      body: ["1", "SUPER-SECRET", 5n],
+    });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toEqual(["1", "[REDACTED]", "5"]);
+    const rendered = JSON.stringify(payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+    expect(rendered).not.toContain("SUPER-SECRET");
+  });
+
+  it("logs a diagnosable redacted body end-to-end when the body carries a BigInt", () => {
+    // Previously the whole body collapsed to the useless "[object Object]",
+    // silently discarding every diagnostic field.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      maskBodyKeys: ["password"],
+    });
+
+    const { res } = runMiddleware(middleware, {
+      method: "POST",
+      originalUrl: "/pay",
+      body: { amount: 100n, password: "hunter2", user: "bob" },
+    });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).not.toBe("[object Object]");
+    expect(payload.http.requestBody).toMatchObject({
+      password: "[REDACTED]",
+      user: "bob",
+      amount: 100n,
+    });
+  });
+
   it("handles missing intermediate keys in redactPaths gracefully", () => {
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
@@ -990,6 +1231,449 @@ describe("createRequestLogger", () => {
     // The caller's ORIGINAL instance must be untouched.
     expect(originalBody.password).toBe("REALSECRET");
     expect(originalBody.username).toBe("alice");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 5 — redactPaths must not destroy the caller's live context, and must
+  // not drop the whole log line when a single path assignment fails.
+  // ---------------------------------------------------------------------------
+
+  it("redactPaths:['context.*'] redacts the log line but leaves the caller's live context object intact", () => {
+    // The post-assembly redactPaths pass used to write [REDACTED] straight into
+    // the object enrich() returned by identity (e.g. req.session), destroying
+    // the real value in the running app. entry.context is now an owned copy.
+    const session = { token: "REALSECRET", userId: 7 };
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => session,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ token: "[REDACTED]", userId: 7 });
+    // The caller's live object must still hold the real value.
+    expect(session.token).toBe("REALSECRET");
+    expect(session.userId).toBe(7);
+  });
+
+  // ---------------------------------------------------------------------------
+  // redactPaths must not mutate the caller's live HEADER values.
+  //
+  // `normalizeHeaders` rebuilds the header BAG, and the code once claimed that
+  // made the header sub-graph package-owned. It did not: each VALUE was copied
+  // by reference, and `redactEntryPath` writes IN PLACE — so a path reaching
+  // into a multi-value (array) header wrote "[REDACTED]" into the running
+  // application's own headers. `set-cookie` hid it (it is in
+  // DEFAULT_MASKED_HEADER_KEYS, so the whole array was already replaced by a
+  // string); every array-valued header outside that list was exposed.
+  // ---------------------------------------------------------------------------
+
+  it("redactPaths into a multi-value REQUEST header redacts the line without mutating req.headers", () => {
+    const liveTags = ["TAG-SECRET", "b"];
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestHeaders: true,
+      redactPaths: ["requestHeaders.x-tags.0"],
+    });
+
+    const { res } = runMiddleware(middleware, { headers: { "x-tags": liveTags } });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    // The log line IS redacted...
+    expect(payload.http.requestHeaders["x-tags"]).toEqual(["[REDACTED]", "b"]);
+    // ...and the caller's live array is untouched. Before `ownHeaderValue` this
+    // array read ["[REDACTED]", "b"] in the running app.
+    expect(liveTags).toEqual(["TAG-SECRET", "b"]);
+  });
+
+  it("redactPaths into a multi-value RESPONSE header does not mutate the app's own array", () => {
+    // Node documents `res.getHeaders()` as returning a shallow copy whose array
+    // values "may be mutated without additional calls to various header-related
+    // http module methods" — i.e. the array reached here is the very array the
+    // application handed to `res.setHeader`. This asserts on that original
+    // variable, not on `getHeaders()`'s copy.
+    const appOwnedArray = ["RES-TAG-SECRET", "b"];
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeResponseHeaders: true,
+      redactPaths: ["responseHeaders.x-tags.0"],
+    });
+
+    const { res } = runMiddleware(
+      middleware,
+      {},
+      { getHeaders: () => ({ "x-tags": appOwnedArray }) },
+    );
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.responseHeaders["x-tags"]).toEqual(["[REDACTED]", "b"]);
+    expect(appOwnedArray).toEqual(["RES-TAG-SECRET", "b"]);
+  });
+
+  it("the allow-list header path owns its values too (covers the filtered branch)", () => {
+    // The allow-list branch reads out of `normalized`, so the single
+    // `ownHeaderValue` site must cover it. If it ever stops doing so, this goes
+    // red while the `include: true` test above stays green.
+    const liveTags = ["ALLOW-SECRET", "b"];
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestHeaders: ["x-tags"],
+      redactPaths: ["requestHeaders.x-tags.0"],
+    });
+
+    const { res } = runMiddleware(middleware, { headers: { "x-tags": liveTags } });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestHeaders["x-tags"]).toEqual(["[REDACTED]", "b"]);
+    expect(liveTags).toEqual(["ALLOW-SECRET", "b"]);
+  });
+
+  it("redactPaths into an OBJECT-valued response header does not mutate the app's object", () => {
+    // Node's docs: `setHeader()` stores "non-string values without
+    // modification", and `getHeaders()` hands the same reference back — so an
+    // object-valued header is reachable in PLAIN Node, not just via an exotic
+    // adapter. A one-level array copy would have left this shared; owning the
+    // value through `redactValue`'s `forceCopy` mode closes it at every depth.
+    const liveObj = { secret: "OBJ-SECRET", other: 1 };
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeResponseHeaders: true,
+      redactPaths: ["responseHeaders.x-meta.secret"],
+    });
+
+    const { res } = runMiddleware(middleware, {}, { getHeaders: () => ({ "x-meta": liveObj }) });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.responseHeaders["x-meta"]).toEqual({ secret: "[REDACTED]", other: 1 });
+    expect(liveObj).toEqual({ secret: "OBJ-SECRET", other: 1 });
+  });
+
+  it("a scalar header value redacts without mutation (covers the non-array ownHeaderValue branch)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestHeaders: true,
+      redactPaths: ["requestHeaders.x-scalar"],
+    });
+
+    const headers = { "x-scalar": "SCALAR-SECRET" };
+    const { res } = runMiddleware(middleware, { headers });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestHeaders["x-scalar"]).toBe("[REDACTED]");
+    // A string is immutable, so the caller's bag simply keeps its own value.
+    expect(headers["x-scalar"]).toBe("SCALAR-SECRET");
+  });
+
+  it("does NOT zero a byte of a Buffer-valued response header the caller still holds", () => {
+    // `redactValue` passes a binary view through BY IDENTITY (its `forceCopy`
+    // mode does not copy `ArrayBuffer.isView` values), so `entry.responseHeaders`
+    // shares the caller's live Buffer. A Buffer has WRITABLE integer-index own
+    // properties, so `hasOwnProperty("0")` + a writable descriptor alone would
+    // let this path coerce and zero a byte of the application's own Buffer.
+    // `redactEntryPath` must refuse to write into any non-plain, non-array
+    // target — this pins that guard. Reachable in plain Node: `res.setHeader`
+    // stores non-string values unmodified and `res.getHeaders()` returns them by
+    // reference.
+    const liveDigest = Buffer.from([0x01, 0x02, 0x03, 0x04]);
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeResponseHeaders: true,
+      redactPaths: ["responseHeaders.x-digest.0"],
+    });
+
+    const { res } = runMiddleware(
+      middleware,
+      {},
+      { getHeaders: () => ({ "x-digest": liveDigest }) },
+    );
+    res.emit("finish");
+
+    // The entry is still logged in full — the skipped write is a no-op, not a
+    // dropped line.
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.method).toBeDefined();
+    // And the caller's live Buffer is byte-for-byte intact.
+    expect([...liveDigest]).toEqual([0x01, 0x02, 0x03, 0x04]);
+  });
+
+  it("does NOT overwrite a RegExp's lastIndex on a response header the caller still holds", () => {
+    // A `RegExp` has no enumerable own keys, so `redactValue` returns it by
+    // identity; `lastIndex` is a writable (non-enumerable) own property, so a
+    // bare `hasOwnProperty` + writable check would clobber it. Same guard.
+    const liveRe = /secret/g;
+    liveRe.lastIndex = 3;
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeResponseHeaders: true,
+      redactPaths: ["responseHeaders.x-re.lastIndex"],
+    });
+
+    const { res } = runMiddleware(middleware, {}, { getHeaders: () => ({ "x-re": liveRe }) });
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(liveRe.lastIndex).toBe(3);
+  });
+
+  it("copying a header array changes nothing a consumer sees (output equivalence)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestHeaders: true,
+    });
+
+    const { res } = runMiddleware(middleware, { headers: { "x-tags": ["a", "b", "c"] } });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestHeaders["x-tags"]).toEqual(["a", "b", "c"]);
+  });
+
+  it("redactPaths:['context.*'] on a FROZEN context still logs the entry and does not throw", () => {
+    // A frozen context is an ordinary defensive pattern. Because entry.context
+    // is copied before the redactPaths loop, the copy is writable, so the
+    // redaction lands on the copy and the frozen caller object is untouched.
+    const frozen = Object.freeze({ userId: 7, token: "SECRET" });
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => frozen,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ userId: 7, token: "[REDACTED]" });
+    // The caller's frozen object is untouched.
+    expect(frozen.token).toBe("SECRET");
+  });
+
+  it("redactPaths:['context.*'] targeting a getter-only context prop still logs the entry", () => {
+    // JSON.stringify resolves the getter into a plain data field on the copy,
+    // so the redaction applies to the copy; the caller's accessor is untouched.
+    const context = { userId: 7 };
+    Object.defineProperty(context, "token", {
+      get: () => "SECRET",
+      enumerable: true,
+      configurable: false,
+    });
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => context as Record<string, unknown>,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ userId: 7, token: "[REDACTED]" });
+    // The caller's getter is still intact.
+    expect((context as Record<string, unknown>).token).toBe("SECRET");
+  });
+
+  it("redactPaths:['context.*'] redacts a toJSON-defining context (DTO / Mongoose-style) without mutating the caller", () => {
+    // enrich commonly returns req.user — a class instance with a toJSON. The
+    // JSON round-trip copy resolves toJSON so the field stays redactable AND
+    // the caller's live instance is never touched (it would otherwise be
+    // passed through by identity and mutated in place).
+    class UserDoc {
+      public token = "REALSECRET";
+      public id = 42;
+      toJSON() {
+        return { id: this.id, token: this.token };
+      }
+    }
+    const user = new UserDoc();
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => user as unknown as Record<string, unknown>,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ id: 42, token: "[REDACTED]" });
+    expect(JSON.stringify(payload.http.context)).not.toContain("REALSECRET");
+    // The caller's live document is untouched.
+    expect(user.token).toBe("REALSECRET");
+  });
+
+  it("redactPaths:['body.tags.length'] does not throw and still logs the entry with the array intact", () => {
+    // Assigning [REDACTED] to an array's length throws RangeError; the length
+    // guard turns it into a no-op so the whole entry is not dropped.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      redactPaths: ["body.tags.length"],
+    });
+
+    const { res } = runMiddleware(middleware, { body: { tags: ["a", "b"] } });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toEqual({ tags: ["a", "b"] });
+  });
+
+  it("redacts a BigInt-carrying context (owned copy, caller untouched) instead of dropping it", () => {
+    // A BigInt makes the primary JSON.stringify throw; the BigInt-coercing
+    // retry still yields a fully-owned, redactable copy.
+    const context: Record<string, unknown> = { id: 100n, token: "REALSECRET" };
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => context,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ id: "100", token: "[REDACTED]" });
+    // The caller's live object is untouched — its BigInt and secret survive.
+    expect(context.id).toBe(100n);
+    expect(context.token).toBe("REALSECRET");
+  });
+
+  it("redacts a toJSON-defining context that carries a BigInt without mutating the caller (judge regression)", () => {
+    // Composite case: a class instance that defines toJSON AND whose serialized
+    // form is not JSON-expressible (a BigInt field). redactValue's forceCopy
+    // would pass such an instance through BY IDENTITY (toJSON boundary), so the
+    // redactPaths write would mutate the caller. The BigInt-coercing round-trip
+    // resolves toJSON into a fresh owned object, closing that hole.
+    class Ctx {
+      token = "REALSECRET";
+      toJSON() {
+        return { token: this.token, amount: 100n };
+      }
+    }
+    const ctx = new Ctx();
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => ctx as unknown as Record<string, unknown>,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ token: "[REDACTED]", amount: "100" });
+    expect(JSON.stringify(payload.http.context)).not.toContain("REALSECRET");
+    // The caller's live instance MUST be untouched.
+    expect(ctx.token).toBe("REALSECRET");
+  });
+
+  it("degrades a circular context to an owned sentinel and still logs (no throw, caller untouched)", () => {
+    // A circular context cannot be expressed by either round-trip; it degrades
+    // to a fresh owned { _unserializable: true } sentinel rather than sharing
+    // the caller's live graph or dropping the line.
+    const circular: Record<string, unknown> = { token: "REALSECRET" };
+    circular.self = circular;
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => circular,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ _unserializable: true });
+    // The caller's live circular object is untouched.
+    expect(circular.token).toBe("REALSECRET");
+    expect(circular.self).toBe(circular);
+  });
+
+  it("degrades a context whose getter throws to an owned sentinel and still logs the entry", () => {
+    // A throwing getter makes both round-trips throw; the line must still be
+    // logged (never dropped) and the caller is never mutated.
+    const context = { userId: 7 };
+    Object.defineProperty(context, "token", {
+      get: () => {
+        throw new Error("getter boom");
+      },
+      enumerable: true,
+      configurable: false,
+    });
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => context as Record<string, unknown>,
+      redactPaths: ["context.token"],
+    });
+
+    const { res } = runMiddleware(middleware);
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.context).toEqual({ _unserializable: true });
   });
 
   // ---------------------------------------------------------------------------
@@ -1593,6 +2277,231 @@ describe("createRequestLogger", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Phase 6 — the error path must not leak the raw URL
+  //
+  // The happy path masks query secrets via `redactUrlQuery`, but finalize()'s
+  // catch used to rebuild its console.error message from the RAW
+  // `req.originalUrl ?? req.url`. Any throwing user callback therefore printed
+  // the cleartext query string to stderr — leaking exactly the secrets
+  // `maskQueryKeys` promises to mask. `code` is in DEFAULT_MASKED_QUERY_KEYS,
+  // so these tests need no explicit `maskQueryKeys` option.
+  //
+  // The pre-existing never-crash tests above all drive the query-less default
+  // url (`/auth/login`) and only assert the message prefix, which is why this
+  // went unnoticed.
+  // ---------------------------------------------------------------------------
+
+  const SECRET_URL = "/oauth/cb?code=SUPER_SECRET_AUTH_CODE&state=x";
+
+  it("redacts query secrets in the error-path message when enrich throws", () => {
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      enrich: () => {
+        throw new Error("enrich boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, { originalUrl: SECRET_URL });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const message = errSpy.mock.calls[0][0] as string;
+    expect(message).not.toContain("SUPER_SECRET_AUTH_CODE");
+    expect(message).toContain("code=[REDACTED]");
+    // Non-masked siblings must survive byte-for-byte.
+    expect(message).toContain("state=x");
+    expect(message).toContain("enrich boom");
+  });
+
+  it("redacts query secrets in the error-path message when messageBuilder throws", () => {
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      messageBuilder: () => {
+        throw new Error("messageBuilder boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, { originalUrl: SECRET_URL });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const message = errSpy.mock.calls[0][0] as string;
+    expect(message).not.toContain("SUPER_SECRET_AUTH_CODE");
+    expect(message).toContain("code=[REDACTED]");
+    expect(message).toContain("messageBuilder boom");
+  });
+
+  it("redacts query secrets in the error-path message when logger.log throws", () => {
+    const { logger, log } = createMockLogger();
+    log.mockImplementation(() => {
+      throw new Error("log boom");
+    });
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({ logger });
+
+    const { res } = runMiddleware(middleware, { originalUrl: SECRET_URL });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const message = errSpy.mock.calls[0][0] as string;
+    expect(message).not.toContain("SUPER_SECRET_AUTH_CODE");
+    expect(message).toContain("code=[REDACTED]");
+    expect(message).toContain("log boom");
+  });
+
+  it("redacts query secrets on the error path when the throw precedes URL resolution", () => {
+    // A function-form `level` throws BEFORE the happy path resolves/redacts the
+    // URL. This is why the catch recomputes the redacted URL itself rather than
+    // reading a value hoisted out of the try: at this throw position no such
+    // value would exist yet, and the message would lose the URL entirely.
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      level: () => {
+        throw new Error("level boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, { originalUrl: SECRET_URL });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const message = errSpy.mock.calls[0][0] as string;
+    expect(message).not.toContain("SUPER_SECRET_AUTH_CODE");
+    expect(message).toContain("code=[REDACTED]");
+  });
+
+  it("honors a custom maskQueryKeys list on the error path", () => {
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      maskQueryKeys: ["sessionid"],
+      enrich: () => {
+        throw new Error("enrich boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, {
+      originalUrl: "/x?sessionid=SUPER_SECRET_SESSION&page=2",
+    });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    const message = errSpy.mock.calls[0][0] as string;
+    expect(message).not.toContain("SUPER_SECRET_SESSION");
+    expect(message).toContain("sessionid=[REDACTED]");
+    expect(message).toContain("page=2");
+  });
+
+  it("falls back to the raw url when originalUrl is absent on the error path", () => {
+    // `req.url` is the raw-Node fallback and must be redacted just the same.
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      enrich: () => {
+        throw new Error("enrich boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, {
+      originalUrl: undefined as unknown as string,
+      url: SECRET_URL,
+    });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    const message = errSpy.mock.calls[0][0] as string;
+    expect(message).not.toContain("SUPER_SECRET_AUTH_CODE");
+    expect(message).toContain("code=[REDACTED]");
+  });
+
+  it("does not throw from the error path when reading the URL itself throws", () => {
+    // The error handler runs inside the `res` "finish" emitter, where an
+    // exception is an UNCAUGHT exception, not a dropped log line. An exotic
+    // request object can expose a throwing `originalUrl` getter, so the
+    // catch's own URL resolution is self-guarded and degrades to "".
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({ logger });
+
+    const { req, res } = runMiddleware(middleware);
+    // Defined AFTER middleware entry: the middleware body never reads the URL,
+    // only finalize() does, and `Object.assign` in runMiddleware would have
+    // invoked the getter too early.
+    Object.defineProperty(req, "originalUrl", {
+      get: () => {
+        throw new Error("hostile getter");
+      },
+    });
+
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toContain("hostile getter");
+  });
+
+  it("leaves the query untouched on the error path when maskQueryKeys is false", () => {
+    // The `false` opt-out disables query masking, and the error path must honor
+    // it exactly as the happy path does — not fall back to the default list.
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      maskQueryKeys: false,
+      enrich: () => {
+        throw new Error("enrich boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, { originalUrl: SECRET_URL });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy.mock.calls[0][0]).toContain("code=SUPER_SECRET_AUTH_CODE");
+  });
+
+  it("does not throw from the error path when every reported field throws", () => {
+    // Last-resort guard: the handler runs inside the `res` "finish" emitter, so
+    // a throw here is an UNCAUGHT exception, not a dropped line. A request whose
+    // `method` getter throws (alongside an error whose `message` getter throws)
+    // must still degrade to a single console.error rather than crash.
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const hostileError = new Error("ignored");
+    Object.defineProperty(hostileError, "message", {
+      get: () => {
+        throw new Error("hostile message getter");
+      },
+    });
+
+    const middleware = createRequestLogger({
+      logger,
+      enrich: () => {
+        throw hostileError;
+      },
+    });
+
+    const { req, res } = runMiddleware(middleware);
+    Object.defineProperty(req, "method", {
+      get: () => {
+        throw new Error("hostile method getter");
+      },
+    });
+
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toBe(
+      "@hiprax/logger request logger failed, and so did reporting the failure.",
+    );
+  });
+
+  // ---------------------------------------------------------------------------
   // Phase 2 — function-form level validated at request time (Task 2.3)
   // ---------------------------------------------------------------------------
 
@@ -1912,28 +2821,59 @@ describe("request middleware internals", () => {
     // iterator instead, so an emoji is kept whole or skipped entirely —
     // never torn in half.
     //
-    // For `truncateString("ab😀😀", 4)`: maxLength=4, so the bounded for...of
-    // collects 3 code points = `['a', 'b', '😀']` then appends `…` —
-    // yielding `"ab😀…"` (4 code points; the first emoji is preserved
-    // intact). Critically, the result must NOT contain a lone surrogate.
-    const truncated = truncateString("ab😀😀", 4);
+    // For `truncateString("ab😀😀😀😀", 4)`: the input is 6 code points, so the
+    // limit of 4 genuinely bites. The bounded for...of collects 3 code points
+    // = `['a', 'b', '😀']` then appends `…` — yielding `"ab😀…"` (4 code
+    // points; the first emoji is preserved intact). Critically, the result
+    // must NOT contain a lone surrogate.
+    const truncated = truncateString("ab😀😀😀😀", 4);
     expect(truncated).toBe("ab😀…");
+    // A real truncation always yields exactly `maxLength` code points.
+    expect(Array.from(truncated).length).toBe(4);
     // Defensive guard: no lone surrogate in the output. `\uD83D` is the high
     // surrogate of `😀` (`😀`); a torn-in-half emoji would surface
     // a `\uD83D` not followed by a low surrogate.
     expect(truncated).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
 
-    // With `maxLength=5` (still less than the 6-code-unit `value.length`,
-    // so the early-exit does not fire), the for...of collects 4 code points:
-    // `['a', 'b', '😀', '😀']` then appends `…` = `"ab😀😀…"`. Both emojis
-    // are kept whole — the truncation strictly trims from the end.
-    expect(truncateString("ab😀😀", 5)).toBe("ab😀😀…");
+    // With `maxLength=5` the for...of collects 4 code points:
+    // `['a', 'b', '😀', '😀']` then appends `…` = `"ab😀😀…"`. Both retained
+    // emojis are kept whole — the truncation strictly trims from the end.
+    expect(truncateString("ab😀😀😀😀", 5)).toBe("ab😀😀…");
 
-    // No truncation needed when the input fits the limit (measured in CODE
-    // UNITS by the early-exit `value.length <= maxLength` branch — preserved
-    // unchanged from the previous implementation for back-compat). `"ab😀😀"`
-    // is 6 UTF-16 code units, so `maxLength=6` returns the input verbatim.
+    // No truncation needed when the input fits the limit. `"ab😀😀"` is 4 code
+    // points (6 UTF-16 code units), so any limit >= 4 returns it verbatim —
+    // the guard measures CODE POINTS, the same unit the loop counts.
+    expect(truncateString("ab😀😀", 4)).toBe("ab😀😀");
     expect(truncateString("ab😀😀", 6)).toBe("ab😀😀");
+  });
+
+  it("truncateString never appends a false ellipsis to a string that already fits", () => {
+    // THE REGRESSION THIS PINS. The fits-already guard used to measure
+    // `value.length` (UTF-16 code UNITS) while the truncation loop counted code
+    // POINTS. On astral-plane input the two units disagree, so a string that
+    // was never truncated had an ellipsis appended anyway: the log claimed a
+    // truncation that never happened, and — absurdly — the "truncated" output
+    // came out LONGER than the input it supposedly shortened.
+    const fiveEmoji = "😀".repeat(5); // 5 code points, 10 code units
+    expect(Array.from(fiveEmoji).length).toBe(5);
+    expect(fiveEmoji.length).toBe(10);
+
+    // 5 code points against a limit of 8: nothing to drop.
+    const result = truncateString(fiveEmoji, 8);
+    expect(result).toBe(fiveEmoji);
+    expect(result).not.toContain("…");
+    // The old code-unit guard produced 11 code units from a 10-code-unit input.
+    expect(result.length).toBeLessThanOrEqual(fiveEmoji.length);
+
+    // The boundary: exactly at the limit is still "fits", not "truncate".
+    expect(truncateString(fiveEmoji, 5)).toBe(fiveEmoji);
+    // One under the limit truncates for real: 4 code points + the ellipsis.
+    expect(truncateString(fiveEmoji, 4)).toBe("😀😀😀…");
+
+    // A single emoji is 1 code point, so it fits a limit of 1 and must be
+    // returned intact rather than replaced by the `maxLength === 1` ellipsis
+    // branch (which the code-unit guard used to reach: 2 code units > 1).
+    expect(truncateString("😀", 1)).toBe("😀");
   });
 
   it("truncateString preserves the documented combining-mark caveat", () => {
@@ -1953,11 +2893,18 @@ describe("request middleware internals", () => {
   // ---------------------------------------------------------------------------
 
   describe("truncateString (Phase 6 — bounded for...of parity)", () => {
-    // Reference implementation preserved from before Phase 6: the old
-    // Array.from-based semantics. Used to verify the new for...of loop
-    // produces byte-identical output for every input class.
+    // Reference implementation: the straightforward, unoptimized Array.from
+    // semantics the helper is meant to be indistinguishable from. Used to
+    // verify the bounded for...of loop produces byte-identical output for
+    // every input class.
+    //
+    // The fits-already guard here measures `Array.from(value).length` — code
+    // POINTS, the same unit the truncation below counts. This oracle
+    // deliberately does NOT reproduce the old `value.length` (code UNIT) guard:
+    // that mismatch WAS the bug, so an oracle carrying it would have ratified
+    // the false ellipsis on every emoji input rather than catching it.
     const arrayFromTruncate = (value: string, maxLength: number): string => {
-      if (value.length <= maxLength) {
+      if (Array.from(value).length <= maxLength) {
         return value;
       }
       if (maxLength <= 0) {
@@ -2021,6 +2968,41 @@ describe("request middleware internals", () => {
     expect(envelope._originalLength).toBe(serialized.length);
     expect(envelope._preview.length).toBe(12);
     expect(envelope._preview.endsWith("…")).toBe(true);
+  });
+
+  it("buildTruncatedEnvelope builds an emoji _preview of exactly maxLength code points", () => {
+    // The `_preview` path routes through `truncateString`, so it inherits the
+    // code-point contract. An emoji payload is where a code-unit slice would
+    // tear a surrogate pair in half and emit a lone half-pair into the log.
+    const serialized = JSON.stringify({ payload: "😀".repeat(50) });
+    const envelope = buildTruncatedEnvelope(serialized, 20);
+    expect(envelope._truncated).toBe(true);
+    // `_originalLength` stays the serialized CODE-UNIT length — it is a
+    // payload-size figure, deliberately not a code-point count.
+    expect(envelope._originalLength).toBe(serialized.length);
+    // The preview is exactly 20 code points (NOT 20 code units — the emoji
+    // make the two differ), with no torn surrogate pair.
+    expect(Array.from(envelope._preview).length).toBe(20);
+    expect(envelope._preview.endsWith("…")).toBe(true);
+    expect(envelope._preview).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+  });
+
+  it("buildTruncatedEnvelope leaves an emoji _preview un-ellipsised when it fits the limit", () => {
+    // The size decision in `serializeBody` (`serialized.length > maxLength`)
+    // counts code UNITS, while `_preview`'s `truncateString` counts code
+    // POINTS. An emoji-dense body can therefore trip the envelope on its
+    // code-unit size while its code-point length still fits the limit — in
+    // which case the preview is the COMPLETE serialized body and carries no
+    // ellipsis. That combination is honest (the preview really is whole);
+    // before the guard fix it produced a false ellipsis on a string nothing
+    // had been dropped from.
+    const serialized = JSON.stringify({ a: "😀😀😀😀😀" }); // 18 code units, 13 code points
+    expect(serialized.length).toBeGreaterThan(14);
+    expect(Array.from(serialized).length).toBeLessThanOrEqual(14);
+
+    const envelope = buildTruncatedEnvelope(serialized, 14);
+    expect(envelope._preview).toBe(serialized);
+    expect(envelope._preview).not.toContain("…");
   });
 
   it("redactUrlQuery is a no-op when there is no query string or no mask set", () => {
@@ -2236,6 +3218,59 @@ describe("request middleware internals", () => {
     const entry = { requestBody: { user: "alice" } } as unknown as Record<string, unknown>;
     redactEntryPath(entry, "body.user.password");
     expect(entry.requestBody).toEqual({ user: "alice" });
+  });
+
+  it("redactEntryPath is a no-op on an array `length` target (does not throw)", () => {
+    const entry = { requestBody: { tags: ["a", "b"] } } as unknown as Record<string, unknown>;
+    expect(() => redactEntryPath(entry, "body.tags.length")).not.toThrow();
+    expect(entry.requestBody).toEqual({ tags: ["a", "b"] });
+    expect((entry.requestBody as { tags: string[] }).tags.length).toBe(2);
+  });
+
+  it("redactEntryPath is a no-op on a non-writable (frozen) property (does not throw)", () => {
+    const entry = { context: Object.freeze({ token: "SECRET" }) } as unknown as Record<
+      string,
+      unknown
+    >;
+    expect(() => redactEntryPath(entry, "context.token")).not.toThrow();
+    expect((entry.context as { token: string }).token).toBe("SECRET");
+  });
+
+  it("redactEntryPath is a no-op on a getter-only / accessor property (does not throw)", () => {
+    const context = {};
+    Object.defineProperty(context, "token", {
+      get: () => "SECRET",
+      enumerable: true,
+      configurable: true,
+    });
+    const entry = { context } as unknown as Record<string, unknown>;
+    expect(() => redactEntryPath(entry, "context.token")).not.toThrow();
+    expect((entry.context as { token: string }).token).toBe("SECRET");
+  });
+
+  it("redactEntryPath swallows an assignment that throws (Proxy with a throwing set trap)", () => {
+    // Defense-in-depth: even a slot reported as a writable data property can
+    // throw on assignment. The final try/catch turns that into a no-op instead
+    // of dropping the whole log entry.
+    const throwing = new Proxy(
+      { token: "SECRET" },
+      {
+        set() {
+          throw new Error("set trap boom");
+        },
+        getOwnPropertyDescriptor(target, key) {
+          return {
+            value: (target as Record<string, unknown>)[key as string],
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          };
+        },
+      },
+    );
+    const entry = { context: throwing } as unknown as Record<string, unknown>;
+    expect(() => redactEntryPath(entry, "context.token")).not.toThrow();
+    expect((throwing as { token: string }).token).toBe("SECRET");
   });
 
   it("resolveMaskHeaderKeys returns undefined when option is false and the default set otherwise", () => {
@@ -2838,13 +3873,121 @@ describe("request middleware internals", () => {
       expect(created.toISOString()).toBe("2024-01-01T00:00:00.000Z");
     });
 
-    it("serializeBody falls back to String() (no throw, no leak) when a BigInt body cannot be JSON-serialized under redactPaths", () => {
-      // A body carrying a BigInt cannot be JSON.stringify'd; the round-trip
-      // catch leaves the keyword-masked graph in place and the String()
-      // fallback truncates it. The raw numeric value is never emitted.
-      const out = serializeBody({ big: 10n }, undefined, 3000, ["body.big"]);
-      expect(typeof out).toBe("string");
-      expect(out).toBe("[object Object]");
+    it("serializeBody applies redactPaths to a BigInt-carrying body instead of collapsing it to String()", () => {
+      // Previously a BigInt made the redactPaths round-trip throw, the catch
+      // silently skipped every mandated path, and String(masked) rendered the
+      // whole body as the useless "[object Object]". `bigintSafeReplacer` makes
+      // the round-trip succeed, so the path is honored and the BigInt renders
+      // as its decimal string (matching logform/json.js's convention).
+      const out = serializeBody({ big: 10n }, undefined, 3000, ["body.big"]) as Record<
+        string,
+        unknown
+      >;
+      expect(out).toEqual({ big: "[REDACTED]" });
+      expect(out).not.toBe("[object Object]");
+    });
+
+    it("serializeBody keeps a BigInt body diagnosable (keyword mask applied, no [object Object])", () => {
+      // The BigInt no longer takes the rest of the body down with it: every
+      // diagnostic field survives and maskBodyKeys still redacts.
+      const out = serializeBody({ amount: 100n, password: "hunter2", user: "bob" }, [
+        "password",
+      ]) as Record<string, unknown>;
+      expect(out.password).toBe("[REDACTED]");
+      expect(out.user).toBe("bob");
+      // The BigInt is preserved as a live value; the downstream serializer
+      // (pretty-mode safeStringify / logform's json replacer) string-coerces it.
+      expect(out.amount).toBe(100n);
+      expect(out).not.toBe("[object Object]");
+    });
+
+    it("serializeBody does not leak a redactPaths target through the String() fallback on a BigInt array body", () => {
+      // The proven leak: String() on an array invokes Array.prototype.join, so
+      // the operator-mandated redaction was emitted in cleartext as
+      // "1,SUPER-SECRET,5".
+      const out = serializeBody(["1", "SUPER-SECRET", 5n], undefined, 3000, ["body.1"]);
+      expect(
+        JSON.stringify(out, (_k, v) => (typeof v === "bigint" ? v.toString() : v)),
+      ).not.toContain("SUPER-SECRET");
+      expect(out).toEqual(["1", "[REDACTED]", "5"]);
+    });
+
+    it("serializeBody fails closed with a sentinel when a redactPaths round-trip cannot be applied", () => {
+      // A genuinely unserializable body: `bad` defines toJSON, so redactValue
+      // passes it through by identity and JSON.stringify invokes the throwing
+      // serializer. With mandated paths unapplied, the body must never be
+      // emitted raw.
+      const body = {
+        token: "SUPER-SECRET",
+        bad: {
+          toJSON() {
+            throw new Error("boom");
+          },
+        },
+      };
+      const out = serializeBody(body, undefined, 3000, ["body.token"]);
+      expect(out).toBe("[UNSERIALIZABLE]");
+      expect(String(out)).not.toContain("SUPER-SECRET");
+    });
+
+    it("serializeBody still applies redactPaths to an ordinary circular body (a plain cycle is not a fail-closed trigger)", () => {
+      // Counter-intuitive but load-bearing: redactValue walks first and renders
+      // the cycle as "[Circular]", so the round-trip succeeds and the path is
+      // honored — a plain cycle never degrades the body to the sentinel.
+      const body: Record<string, unknown> = { token: "SUPER-SECRET" };
+      body.self = body;
+      const out = serializeBody(body, undefined, 3000, ["body.token"]) as Record<string, unknown>;
+      expect(out.token).toBe("[REDACTED]");
+      expect(out.self).toBe("[Circular]");
+      expect(JSON.stringify(out)).not.toContain("SUPER-SECRET");
+    });
+
+    it("serializeBody fails closed when a cycle is routed through a toJSON-defining instance", () => {
+      // The exception to the rule above, and the reason it is scoped to
+      // ORDINARY cycles: redactValue passes a toJSON-defining instance through
+      // by identity (its documented boundary) without cycle-tracking it, so the
+      // cycle survives into JSON.stringify and throws. Note the throw is
+      // `RangeError: Maximum call stack size exceeded`, NOT "Converting
+      // circular structure to JSON": JSON.stringify's cycle detection tracks
+      // the value returned by toJSON, and this toJSON mints a FRESH object
+      // every call, so no reference ever repeats and it recurses until the
+      // stack is exhausted. Either way it lands on the fail-closed path — the
+      // safe outcome, and why the fallback must not render `masked` raw.
+      class Node {
+        public parent: unknown = null;
+        toJSON() {
+          return { parent: this.parent };
+        }
+      }
+      const node = new Node();
+      node.parent = node;
+      const out = serializeBody({ token: "SUPER-SECRET", node }, undefined, 3000, ["body.token"]);
+      expect(out).toBe("[UNSERIALIZABLE]");
+      expect(String(out)).not.toContain("SUPER-SECRET");
+    });
+
+    it("degrades an unserializable body even when redactPaths holds ONLY non-body paths", () => {
+      // The fail-closed guard tests `bodyRedactPaths.length > 0`, not whether
+      // any path actually targets the body — so a list of purely non-body paths
+      // (`context.*`, header paths) degrades an unserializable body too. Both
+      // `src/request-middleware.ts` and `CLAUDE.md` assert this is deliberate
+      // (the direction is conservative, and the alternative renderings here are
+      // worthless anyway); nothing pinned it until now, so the "deliberate"
+      // claim rested on prose alone.
+      class Node {
+        public parent: unknown = null;
+        toJSON() {
+          return { parent: this.parent };
+        }
+      }
+      const node = new Node();
+      node.parent = node;
+
+      const out = serializeBody({ token: "SUPER-SECRET", node }, undefined, 3000, [
+        "context.token",
+      ]);
+      expect(out).toBe("[UNSERIALIZABLE]");
+      expect(String(out)).not.toContain("SUPER-SECRET");
     });
 
     it("does NOT yield [Circular] when the same built-in is referenced by two keys", () => {
@@ -3045,6 +4188,41 @@ describe("request middleware internals", () => {
       // the forward edge (a.peer -> b) is not itself circular and renders as
       // a proper nested object.
       expect(peer.peer).toBe("[Circular]");
+    });
+  });
+
+  describe("printf tokens in a request URL", () => {
+    it("logs the full entry even when the URL contains printf tokens", () => {
+      // Neither format chain composes `winston.format.splat()`, so a message
+      // holding a printf token makes winston route a trailing metadata object
+      // into its unread `SPLAT` slot and drop it. The middleware is IMMUNE to
+      // that by construction: it logs via `logger.log(logEntry)` — winston's
+      // single-object form (`logger.js:233-241`), which never sets `SPLAT` and
+      // never takes the token branch. So an attacker-chosen URL containing
+      // `%d` cannot strip the diagnostic context from the entry recording
+      // their own request.
+      //
+      // This pins that immunity: if the log call at the end of `finalize()` is
+      // ever refactored to the 2-arg `logger.log(level, msg, meta)` form, the
+      // drop becomes reachable here and this test fails.
+      const { logger, log } = createMockLogger();
+      const middleware = createRequestLogger({ logger, includeHttpContext: true });
+
+      const { res } = runMiddleware(middleware, {
+        url: "/report/a%d?q=%s",
+        originalUrl: "/report/a%d?q=%s",
+      });
+      res.emit("finish");
+
+      const payload = log.mock.calls[0][0];
+      // The URL rides through verbatim...
+      expect(payload.message).toContain("/report/a%d?q=%s");
+      expect(payload.message).not.toContain("NaN");
+      // ...and the structured context is fully intact — nothing was dropped.
+      expect(payload.http.url).toBe("/report/a%d?q=%s");
+      expect(payload.http.method).toBe("POST");
+      expect(payload.http.statusCode).toBe(200);
+      expect(payload.http.responseTimeMs).toEqual(expect.any(Number));
     });
   });
 });

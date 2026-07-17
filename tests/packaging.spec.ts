@@ -46,9 +46,18 @@ describe("package.json exports map", () => {
   });
 
   describe("declaration files present on disk (post-build)", () => {
-    // Skipped when dist/ is absent (CI runs npm test before npm run build).
-    // Run `npm run build` first to exercise these assertions locally.
-    const itWhenDist = fs.existsSync(distDir) ? it : it.skip;
+    // CI builds before it tests (the Build step precedes Test in both ci.yml and
+    // release.yml), so dist/ is present and these assertions run there. Under CI
+    // the skip is DISABLED: `it` is used unconditionally, so if a future workflow
+    // edit ever reorders Test ahead of Build, dist/ is absent on the fresh
+    // checkout and these assertions FAIL loudly instead of silently skipping —
+    // the only automated guard that Build-before-Test stays in place, since a
+    // skipped test keeps CI green and a tsup regression dropping index.d.cts
+    // would then publish the TS1479 failure this spec exists to catch. Locally
+    // (`npm test` with no prior build, no CI env) it still skips gracefully; run
+    // `npm run build` first to exercise these assertions locally.
+    const isCI = process.env.CI === "true";
+    const itWhenDist = fs.existsSync(distDir) || isCI ? it : it.skip;
 
     itWhenDist("dist/index.d.ts exists (ESM declaration)", () => {
       expect(fs.existsSync(path.join(distDir, "index.d.ts"))).toBe(true);

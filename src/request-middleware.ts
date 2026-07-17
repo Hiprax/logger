@@ -11,6 +11,7 @@ import type {
 } from "./types";
 import { createLogger } from "./logger";
 import { redactValue, REDACTED } from "./redact";
+import { bigintSafeReplacer } from "./serialize";
 import { RequestLoggerOptionError } from "./errors";
 import type { LogLevel } from "./types";
 
@@ -171,6 +172,34 @@ const determineLevel = (statusCode: number): LogLevel => {
 };
 
 /**
+ * Reports whether `value` holds at most `maxLength` Unicode code points.
+ *
+ * **Bounded by design.** The walk stops the instant the count exceeds
+ * `maxLength`, so the cost is O(`maxLength`) — never O(input length). That is
+ * what lets `truncateString` measure a 200 kB body against a 3000-char limit
+ * without materializing `Array.from(value)`, which would allocate one array
+ * entry per code point purely to read its `.length` and defeat the very
+ * O(`maxLength`) property the helper advertises.
+ *
+ * A string's `Symbol.iterator` yields code points (it is the same iterator
+ * `for...of` and `Array.from` drive), so an astral-plane character counts as
+ * the single character it is rather than as its two UTF-16 surrogate halves.
+ * It is stepped directly here rather than through `for...of` because only the
+ * count is wanted, never the code point itself.
+ */
+const isWithinCodePointLimit = (value: string, maxLength: number): boolean => {
+  const iterator = value[Symbol.iterator]();
+  let count = 0;
+  while (!iterator.next().done) {
+    count += 1;
+    if (count > maxLength) {
+      return false;
+    }
+  }
+  return true;
+};
+
+/**
  * Truncates a string to fit within `maxLength` total characters, INCLUDING the
  * trailing ellipsis. Returns the input unchanged when it already fits. Result
  * length is exactly `maxLength` Unicode code points for any string longer than
@@ -189,7 +218,21 @@ const determineLevel = (statusCode: number): LogLevel => {
  * grapheme-correct slicing if that matters for your data set.
  */
 const truncateString = (value: string, maxLength: number): string => {
-  if (value.length <= maxLength) {
+  // The fits-already guard MUST count the same unit as the truncation loop
+  // below, or the two disagree on astral-plane input and this helper appends an
+  // ellipsis to a string it never truncated: measuring here in code UNITS
+  // (`value.length`) while the loop counts code POINTS made
+  // `truncateString("[5 emoji]", 8)` return all five emoji plus a `…` — 5 code
+  // points sit comfortably within the limit of 8, yet the log claimed
+  // truncation and the output (11 code units) came out LONGER than the input
+  // (10).
+  //
+  // `value.length <= maxLength` is retained purely as a cheap O(1) pre-check.
+  // It is *sound* in the one direction that matters: a string can never hold
+  // more code points than code units, so anything it accepts genuinely fits.
+  // That keeps the common all-ASCII path walk-free; only when it fails do we
+  // pay for the bounded count.
+  if (value.length <= maxLength || isWithinCodePointLimit(value, maxLength)) {
     return value;
   }
   if (maxLength <= 0) {
@@ -231,6 +274,16 @@ const buildTruncatedEnvelope = (serialized: string, maxLength: number): Truncate
   _originalLength: serialized.length,
   _preview: truncateString(serialized, maxLength),
 });
+
+/**
+ * Substituted for `requestBody` when serializing the body fails outright.
+ *
+ * Logging is best-effort per this module's contract, and the body is the only
+ * part of an entry built from arbitrary caller data — so its failure degrades
+ * to this sentinel while the rest of the entry (method, url, status, duration)
+ * is still logged.
+ */
+const UNSERIALIZABLE_BODY = "[UNSERIALIZABLE]";
 
 const serializeBody = (
   body: unknown,
@@ -283,20 +336,35 @@ const serializeBody = (
   // The throw-away `{ requestBody: owned }` wrapper reuses `redactEntryPath`'s
   // `body.` → `requestBody.` alias and prototype-pollution guards; non-body
   // paths (`context.*`, header paths) no-op here and are applied by the
-  // post-assembly loop in `finalize()`. A non-JSON-serializable body (e.g. one
-  // carrying a `BigInt`) throws in `JSON.stringify`; the catch leaves `masked`
-  // as the keyword-masked graph so the `String()` fallback below still runs.
+  // post-assembly loop in `finalize()`. `bigintSafeReplacer` is what keeps a
+  // `BigInt` anywhere in the body from throwing here: without it a single
+  // `BigInt` (an `express.json({ reviver })` product, a protobuf/gRPC adapter,
+  // a 64-bit DB id) failed the round-trip, which — before the fail-closed
+  // return below — meant the operator's mandated paths were silently skipped.
   if (bodyRedactPaths && bodyRedactPaths.length > 0 && masked && typeof masked === "object") {
     try {
-      const owned: unknown = JSON.parse(JSON.stringify(masked));
+      const owned: unknown = JSON.parse(JSON.stringify(masked, bigintSafeReplacer));
       const wrapper: Record<string, unknown> = { requestBody: owned };
       for (const path of bodyRedactPaths) {
         redactEntryPath(wrapper, path);
       }
       masked = wrapper.requestBody;
     } catch {
-      // Body is not JSON-serializable (e.g. a `BigInt` value) — leave `masked`
-      // as the keyword-masked graph; the `String()` fallback below handles it.
+      // FAIL CLOSED. Reaching here means the operator configured `redactPaths`
+      // and NONE of them could be applied to this body — `masked` is still the
+      // graph those paths were meant to scrub. (The guard tests only that the
+      // path list is non-empty, so a list holding purely non-body paths — e.g.
+      // `["context.token"]` — degrades this body too. That is deliberate: the
+      // direction is conservative, and the alternative renderings available
+      // here are worthless anyway.) Falling through to the
+      // `String(masked)` fallback would emit exactly the values the operator
+      // ordered redacted: `String()` on an array invokes
+      // `Array.prototype.join`, so `redactPaths: ["body.1"]` over
+      // `["1", "SUPER-SECRET", 5n]` printed `"1,SUPER-SECRET,5"` in cleartext.
+      // A body whose mandated redactions could not be applied must never be
+      // emitted raw — the sentinel loses one diagnostic field, the fallback
+      // loses the secret.
+      return UNSERIALIZABLE_BODY;
     }
   }
 
@@ -305,14 +373,62 @@ const serializeBody = (
   }
 
   try {
-    const serialized = JSON.stringify(masked);
+    // `bigintSafeReplacer` mirrors the pretty-mode formatter's `safeStringify`
+    // and `logform/json.js`'s built-in replacer, so a BigInt renders as its
+    // decimal string here instead of throwing and collapsing the whole body
+    // into the `String(masked)` fallback (`"[object Object]"`). Note this
+    // serialization is used for the length decision and the `_preview` text;
+    // an under-limit body is returned as the live `masked` object, whose
+    // BigInts the downstream logger renders through the same convention.
+    const serialized = JSON.stringify(masked, bigintSafeReplacer);
     if (serialized.length > maxLength) {
       return buildTruncatedEnvelope(serialized, maxLength);
     }
     return masked;
   } catch {
+    // Safe to render loosely: any `redactPaths` mandated for this body were
+    // already applied above (a failure there returned the sentinel and never
+    // reaches this point), so `masked` carries only `maskBodyKeys`-redacted
+    // data.
     const fallback = String(masked);
     return truncateString(fallback, maxLength);
+  }
+};
+
+/**
+ * Returns a **fully-owned** copy of the `enrich()` context so the post-assembly
+ * `redactPaths` pass — which writes in place via `redactEntryPath` — can never
+ * mutate the caller's live object (typically `req.session` / `req.user`). The
+ * result shares no reference with the caller, and this function never throws.
+ *
+ * A `JSON.parse(JSON.stringify(...))` round-trip is the primary strategy
+ * (matching `serializeBody`'s body path): it yields a graph that shares nothing
+ * with the caller and is `toJSON`-resolved exactly as the downstream log
+ * serializer renders it, so a context that defines `toJSON` (a Mongoose
+ * document, a class DTO, `req.user`) is copied BY VALUE — its fields stay
+ * redactable by `redactPaths` instead of being passed through by identity and
+ * mutated. A context carrying a `BigInt` (a snowflake id, a monetary amount)
+ * makes the plain round-trip throw, so it is retried through a BigInt-coercing
+ * replacer — still a fully-owned, `toJSON`-resolved copy. A context that
+ * neither round-trip can express (a circular reference, or a value whose getter
+ * / `toJSON` throws) degrades to a fresh owned `{ _unserializable: true }`
+ * sentinel rather than sharing the caller's live graph or letting the failure
+ * escape and drop the whole log line. `redactValue`'s `forceCopy` is
+ * deliberately NOT used here: it passes a `toJSON`-defining instance through by
+ * identity (a documented `redact.ts` boundary), which would leave a `toJSON`
+ * DTO carrying a `BigInt` field shared with — and mutable on — the caller.
+ */
+const ownContext = (enriched: Record<string, unknown>): Record<string, unknown> => {
+  try {
+    return JSON.parse(JSON.stringify(enriched)) as Record<string, unknown>;
+  } catch {
+    // Fall through: a value is not JSON-expressible as-is (commonly a BigInt).
+  }
+  try {
+    return JSON.parse(JSON.stringify(enriched, bigintSafeReplacer)) as Record<string, unknown>;
+  } catch {
+    // A circular reference, or a value whose getter / `toJSON` throws.
+    return { _unserializable: true };
   }
 };
 
@@ -344,6 +460,72 @@ const applyHeaderMask = (
   }, {});
 };
 
+/**
+ * Returns a header value the package fully owns, so a later `redactEntryPath`
+ * write cannot reach the caller's live state.
+ *
+ * **Rebuilding the header BAG was not enough, and the claim that it was is the
+ * bug this closes.** `normalizeHeaders` rebuilds the bag but used to copy each
+ * VALUE by reference, while `finalize()`'s post-assembly `redactPaths` pass
+ * writes IN PLACE via `redactEntryPath`. So
+ * `redactPaths: ["requestHeaders.x-tags.0"]` over
+ * `req.headers["x-tags"] = ["TAG-SECRET", "b"]` wrote `"[REDACTED]"` into the
+ * RUNNING APPLICATION's live request headers, not merely into the log line —
+ * verified. The response side is the same and is worse by Node's own contract:
+ * `res.getHeaders()` is documented as returning "a shallow copy of the current
+ * outgoing headers… Since a shallow copy is used, array values may be mutated
+ * without additional calls to various header-related http module methods" — so
+ * the array reached from it is the very array the application handed to
+ * `res.setHeader`.
+ *
+ * `set-cookie` hid this for a long time: it is in
+ * {@link DEFAULT_MASKED_HEADER_KEYS}, so `applyHeaderMask` had already swapped
+ * the whole array for a string before any path could walk into it. Every
+ * array-valued header OUTSIDE that list was exposed.
+ *
+ * **One level is the whole realistic surface, not a partial fix.** Node types a
+ * header value as `string | string[] | number | undefined`, so an array is the
+ * only reference-typed shape that reaches here and its elements are strings.
+ * **A one-level array copy is NOT enough, because a non-string header value is
+ * reachable in plain Node.** Node's docs for `response.setHeader()` state that
+ * "non-string values will be stored without modification. Therefore,
+ * `response.getHeader()` may return non-string values" — verified: after
+ * `res.setHeader("x-meta", live)` with an object, `res.getHeaders()["x-meta"]`
+ * IS `live`, the same reference. So `redactPaths: ["responseHeaders.x-meta.a"]`
+ * would write into the application's own object. `redactValue`'s `forceCopy`
+ * mode exists for exactly this caller ("will mutate the returned value in place
+ * afterward and must not risk that mutation landing on a caller-owned object"),
+ * so it is reused here rather than hand-rolling a second deep-copy: it owns
+ * plain objects, arrays, and class instances at every depth, renders cycles as
+ * `"[Circular]"` instead of throwing, and strips `FORBIDDEN_KEYS`.
+ *
+ * Cost is negligible on the realistic surface: `redactValue` returns any
+ * primitive from its first statement, so an ordinary all-string header bag is
+ * walk-free, and only a reference-typed value pays for a copy. The mask set is
+ * empty here — this call is purely for ownership; keyword masking is
+ * `applyHeaderMask`'s job, and it runs afterwards over the owned bag.
+ *
+ * Boundary: `redactValue` returns `toJSON`-defining values (`Date`), binary
+ * views (`Buffer` / typed arrays), and values with no enumerable own keys
+ * (`Map`, `Set`, `RegExp`) by identity — its documented rule for values owning
+ * no key-addressable *string* secret. Those are therefore still shared with the
+ * caller by reference. That sharing is safe ONLY because {@link redactEntryPath}
+ * refuses to write into any target that is not an owned plain object or array:
+ * a `Buffer`'s writable integer indices and a `RegExp`'s writable `lastIndex`
+ * DO pass a bare `hasOwnProperty` + writable-descriptor check, so the earlier
+ * claim that "such a value exposes none a path would target" was false — the
+ * guarantee is enforced at the write site, not by the shape of these values.
+ */
+const EMPTY_HEADER_MASK = new Set<string>();
+
+const ownHeaderValue = (value: unknown): unknown =>
+  redactValue(value, EMPTY_HEADER_MASK, new WeakSet(), true);
+
+/**
+ * Normalizes the header bag for logging. Returns a bag that shares no reference
+ * with the caller, one level deep — see {@link ownHeaderValue} for why the
+ * value copy (not just the bag rebuild) is load-bearing.
+ */
 const normalizeHeaders = (
   headers: Record<string, unknown> | undefined,
   include?: boolean | string[],
@@ -371,7 +553,11 @@ const normalizeHeaders = (
     if (FORBIDDEN_OBJECT_KEYS.has(key)) {
       return acc;
     }
-    acc[key.toLowerCase()] = val;
+    // Own the VALUE, not just the key. This single site covers both the
+    // `include === true` path and the allow-list path below, because the latter
+    // reads out of `normalized`. `applyHeaderMask` deliberately does NOT repeat
+    // the copy — it consumes `normalized`, whose values are already owned.
+    acc[key.toLowerCase()] = ownHeaderValue(val);
     return acc;
   }, {});
 
@@ -485,6 +671,57 @@ const redactUrlQuery = (url: string, maskQueryKeys: ReadonlySet<string> | undefi
 };
 
 /**
+ * Resolves the URL for `finalize()`'s error-path fallback message, with query
+ * secrets masked exactly as the happy path masks them.
+ *
+ * Two properties are load-bearing:
+ *
+ * 1. **It redacts.** The fallback message is written to `console.error`, so
+ *    building it from the raw `req.originalUrl` leaked precisely the
+ *    query-string secrets `maskQueryKeys` promises to mask — a throwing
+ *    `enrich` / `messageBuilder` / `logger.log` printed
+ *    `?code=SUPER_SECRET_AUTH_CODE` to stderr in cleartext even though `code`
+ *    is in {@link DEFAULT_MASKED_QUERY_KEYS}.
+ * 2. **It degrades rather than throws.** The catch runs inside the `res`
+ *    `"finish"` / `"close"` emitter, where an exception is an UNCAUGHT
+ *    exception. Every value read here is caller-controlled (an exotic request
+ *    adapter can expose a throwing `originalUrl` getter, or a non-string url
+ *    that `redactUrlQuery` would choke on), so the resolution is self-guarded
+ *    and degrades to `""` — leaving the method and the failure reason still
+ *    reportable, which a guard around the whole message would not.
+ *
+ * The value is RECOMPUTED here rather than hoisted out of `finalize()`'s try
+ * block. Both work — hoisting *this* (already guarded) call above the try would
+ * be safe too — but recompute keeps the happy path byte-identical and pays
+ * nothing per request for a value only the error path ever reads. What does NOT
+ * work is hoisting a `let` that the try block assigns: a function-form `level`
+ * throws before the URL is resolved, so at that throw position the value does
+ * not exist yet and the message would lose the URL entirely (pinned by test).
+ * `redactUrlQuery` is pure, so recomputing re-reads only `req.originalUrl` /
+ * `req.url` — for any ordinary request object, the same value the entry carried.
+ *
+ * Boundary: this masks query secrets, which is what `maskQueryKeys` governs. A
+ * `redactPaths` entry targeting `url` itself (e.g. to suppress a path segment
+ * like `/users/<ssn>`) is NOT honored here, because this resolves from `req` and
+ * never consults `entry.url`: the entry is block-scoped to the try, and for a
+ * throw from `enrich` or a function-form `level` it does not exist yet at all.
+ * (For a later throw — `messageBuilder`, `logger.log` — it does exist with `url`
+ * already redacted, but reaching it would mean hoisting the entry out of the
+ * try, beyond this helper's query-secret mandate.) So a path segment the
+ * happy-path line redacts can still appear in the error-path message.
+ */
+const safeRedactedUrl = (
+  req: LoggableRequest,
+  maskQueryKeys: ReadonlySet<string> | undefined,
+): string => {
+  try {
+    return redactUrlQuery(req.originalUrl ?? req.url ?? "", maskQueryKeys);
+  } catch {
+    return "";
+  }
+};
+
+/**
  * Surgically redacts a value at the supplied dot-notation path on the entry
  * object. Missing intermediate keys are a no-op (we never create new sub-paths
  * just to write `[REDACTED]`). Mutates the passed object in place — callers
@@ -496,6 +733,17 @@ const redactUrlQuery = (url: string, maskQueryKeys: ReadonlySet<string> | undefi
  *   field name on `RequestLogEntry`).
  * - `requestBody.user.password` is also accepted as the explicit form.
  * - `context.user.token` → `entry.context.user.token = "[REDACTED]"`.
+ *
+ * The final assignment is **best-effort and never throws**: an array `length`
+ * target, a getter-only / accessor property, a non-writable (frozen) slot, or
+ * any other value whose write would raise (a `Proxy` with a throwing `set`
+ * trap) is skipped rather than allowed to propagate. This is load-bearing —
+ * `finalize()` applies these paths inside the same try block that assembles the
+ * whole entry, so a throwing redaction would otherwise drop the ENTIRE log line
+ * (method, url, status included) over one path. Callers that must guarantee the
+ * caller's own object is never mutated by these in-place writes should pass a
+ * fully-owned copy of the target sub-graph (as `finalize()` does for
+ * `entry.context` and `serializeBody()` does for `entry.requestBody`).
  */
 const redactEntryPath = (entry: Record<string, unknown>, path: string): void => {
   if (!path) {
@@ -547,7 +795,60 @@ const redactEntryPath = (entry: Record<string, unknown>, path: string): void => 
   if (!Object.prototype.hasOwnProperty.call(target, finalKey)) {
     return;
   }
-  target[finalKey] = REDACTED;
+  // Never overwrite an array's `length`. `hasOwnProperty(arr, "length")` is
+  // `true`, but assigning a non-numeric value throws
+  // `RangeError: Invalid array length`; without this guard
+  // `redactPaths:["body.tags.length"]` would throw and `finalize()`'s catch
+  // would drop the ENTIRE log entry over a single path.
+  if (Array.isArray(target) && finalKey === "length") {
+    return;
+  }
+  // Only ever write into a container the package FULLY OWNS: a plain object
+  // (produced by the `ownContext` / `serializeBody` JSON round-trips or the
+  // `normalizeHeaders` bag rebuild) or an array (an owned header/body array).
+  // Every other reachable target is a value that `redactValue` handed back BY
+  // IDENTITY — a `Date`, a `Buffer` / typed-array, a `RegExp`, a bare `Error`,
+  // a `Map` / `Set` — i.e. STILL SHARED with the caller. Those are pass-through
+  // precisely because they own no key-addressable *string* secret, but that is
+  // not the same as owning no writable own key a numeric/reserved path could
+  // hit: a binary view exposes writable integer-index data properties
+  // (`Object.keys(Buffer.from([1,2,3]))` → `["0","1","2"]`) and a `RegExp` a
+  // writable `lastIndex`, both of which pass the `hasOwnProperty` + writable-
+  // descriptor guards below. Without this check
+  // `redactPaths:["responseHeaders.x-buf.0"]` over a `Buffer`-valued response
+  // header — reachable in plain Node, since `res.setHeader` stores non-string
+  // values unmodified and `res.getHeaders()` hands the same reference back —
+  // would coerce and zero a byte of the application's LIVE Buffer, the exact
+  // caller-mutation `ownHeaderValue` exists to prevent. Restricting the write
+  // to owned plain containers closes that whole class centrally and excludes
+  // nothing legitimate: every value the package owns for redaction (after the
+  // round-trips and the `forceCopy` header rebuild) is a plain object or an
+  // array, never one of these pass-through built-ins. (`redactValue` rebuilds
+  // every plain object into a fresh `{}` with `Object.prototype`, even an
+  // `Object.create(null)` input, so a null-prototype target is unreachable here
+  // and is not admitted — that keeps the guard's branches exactly the reachable
+  // ones: array, `Object.prototype`, or skip.)
+  if (!Array.isArray(target) && Object.getPrototypeOf(target) !== Object.prototype) {
+    return;
+  }
+  // Only overwrite a writable data property. A frozen target
+  // (`writable === false`), a getter-only / accessor property (`get` / `set`),
+  // or any other non-assignable slot cannot be written — in strict mode the
+  // assignment throws, and that throw would propagate to `finalize()`'s catch
+  // and drop the whole entry. Logging is best-effort, so a redaction that
+  // cannot be applied degrades to a no-op on that path instead.
+  const descriptor = Object.getOwnPropertyDescriptor(target, finalKey);
+  if (!descriptor || descriptor.get || descriptor.set || descriptor.writable === false) {
+    return;
+  }
+  // Defense-in-depth: even a writable data property can throw on assignment
+  // (an exotic host object, or a `Proxy` with a throwing `set` trap). A failed
+  // redaction must never take the log line down with it.
+  try {
+    target[finalKey] = REDACTED;
+  } catch {
+    // best-effort: leave the value in place rather than dropping the entry
+  }
 };
 
 /**
@@ -732,8 +1033,6 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
     const externalStart = (req as unknown as Record<symbol, unknown>)[REQUEST_START_SYMBOL];
     const start = typeof externalStart === "bigint" ? externalStart : process.hrtime.bigint();
 
-    const initialContentLength = toNumber(req.headers["content-length"]);
-
     // Snapshot `req.body` at middleware ENTRY time so handler-time mutation
     // (e.g. `req.body = { redacted: true }`) does not change what gets logged.
     // We take a SHALLOW reference rather than a deep clone: deep cloning every
@@ -817,7 +1116,16 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
           url: loggedUrl,
           statusCode,
           responseTimeMs: Number(durationMs.toFixed(2)),
-          contentLength: toNumber(res.getHeader("content-length")) ?? initialContentLength,
+          // The RESPONSE's declared byte count only. This is a response-side
+          // field (it sits alongside `statusCode` / `responseTimeMs`, all
+          // computed at finalize time), so it must never fall back to the
+          // request's `Content-Length`: a chunked/streamed response carries no
+          // `Content-Length`, and reporting the uploaded request-body size there
+          // mislabels egress (a 5000-byte upload answered by a 2-byte chunked
+          // reply would log 5000) and would report bytes never sent on an abort.
+          // `toNumber` yields `undefined` for a missing/non-finite header, which
+          // is the honest value for a chunked/streamed/aborted response.
+          contentLength: toNumber(res.getHeader("content-length")),
           ip: req.ip ?? req.socket?.remoteAddress ?? undefined,
           userAgent: lookupHeader("user-agent"),
           requestId: lookupHeader("x-request-id"),
@@ -841,12 +1149,27 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
           // Also pass `resolvedRedactPaths` so body-scoped paths are applied to
           // the object graph BEFORE any over-limit truncation collapses it into
           // the `_preview` envelope (see the comment inside `serializeBody`).
-          entry.requestBody = serializeBody(
-            bodySnapshot,
-            bodyMaskSet,
-            maxBodyLength,
-            resolvedRedactPaths,
-          );
+          // Serializing the body is the only step here that runs over
+          // arbitrary caller-supplied data of arbitrary shape, so it is the
+          // only step whose failure is plausible — a metadata getter throwing,
+          // a hostile `toJSON`, a payload no serializer can express. Its
+          // failure must not be allowed to reach the outer catch, which would
+          // discard the ENTIRE entry: the method, url, status, and duration are
+          // all already computed and never touched the body, so dropping them
+          // over a body problem loses the record of a request that did happen.
+          // (That was a cheap way to make a request structurally invisible in
+          // the HTTP log — post a body the serializer chokes on.) Degrade the
+          // body to a sentinel; log everything else.
+          try {
+            entry.requestBody = serializeBody(
+              bodySnapshot,
+              bodyMaskSet,
+              maxBodyLength,
+              resolvedRedactPaths,
+            );
+          } catch {
+            entry.requestBody = UNSERIALIZABLE_BODY;
+          }
         }
 
         entry.requestHeaders = normalizeHeaders(
@@ -863,7 +1186,13 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
         if (enrich) {
           // `enrich(...) ?? undefined` collapses a `null` or `undefined` return
           // value to `undefined` so `entry.context` is never set to `null`.
-          entry.context = enrich(req, res, durationMs) ?? undefined;
+          // `ownContext` then takes a fully-owned copy (see its doc): the
+          // post-assembly `redactPaths` loop writes in place, so `entry.context`
+          // must never be the object `enrich()` returned BY IDENTITY, or
+          // `redactPaths:["context.token"]` would overwrite the caller's live
+          // `req.session` / `req.user` in the running app.
+          const enriched = enrich(req, res, durationMs) ?? undefined;
+          entry.context = enriched === undefined ? undefined : ownContext(enriched);
         }
 
         // Surgical path-based redaction. Body-scoped paths (`body.*` /
@@ -873,8 +1202,33 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
         // them here is a harmless idempotent no-op. This pass remains the ONLY
         // place `context.*` / `requestHeaders.*` / `responseHeaders.*` paths
         // are redacted, and it still runs LAST so it can override anything
-        // that survived the keyword-based body/header masks. Missing
-        // intermediate segments are a graceful no-op.
+        // that survived the keyword-based body/header masks. Every sub-graph it
+        // writes into is package-owned:
+        //   - `entry.requestBody` — `serializeBody` applies body paths on a
+        //     `JSON.parse(JSON.stringify(...))` copy, and its guard is the SAME
+        //     predicate as this loop's (`redactPaths` non-empty), so the
+        //     round-trip has always run whenever this loop can write at all.
+        //   - `entry.requestHeaders` / `entry.responseHeaders` —
+        //     `normalizeHeaders` rebuilds the bag AND copies each value via
+        //     `ownHeaderValue`. The bag rebuild alone was NOT enough, and the
+        //     previous claim here that it was is the bug that fix closed:
+        //     header values were shared by reference, so
+        //     `redactPaths: ["requestHeaders.x-tags.0"]` wrote into the
+        //     caller's live `req.headers` array, and Node documents
+        //     `res.getHeaders()` as a shallow copy whose array values are the
+        //     app's own arrays.
+        //   - `entry.context` — `ownContext`'s round-trip copy.
+        // So `redactEntryPath`'s in-place writes cannot reach the caller's live
+        // objects. Missing intermediate segments, non-writable slots, and array
+        // `length` targets are all graceful no-ops. BOUNDARY: `ownHeaderValue`
+        // owns plain objects, arrays, and class instances at every depth, but
+        // leaves `Date` / `Buffer` / `RegExp` / `Map`-shaped values shared by
+        // identity — `redactValue`'s own rule for values owning no key-
+        // addressable string secret. That is safe because `redactEntryPath`
+        // writes ONLY into an owned plain object or array and refuses every
+        // other target, so a path aimed at a shared `Buffer`'s writable integer
+        // index (or a `RegExp`'s `lastIndex`) is a no-op instead of a write into
+        // the caller's live value.
         if (resolvedRedactPaths.length > 0) {
           resolvedRedactPaths.forEach((path) =>
             redactEntryPath(entry as unknown as Record<string, unknown>, path),
@@ -894,12 +1248,27 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
 
         logger.log(logEntry);
       } catch (err) {
-        const method = req.method ?? "GET";
-        const reqUrl = req.originalUrl ?? req.url ?? "";
-        const reason = err instanceof Error ? err.message : String(err);
-        console.error(
-          `@hiprax/logger request logger failed while logging ${method} ${reqUrl}: ${reason}`,
-        );
+        // This handler runs inside the `res` "finish" / "close" emitter, where a
+        // throw is an UNCAUGHT exception — it would escalate a dropped log line
+        // into a crashed process. Every value read here is caller-controlled: an
+        // exotic request adapter can expose throwing `method` / `originalUrl`
+        // getters, and a custom `Error` subclass can expose a throwing `message`
+        // getter (or be a value whose `String()` conversion throws). So the whole
+        // assembly is guarded, with a last-resort message that reads nothing.
+        try {
+          const method = req.method ?? "GET";
+          // Never build this message from the raw URL: it goes to `console.error`,
+          // so an unredacted query string leaks the very secrets `maskQueryKeys`
+          // masks on the happy path. `safeRedactedUrl` degrades the URL alone, so
+          // a hostile url getter still leaves the method and reason reportable.
+          const reqUrl = safeRedactedUrl(req, queryMaskSet);
+          const reason = err instanceof Error ? err.message : String(err);
+          console.error(
+            `@hiprax/logger request logger failed while logging ${method} ${reqUrl}: ${reason}`,
+          );
+        } catch {
+          console.error("@hiprax/logger request logger failed, and so did reporting the failure.");
+        }
       }
     };
 
@@ -926,6 +1295,7 @@ export const __requestInternals = {
   truncateString,
   buildTruncatedEnvelope,
   redactUrlQuery,
+  safeRedactedUrl,
   redactEntryPath,
   resolveMaskHeaderKeys,
   resolveMaskQueryKeys,

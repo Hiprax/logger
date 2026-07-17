@@ -8,6 +8,7 @@ import fc from "fast-check";
 import winston from "winston";
 import Transport from "winston-transport";
 import DailyRotateFile from "winston-daily-rotate-file";
+import moment from "moment-timezone";
 import {
   createLogger,
   createNoopLogger,
@@ -25,6 +26,7 @@ import {
   acquireSharedGlobalFile,
   flushSharedFileTransportsForExit,
 } from "../src/shared-file-transport";
+import { MAX_REDACT_DEPTH, redactValue } from "../src/redact";
 import { InvalidTimezoneError, LoggerOptionError } from "../src/errors";
 import { createTempDir, teardownLogger } from "./_helpers";
 
@@ -467,6 +469,37 @@ describe("createLogger", () => {
       level: "info",
       message: "stringified-problem",
     });
+    teardownLogger(logger);
+  });
+
+  it("renders a nested BigInt in the info fallback instead of collapsing to String(value)", () => {
+    // Same defect shape the middleware's serializeBody carried: an unguarded
+    // JSON.stringify threw on the BigInt and String(value) rendered the whole
+    // payload as the useless "[object Object]".
+    const logger = createNoopTransportLogger();
+    (logger as any).info = undefined;
+    const logSpy = jest.fn();
+    (logger as any).log = logSpy;
+
+    (logger as any).obscure({ orderId: 123n, user: "bob" });
+
+    expect(logSpy).toHaveBeenCalledWith({
+      level: "info",
+      message: '{"orderId":"123","user":"bob"}',
+    });
+    teardownLogger(logger);
+  });
+
+  it("renders a bare BigInt payload as its bare digits in the info fallback", () => {
+    // Matches formatMessage's bare-BigInt short-circuit: `123`, not `"123"`.
+    const logger = createNoopTransportLogger();
+    (logger as any).info = undefined;
+    const logSpy = jest.fn();
+    (logger as any).log = logSpy;
+
+    (logger as any).obscure(123n);
+
+    expect(logSpy).toHaveBeenCalledWith({ level: "info", message: "123" });
     teardownLogger(logger);
   });
 
@@ -952,6 +985,145 @@ describe("createLogger", () => {
       teardownLogger(first);
     });
 
+    it("folds two module names that sanitize to the same file into one cached logger (P13a)", () => {
+      // "user api" and "user-api" both sanitize to `http/user-api-%DATE%.log`,
+      // so they must resolve to the SAME cached instance — not two independent
+      // rotators fighting over one physical file. Reachable via
+      // createRequestLogger({ label: "user api" }) (moduleName "http/<label>").
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const spaced = createLogger({ ...baseOpts(root), moduleName: "http/user api" });
+      const hyphen = createLogger({ ...baseOpts(root), moduleName: "http/user-api" });
+
+      expect(hyphen).toBe(spaced);
+      // Identical options otherwise → no false-positive conflict warning.
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+      teardownLogger(spaced);
+    });
+
+    it("warns when two colliding module names carry divergent options (P13a)", () => {
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({
+        ...baseOpts(root),
+        moduleName: "http/user api",
+        level: "info",
+      });
+      const second = createLogger({
+        ...baseOpts(root),
+        moduleName: "http/user-api",
+        level: "debug",
+      });
+
+      // Same resolved file → same cache key → the options divergence now trips
+      // the existing conflict warning instead of silently double-opening.
+      expect(second).toBe(first);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain("level");
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("does not warn when rotation.maxSize differs only by unit-suffix case (P13b)", () => {
+      // "20m" and "20M" produce a byte-identical transport (upstream lowercases
+      // internally), so the signature must treat them as equal — no
+      // false-positive conflict warning.
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({ ...baseOpts(root), rotation: { maxSize: "20m" } });
+      const second = createLogger({ ...baseOpts(root), rotation: { maxSize: "20M" } });
+
+      expect(second).toBe(first);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("warns when onTransportError presence differs on a cached key (P13c)", () => {
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger(baseOpts(root));
+      const second = createLogger({ ...baseOpts(root), onTransportError: () => undefined });
+
+      // Adding the callback to a cached key must no longer be silently dropped:
+      // the presence marker surfaces it through the conflict warning.
+      expect(second).toBe(first);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain("onTransportError");
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("does not warn when onTransportError is present on both calls (presence-only, P13c)", () => {
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      // Two DIFFERENT callbacks: compared by presence only, both are
+      // "function", so no conflict is reported (documented caveat, mirroring
+      // additionalTransports(count)).
+      const first = createLogger({ ...baseOpts(root), onTransportError: () => undefined });
+      const second = createLogger({ ...baseOpts(root), onTransportError: (err) => void err });
+
+      expect(second).toBe(first);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("normalizeMaxSize lowercases a string unit suffix and passes non-strings through (P13b)", () => {
+      expect(__loggerInternals.normalizeMaxSize("20M")).toBe("20m");
+      expect(__loggerInternals.normalizeMaxSize("0.5M")).toBe("0.5m");
+      expect(__loggerInternals.normalizeMaxSize("1G")).toBe("1g");
+      expect(__loggerInternals.normalizeMaxSize("20m")).toBe("20m");
+      expect(__loggerInternals.normalizeMaxSize(undefined)).toBeUndefined();
+    });
+
+    it("folds a case-varying globalModuleName into one shared global-file transport (P13/shared-file)", () => {
+      // The shared-file registry key is normalized the same way the module
+      // registry key is (`buildRegistryKey` — Windows-only lowercase, POSIX
+      // identity). Two DISTINCT module loggers whose `globalModuleName` differs
+      // only in case target the same physical global file on a case-insensitive
+      // filesystem, so they must share ONE `DailyRotateFile`, not open two
+      // rotators fighting over it. On a case-sensitive filesystem the two names
+      // are genuinely different files, so two transports is correct there.
+      const root = createTempDir();
+      const a = createLogger({
+        moduleName: "svc-a",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: true,
+        globalModuleName: "SharedLog",
+      });
+      const b = createLogger({
+        moduleName: "svc-b",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: true,
+        globalModuleName: "sharedlog",
+      });
+
+      // Two different module loggers (distinct module keys), so neither is a
+      // cache hit of the other; the assertion is purely about the shared-file key.
+      expect(b).not.toBe(a);
+      const expectedShared = process.platform === "win32" ? 1 : 2;
+      expect(__sharedFileInternals.sharedFileRegistry.size).toBe(expectedShared);
+
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
     it("does not warn a second time when the same mismatched options recur", () => {
       const root = createTempDir();
       const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -1353,6 +1525,20 @@ describe("createLogger", () => {
   });
 
   describe("internals", () => {
+    it("re-exports a working bigintSafeReplacer after the move to src/serialize.ts", () => {
+      // The replacer now lives in `src/serialize.ts` and is shared with the
+      // request middleware; `__loggerInternals` must keep exposing it, and it
+      // must still be the real implementation rather than a stale stub.
+      const { bigintSafeReplacer } = __loggerInternals;
+      expect(bigintSafeReplacer("k", 123n)).toBe("123");
+      expect(bigintSafeReplacer("k", "plain")).toBe("plain");
+      expect(bigintSafeReplacer("k", 42)).toBe(42);
+      // Behaves correctly as an actual JSON.stringify replacer.
+      expect(JSON.stringify({ id: 9007199254740993n }, bigintSafeReplacer)).toBe(
+        '{"id":"9007199254740993"}',
+      );
+    });
+
     it("generates log paths for empty module names", () => {
       const result = __loggerInternals.buildLogFilePath("/tmp", "");
       expect(result.endsWith(`logs-%DATE%.log`)).toBe(true);
@@ -1518,31 +1704,138 @@ describe("createLogger", () => {
       expect(lines.length).toBeGreaterThanOrEqual(2);
     });
 
-    it("resolveLogDirectory falls back to path.resolve when the dir does not exist", () => {
-      const ghost = path.join(os.tmpdir(), `adv-logger-ghost-${Date.now()}`);
+    it("resolveLogDirectory canonicalizes via the nearest existing ancestor when the dir does not exist", () => {
+      // The parent exists but the target does not yet. The resolved path must be
+      // the CANONICAL parent (realpath) with the missing tail re-joined, so it
+      // matches what a later call resolves once the directory is created. This
+      // is what keeps the registry key stable across the create-the-directory
+      // boundary when a symlink/junction sits above the target.
+      const parent = createTempDir();
+      const ghost = path.join(parent, "does-not-exist-yet");
       const resolved = __loggerInternals.resolveLogDirectory(ghost);
-      expect(resolved).toBe(path.resolve(ghost));
+      const expected = path.join(fs.realpathSync.native(parent), "does-not-exist-yet");
+      expect(resolved).toBe(expected);
     });
 
+    it("resolveLogDirectory re-joins a multi-segment missing tail onto the nearest existing ancestor", () => {
+      const parent = createTempDir();
+      const ghost = path.join(parent, "a", "b", "c");
+      const resolved = __loggerInternals.resolveLogDirectory(ghost);
+      const expected = path.join(fs.realpathSync.native(parent), "a", "b", "c");
+      expect(resolved).toBe(expected);
+    });
+
+    it("resolveLogDirectory falls back to the plain absolute path when no ancestor can be canonicalized", () => {
+      // Force every realpath to fail so the ancestor walk climbs to the
+      // filesystem root and hits the root guard, exercising the fallback.
+      const spy = jest.spyOn(fs.realpathSync, "native").mockImplementation(() => {
+        throw new Error("realpath unavailable");
+      });
+      try {
+        const input = path.join(createTempDir(), "x", "y");
+        const resolved = __loggerInternals.resolveLogDirectory(input);
+        expect(resolved).toBe(path.resolve(input));
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    // Probe (once) whether this runner is allowed to create a symlink/junction.
+    // Windows can create directory JUNCTIONS without elevation but plain
+    // symlinks usually need it; POSIX allows symlinks. Where neither is
+    // permitted the junction test is skipped EXPLICITLY (jest reports it as
+    // skipped) rather than silently passing.
+    const symlinkProbe = ((): { ok: boolean; type: "junction" | undefined } => {
+      const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "adv-logger-symprobe-"));
+      const type = process.platform === "win32" ? ("junction" as const) : undefined;
+      try {
+        const target = path.join(probeRoot, "target");
+        fs.mkdirSync(target);
+        fs.symlinkSync(target, path.join(probeRoot, "link"), type);
+        return { ok: true, type };
+      } catch {
+        return { ok: false, type };
+      } finally {
+        fs.rmSync(probeRoot, { recursive: true, force: true });
+      }
+    })();
+
+    const junctionIt = symlinkProbe.ok ? it : it.skip;
+
+    junctionIt(
+      "resolves one logger and one shared global file across the create-the-directory boundary through a junction/symlink",
+      () => {
+        const root = fs.realpathSync.native(createTempDir());
+        const realDir = path.join(root, "real");
+        fs.mkdirSync(realDir);
+        const linkDir = path.join(root, "link");
+        fs.symlinkSync(realDir, linkDir, symlinkProbe.type);
+
+        // The target under the link does NOT exist yet, so the FIRST call runs
+        // before its own ensureDirectory materializes it — the exact ordering
+        // that used to split one physical file across two registry keys.
+        const logDirectory = path.join(linkDir, "logs");
+        expect(fs.existsSync(logDirectory)).toBe(false);
+
+        const first = createLogger({
+          logDirectory,
+          moduleName: "svc",
+          includeConsole: false,
+        });
+        // Now the directory exists (physically under realDir), so the second
+        // call's realpath succeeds and — with the fix — resolves to the same
+        // canonical path the first call registered under.
+        expect(fs.existsSync(logDirectory)).toBe(true);
+
+        const second = createLogger({
+          logDirectory,
+          moduleName: "svc",
+          includeConsole: false,
+        });
+
+        // Same cached instance => a single registry key across the boundary.
+        expect(second).toBe(first);
+        // Exactly ONE shared global-file transport => the shared-file key did
+        // not diverge either (its key is derived from the same resolved dir).
+        expect(__sharedFileInternals.sharedFileRegistry.size).toBe(1);
+        // And exactly one module-scoped rotating-file handle backs the file.
+        expect(moduleRotatingTransports(first)).toHaveLength(1);
+
+        teardownLogger(first);
+      },
+    );
+
     it("buildRegistryKey is case-insensitive on Windows and case-sensitive on POSIX", () => {
-      const moduleName = "auth";
-      const upper = path.resolve("/Tmp/Logger");
-      const lower = path.resolve("/tmp/logger");
+      // Phase 13: the key is now the resolved MODULE LOG-FILE PATH, not the raw
+      // moduleName + directory. Case-folding is still Windows-only.
+      const upper = "/Tmp/Logger/auth-%DATE%.log";
+      const lower = "/tmp/logger/auth-%DATE%.log";
       const original = process.platform;
 
       try {
         Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-        const upperKeyWin = __loggerInternals.buildRegistryKey(moduleName, upper);
-        const lowerKeyWin = __loggerInternals.buildRegistryKey(moduleName, lower);
+        const upperKeyWin = __loggerInternals.buildRegistryKey(upper);
+        const lowerKeyWin = __loggerInternals.buildRegistryKey(lower);
         expect(upperKeyWin).toBe(lowerKeyWin);
 
         Object.defineProperty(process, "platform", { value: "linux", configurable: true });
-        const upperKeyPosix = __loggerInternals.buildRegistryKey(moduleName, upper);
-        const lowerKeyPosix = __loggerInternals.buildRegistryKey(moduleName, lower);
+        const upperKeyPosix = __loggerInternals.buildRegistryKey(upper);
+        const lowerKeyPosix = __loggerInternals.buildRegistryKey(lower);
         expect(upperKeyPosix).not.toBe(lowerKeyPosix);
       } finally {
         Object.defineProperty(process, "platform", { value: original, configurable: true });
       }
+    });
+
+    it("buildRegistryKey folds two module names that sanitize to one file into one key", () => {
+      // "user api" and "user-api" both sanitize to `user-api-%DATE%.log`, so
+      // their registry keys must be identical (Phase 13 collision fix).
+      const baseDir = path.resolve("/tmp/logger-key");
+      const spaced = __loggerInternals.buildLogFilePath(baseDir, "http/user api");
+      const hyphen = __loggerInternals.buildLogFilePath(baseDir, "http/user-api");
+      expect(__loggerInternals.buildRegistryKey(spaced)).toBe(
+        __loggerInternals.buildRegistryKey(hyphen),
+      );
     });
 
     it("buildOptionsSignature sorts extraTimezones to ignore input order", () => {
@@ -1561,6 +1854,7 @@ describe("createLogger", () => {
         colorize: { level: true, message: true },
         captureUncaught: true,
         exitOnUncaught: true,
+        onTransportError: "undefined",
       };
       const a = __loggerInternals.buildOptionsSignature({
         ...base,
@@ -1589,6 +1883,7 @@ describe("createLogger", () => {
         colorize: { level: true, message: true },
         captureUncaught: true,
         exitOnUncaught: true,
+        onTransportError: "undefined",
       };
       const a = __loggerInternals.buildOptionsSignature({
         ...base,
@@ -1914,6 +2209,577 @@ describe("createLogger", () => {
         /shutdownLogger timed out after 50ms/,
       );
       teardownLogger(logger);
+    });
+
+    // -------------------------------------------------------------------------
+    // Phase 1 — shutdownLogger must actually flush to disk
+    //
+    // Regression guard for the data-loss defect: `shutdownLogger` used to await
+    // only `finish`, and a `DailyRotateFile` implements no `_final`, so `end()`
+    // emitted `finish` while its `logStream` was still buffering. The helper
+    // resolved with NOTHING on disk, which meant the documented SIGTERM idiom
+    // (`await shutdownAllLoggers(); process.exit(0)`) lost every buffered line.
+    //
+    // These tests are deliberately end-to-end: they read the real rotating log
+    // file back off disk AFTER the await resolves. Asserting on transport
+    // internals or `finish` events would have stayed green throughout the bug.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Concatenates every rotated log file written for `prefix` in `dir`. Reading
+     * the directory rather than reconstructing the `-%DATE%.log` filename keeps
+     * the assertion independent of the rotator's local-vs-UTC date resolution.
+     */
+    const readLogFiles = (dir: string, prefix: string): string => {
+      if (!fs.existsSync(dir)) {
+        return "";
+      }
+      return fs
+        .readdirSync(dir)
+        .filter((name) => name.startsWith(`${prefix}-`) && name.endsWith(".log"))
+        .map((name) => fs.readFileSync(path.join(dir, name), "utf8"))
+        .join("");
+    };
+
+    it("flushes a single line to the module file before resolving (Phase 1)", async () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "flush-single",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      });
+
+      logger.info("SINGLE-LINE-ON-DISK");
+
+      await shutdownLogger(logger);
+
+      // The await has resolved — the bytes MUST already be readable. Before the
+      // fix this file did not even exist at this point.
+      expect(readLogFiles(root, "flush-single")).toContain("SINGLE-LINE-ON-DISK");
+      teardownLogger(logger);
+    });
+
+    it("flushes a bulk write to the module file before resolving (Phase 1)", async () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "flush-bulk",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      });
+
+      const total = 500;
+      for (let i = 0; i < total; i += 1) {
+        logger.info(`bulk-line-${i}`);
+      }
+
+      await shutdownLogger(logger);
+
+      // Every line, not just the first — the original defect lost the entire
+      // buffer, and a partial drain would be just as much a data-loss bug.
+      const contents = readLogFiles(root, "flush-bulk");
+      for (let i = 0; i < total; i += 1) {
+        expect(contents).toContain(`bulk-line-${i}`);
+      }
+      teardownLogger(logger);
+    });
+
+    it("flushes both the module and shared global file under the default config (Phase 1)", async () => {
+      const root = createTempDir();
+      // `includeFile` and `includeGlobalFile` both default to true — this is the
+      // configuration the README's SIGTERM example produces.
+      const logger = createLogger({
+        moduleName: "flush-default",
+        logDirectory: root,
+        includeConsole: false,
+      });
+
+      logger.info("DEFAULT-CONFIG-LINE");
+
+      await shutdownLogger(logger);
+
+      expect(readLogFiles(root, "flush-default")).toContain("DEFAULT-CONFIG-LINE");
+      // The shared global file drains through the refcounted handle's `_final`,
+      // a different code path from the module file's `DailyRotateFile`.
+      expect(readLogFiles(root, "all-logs")).toContain("DEFAULT-CONFIG-LINE");
+      teardownLogger(logger);
+    });
+
+    it("flushes to disk via shutdownAllLoggers before resolving (Phase 1)", async () => {
+      const root = createTempDir();
+      const a = createLogger({
+        moduleName: "flush-all-a",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      });
+      const b = createLogger({
+        moduleName: "flush-all-b",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      });
+      a.info("ALL-LOGGERS-A");
+      b.info("ALL-LOGGERS-B");
+
+      // This is the exact idiom the `shutdownAllLoggers` JSDoc documents for a
+      // SIGTERM handler that then calls `process.exit(0)`.
+      await shutdownAllLoggers({ timeoutMs: 5000 });
+
+      expect(readLogFiles(root, "flush-all-a")).toContain("ALL-LOGGERS-A");
+      expect(readLogFiles(root, "flush-all-b")).toContain("ALL-LOGGERS-B");
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    it("partial shutdown flushes one logger while the shared global file stays usable (Phase 1)", async () => {
+      const root = createTempDir();
+      const a = createLogger({
+        moduleName: "partial-a",
+        logDirectory: root,
+        includeConsole: false,
+      });
+      const b = createLogger({
+        moduleName: "partial-b",
+        logDirectory: root,
+        includeConsole: false,
+      });
+
+      a.info("PARTIAL-FROM-A");
+      b.info("PARTIAL-FROM-B");
+
+      // Shut down ONLY `a`. The shared global transport is refcounted, so `b`
+      // still holds a handle and the file must stay open and writable.
+      await shutdownLogger(a);
+
+      expect(readLogFiles(root, "partial-a")).toContain("PARTIAL-FROM-A");
+
+      // `b` survives `a`'s shutdown and can still write to both its own module
+      // file and the shared global file.
+      b.info("PARTIAL-AFTER-A-SHUTDOWN");
+      await shutdownLogger(b);
+
+      const bContents = readLogFiles(root, "partial-b");
+      expect(bContents).toContain("PARTIAL-FROM-B");
+      expect(bContents).toContain("PARTIAL-AFTER-A-SHUTDOWN");
+
+      // The shared global file must carry every line from BOTH loggers,
+      // including the one written after `a` was already down.
+      const globalContents = readLogFiles(root, "all-logs");
+      expect(globalContents).toContain("PARTIAL-FROM-A");
+      expect(globalContents).toContain("PARTIAL-FROM-B");
+      expect(globalContents).toContain("PARTIAL-AFTER-A-SHUTDOWN");
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    it("flushes an additional transport that brings its own _final (Phase 1)", async () => {
+      // `winston.transports.File` ships a correct `_final` of its own AND a
+      // `close()` that emits `flush`/`closed` but NEVER `finish`/`close`. It is
+      // the reason the drain lives in `buildRotateTransport` rather than in a
+      // "prefer close() over end()" rule inside the flush: such a rule would
+      // hang here until the shutdown timeout.
+      const root = createTempDir();
+      const filename = path.join(root, "final-transport.log");
+      const fileTransport = new winston.transports.File({ filename });
+
+      const logger = createLogger({
+        moduleName: "flush-final-transport",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [fileTransport as unknown as winston.transport],
+      });
+
+      logger.info("FINAL-TRANSPORT-LINE");
+
+      // Must resolve well inside the deadline, not reject.
+      await expect(shutdownLogger(logger, { timeoutMs: 2000 })).resolves.toBeUndefined();
+
+      expect(fs.readFileSync(filename, "utf8")).toContain("FINAL-TRANSPORT-LINE");
+      teardownLogger(logger);
+    });
+
+    it("keeps driving winston's pipeline via logger.end() for a back-pressuring transport (Phase 1)", async () => {
+      // Pins WHY the drain lives in the transport's `_final` rather than in a
+      // "close() each transport instead of calling logger.end()" flush.
+      //
+      // A transport whose `log()` callback is ASYNC back-pressures the winston
+      // pipe: its writable buffer fills, `pipe` pauses the Logger's readable,
+      // and the remaining infos sit in the Logger's OWN buffers. `logger.end()`
+      // is the only thing that hands those over (`Logger._final`). Draining the
+      // transports directly without it strands everything behind the
+      // back-pressure — measured at ONE line of 2000 delivered.
+      class AsyncTransport extends Transport {
+        public name = "async-backpressure";
+        public received: string[] = [];
+        public finalCalled = false;
+        public log = (info: { message?: unknown }, callback?: () => void): void => {
+          setImmediate(() => {
+            this.received.push(String(info.message));
+            callback?.();
+          });
+        };
+        public _final = (callback: (err?: Error) => void): void => {
+          this.finalCalled = true;
+          callback();
+        };
+      }
+      const asyncTransport = new AsyncTransport();
+
+      const logger = createLogger({
+        moduleName: "flush-async-backpressure",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [asyncTransport as unknown as winston.transport],
+      });
+
+      const total = 200;
+      for (let i = 0; i < total; i += 1) {
+        logger.info(`async-line-${i}`);
+      }
+
+      await shutdownLogger(logger, { timeoutMs: 5000 });
+
+      // `_final` only runs because `shutdownLogger` called `logger.end()`, whose
+      // `Logger._final` ends each transport. This is the load-bearing assertion.
+      expect(asyncTransport.finalCalled).toBe(true);
+
+      // ...and the pipeline really did hand over the back-pressured backlog,
+      // far beyond the handful the transport's own writable could hold in
+      // flight (objectMode highWaterMark is 16). Without `logger.end()` this is
+      // 1. NOTE: this is deliberately a lower bound, not `total`. winston's own
+      // `Logger._final` ends each transport while the Logger's readable may
+      // still hold queued chunks, so the tail is lost to a write-after-end that
+      // the base logger's no-op `error` listener swallows. That is an upstream
+      // winston race, reproducible with bare winston and no part of this
+      // package; asserting `total` here would pin a guarantee winston does not
+      // make.
+      expect(asyncTransport.received.length).toBeGreaterThan(100);
+      teardownLogger(logger);
+    });
+
+    it("installRotateFileFinal drains logStream and never clobbers an existing _final (Phase 1)", async () => {
+      // Unit-level coverage for the hook that makes `DailyRotateFile.end()`
+      // truthful. The rotating file defines no `_final`, so Node emits `finish`
+      // the moment its queued writes return — while `logStream` is still
+      // buffering. This installs the missing drain.
+      const ended: string[] = [];
+      const stub = {
+        logStream: {
+          end: (callback?: () => void): void => {
+            ended.push("drained");
+            callback?.();
+          },
+        },
+      } as unknown as DailyRotateFile;
+
+      __loggerInternals.installRotateFileFinal(stub);
+      const withFinal = stub as unknown as {
+        _final: (callback: (err?: Error) => void) => void;
+      };
+      expect(typeof withFinal._final).toBe("function");
+
+      // `_final` must not call back until `logStream.end()` has drained.
+      await new Promise<void>((resolve) => withFinal._final(() => resolve()));
+      expect(ended).toEqual(["drained"]);
+
+      // A transport that already has a `_final` (a future upstream release, or
+      // `winston.transports.File`) must be left exactly as it was.
+      const existing = jest.fn((callback: (err?: Error) => void) => callback());
+      const preEquipped = { _final: existing } as unknown as DailyRotateFile;
+      __loggerInternals.installRotateFileFinal(preEquipped);
+      expect((preEquipped as unknown as { _final: unknown })._final).toBe(existing);
+    });
+
+    it("installRotateFileFinal settles when logStream is absent or throws (Phase 1)", async () => {
+      // No `logStream` yet: `_final` must still call back rather than wedge
+      // `end()` forever.
+      const noStream = {} as unknown as DailyRotateFile;
+      __loggerInternals.installRotateFileFinal(noStream);
+      await expect(
+        new Promise<void>((resolve) =>
+          (noStream as unknown as { _final: (cb: () => void) => void })._final(() => resolve()),
+        ),
+      ).resolves.toBeUndefined();
+
+      // A stream already mid-teardown can throw on a second `end()`. That must
+      // degrade to "settle", never to a hang.
+      const throwing = {
+        logStream: {
+          end: (): void => {
+            throw new Error("end boom");
+          },
+        },
+      } as unknown as DailyRotateFile;
+      __loggerInternals.installRotateFileFinal(throwing);
+      await expect(
+        new Promise<void>((resolve) =>
+          (throwing as unknown as { _final: (cb: () => void) => void })._final(() => resolve()),
+        ),
+      ).resolves.toBeUndefined();
+    });
+
+    // -------------------------------------------------------------------------
+    // Phase 2 — a shut-down logger must not stay in the registry.
+    //
+    // `shutdownLogger` deregistered crash capture and released the shared-file
+    // handle but never evicted `loggerRegistry`, so a later `createLogger()` on
+    // the same `moduleName` + `logDirectory` cache-hit and returned the ENDED
+    // logger: `b === a`, `b.transports.length === 0`, and every subsequent write
+    // was silently discarded — no throw, no warning, nothing on disk. Worker
+    // recycles, dev hot-reload and shutdown-then-recreate loops all hit it.
+    //
+    // These tests assert the REPLACEMENT logger actually works end-to-end
+    // (bytes on disk), not merely that the identity differs — a fresh-but-broken
+    // instance would satisfy an identity check while still losing every line.
+    // -------------------------------------------------------------------------
+
+    it("evicts the registry entry so a later createLogger builds a fresh working logger (Phase 2)", async () => {
+      const root = createTempDir();
+      const options = {
+        moduleName: "evict-single",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      };
+
+      const a = createLogger(options);
+      a.info("BEFORE-SHUTDOWN");
+      await shutdownLogger(a);
+
+      const b = createLogger(options);
+
+      // The cache must NOT hand back the ended instance.
+      expect(b).not.toBe(a);
+      expect(b.transports.length).toBeGreaterThan(0);
+
+      b.info("AFTER-SHUTDOWN-WRITE");
+      await shutdownLogger(b);
+
+      // The load-bearing assertion: the post-shutdown line is really on disk.
+      // Before the fix this write vanished silently.
+      const contents = readLogFiles(root, "evict-single");
+      expect(contents).toContain("BEFORE-SHUTDOWN");
+      expect(contents).toContain("AFTER-SHUTDOWN-WRITE");
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    it("evicts every logger shut down via shutdownAllLoggers (Phase 2)", async () => {
+      const root = createTempDir();
+      const optionsA = {
+        moduleName: "evict-all-a",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      };
+      const optionsB = {
+        moduleName: "evict-all-b",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      };
+
+      const a1 = createLogger(optionsA);
+      const b1 = createLogger(optionsB);
+      a1.info("ALL-BEFORE-A");
+      b1.info("ALL-BEFORE-B");
+
+      await shutdownAllLoggers();
+
+      const a2 = createLogger(optionsA);
+      const b2 = createLogger(optionsB);
+      expect(a2).not.toBe(a1);
+      expect(b2).not.toBe(b1);
+
+      a2.info("ALL-AFTER-A");
+      b2.info("ALL-AFTER-B");
+      await shutdownAllLoggers();
+
+      expect(readLogFiles(root, "evict-all-a")).toContain("ALL-AFTER-A");
+      expect(readLogFiles(root, "evict-all-b")).toContain("ALL-AFTER-B");
+      teardownLogger(a1);
+      teardownLogger(b1);
+      teardownLogger(a2);
+      teardownLogger(b2);
+    });
+
+    it("re-registers crash capture for a logger created after a shutdown (Phase 2)", async () => {
+      const root = createTempDir();
+      const options = {
+        moduleName: "evict-crash",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+        captureUncaught: true,
+      };
+
+      const a = createLogger(options);
+      expect(__crashCaptureInternals.isInstalled()).toBe(true);
+
+      // Last logger down -> the coordinator's single listener pair is uninstalled.
+      await shutdownLogger(a);
+      expect(__crashCaptureInternals.isInstalled()).toBe(false);
+      expect(__crashCaptureInternals.registered.size).toBe(0);
+
+      // The replacement must be a real, registered participant again — an
+      // eviction that returned a fresh logger which never re-registered would
+      // leave the process with no crash capture at all.
+      const b = createLogger(options);
+      expect(b).not.toBe(a);
+      expect(__crashCaptureInternals.isInstalled()).toBe(true);
+      expect(__crashCaptureInternals.registered.size).toBe(1);
+
+      await shutdownLogger(b);
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    it("evicts on a TIMED-OUT shutdown too, and stays retryable by reference (Phase 2)", async () => {
+      // A timed-out shutdown evicts as well. `end()` is issued unconditionally
+      // before the flush race even starts, so a timed-out logger is not
+      // "maybe still usable" — it is ended AND still undrained, i.e. strictly
+      // more broken than a successful one. Keeping it cached would preserve the
+      // silent-loss defect on precisely the unhealthy path.
+      const root = createTempDir();
+      let releaseFinal: (() => void) | undefined;
+      class StallingTransport extends Transport {
+        public name = "stalling";
+        public log = jest.fn((_info: unknown, callback?: () => void) => callback?.());
+        public _final = (callback: (err?: Error) => void): void => {
+          releaseFinal = () => callback();
+        };
+      }
+
+      const options = {
+        moduleName: "evict-timeout",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [new StallingTransport() as unknown as winston.transport],
+      };
+      const a = createLogger(options);
+
+      await expect(shutdownLogger(a, { timeoutMs: 20 })).rejects.toThrow(/timed out/);
+
+      // Evicted despite the rejection: the cache must not keep serving an ended
+      // logger just because its drain overran the deadline.
+      const b = createLogger(options);
+      expect(b).not.toBe(a);
+      expect(b.transports.length).toBeGreaterThan(0);
+
+      // Retry by reference still works — `shutdownLogger` never reads the
+      // registry, so eviction cannot break the documented escalate-with-a-
+      // longer-timeout idiom.
+      releaseFinal?.();
+      await expect(shutdownLogger(a, { timeoutMs: 2000 })).resolves.toBeUndefined();
+
+      await shutdownLogger(b);
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    it("evicts when a logger is torn down via close() or end() directly (Phase 2)", async () => {
+      // `shutdownLogger` is not the only door to a dead logger. Winston's
+      // `close()` runs `clear()` -> `unpipe()`, and `end()` drives
+      // `Logger._final` which ends every transport (Node then auto-unpipes
+      // each) — both leave `transports` empty and silently discard writes. A
+      // cached entry would keep serving that corpse.
+      const root = createTempDir();
+      const closeOptions = {
+        moduleName: "evict-close",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      };
+      const a = createLogger(closeOptions);
+      a.close();
+      const a2 = createLogger(closeOptions);
+      expect(a2).not.toBe(a);
+      expect(a2.transports.length).toBeGreaterThan(0);
+
+      const endOptions = {
+        moduleName: "evict-end",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      };
+      const b = createLogger(endOptions);
+      b.end();
+      const b2 = createLogger(endOptions);
+      expect(b2).not.toBe(b);
+
+      // The replacement is genuinely functional, not merely a new object.
+      b2.info("REPLACED-AFTER-END");
+      await shutdownLogger(b2);
+      expect(readLogFiles(root, "evict-end")).toContain("REPLACED-AFTER-END");
+
+      await shutdownLogger(a2);
+      teardownLogger(a);
+      teardownLogger(a2);
+      teardownLogger(b);
+      teardownLogger(b2);
+    });
+
+    it("only evicts when the registry slot still points at the shut-down logger (Phase 2)", async () => {
+      // `proxyToRegistryKey` can outlive the slot it names. After a
+      // `resetLoggerRegistry()` the same key is re-claimed by a DIFFERENT, live
+      // logger; shutting the old detached instance down must not evict its
+      // replacement out of the cache.
+      const root = createTempDir();
+      const options = {
+        moduleName: "evict-identity",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      };
+
+      const a = createLogger(options);
+      resetLoggerRegistry();
+      const b = createLogger(options);
+      expect(b).not.toBe(a);
+
+      // Shutting down the detached `a` must leave `b`'s slot alone.
+      await shutdownLogger(a);
+      expect(createLogger(options)).toBe(b);
+
+      b.info("IDENTITY-GUARD-LINE");
+      await shutdownLogger(b);
+      expect(readLogFiles(root, "evict-identity")).toContain("IDENTITY-GUARD-LINE");
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    it("shutting down a never-registered logger evicts nothing and does not throw (Phase 2)", async () => {
+      // A `createNoopLogger()` result (and any winston logger the caller built
+      // themselves) has no `proxyToRegistryKey` entry — the eviction must be a
+      // clean no-op rather than an error or a stray registry delete.
+      const root = createTempDir();
+      const cached = createLogger({
+        moduleName: "evict-noop-bystander",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      });
+
+      await expect(shutdownLogger(createNoopLogger())).resolves.toBeUndefined();
+
+      // The unrelated cached logger is untouched.
+      expect(
+        createLogger({
+          moduleName: "evict-noop-bystander",
+          logDirectory: root,
+          includeConsole: false,
+          includeGlobalFile: false,
+        }),
+      ).toBe(cached);
+      await shutdownLogger(cached);
+      teardownLogger(cached);
     });
 
     it("awaitTransportFlush exposes a cleanup() that detaches both listeners", () => {
@@ -2510,6 +3376,39 @@ describe("createLogger", () => {
       [a, b, c].forEach((logger) => teardownLogger(logger));
     });
 
+    it("does not warn when two sharing loggers differ only by global maxSize unit case (P13b)", () => {
+      // Two DIFFERENT module names (distinct registry keys, both created) that
+      // share the global file with global rotation maxSize "20m" vs "20M". Since
+      // resolvedGlobalRotation feeds the shared-file rotationSignature and
+      // maxSize is now normalized before it is built, the two signatures agree
+      // and the shared-file rotation-conflict warning must NOT fire. Against the
+      // pre-Phase-13 code (raw maxSize in the signature) this warned.
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+      const root = createTempDir();
+
+      const a = createLogger({
+        moduleName: "size-a",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        globalRotation: { maxSize: "20m", maxFiles: "14d" },
+      });
+      const b = createLogger({
+        moduleName: "size-b",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        globalRotation: { maxSize: "20M", maxFiles: "14d" },
+      });
+
+      const conflictWarnings = warn.mock.calls.filter((call) =>
+        String(call[0]).includes("Conflicting global-file rotation config"),
+      );
+      expect(conflictWarnings).toHaveLength(0);
+
+      [a, b].forEach((logger) => teardownLogger(logger));
+    });
+
     it("fans the shared transport's error events out to every sharing logger", () => {
       const root = createTempDir();
       const errorsA: Error[] = [];
@@ -2765,6 +3664,70 @@ describe("createLogger", () => {
 
       expect(stub.log).toHaveBeenCalledTimes(1);
       expect(exitFn).not.toHaveBeenCalled();
+    });
+
+    it("makes the exit decision independent of creation order (opt-out honored either way)", async () => {
+      // Two loggers: one opts out, one keeps the default (exit). Whichever is
+      // created first wins the primary election — but the exit decision must be
+      // the SAME in both orders. Before the fix `onFatal` consulted only the
+      // elected primary's policy, so swapping the creation order of these two
+      // unrelated loggers flipped whether the process exited.
+
+      // Order 1: the opt-out logger is created first, so it is elected primary.
+      makeCaptureLogger("crash-order-optout-first", { exitOnUncaught: false });
+      makeCaptureLogger("crash-order-default-first"); // default exitOnUncaught: true
+      const primaryOrder1 = __crashCaptureInternals.getPrimaryEntry();
+      __crashCaptureInternals.invokeUncaught(new Error("fatal-order-1"));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // Fresh coordinator, swapped order: the default (exit) logger is created
+      // first, so it is elected primary this time.
+      resetLoggerRegistry();
+      makeCaptureLogger("crash-order-default-second"); // default true, elected primary
+      makeCaptureLogger("crash-order-optout-second", { exitOnUncaught: false });
+      const primaryOrder2 = __crashCaptureInternals.getPrimaryEntry();
+      __crashCaptureInternals.invokeUncaught(new Error("fatal-order-2"));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // A DIFFERENT logger was elected primary in each order...
+      expect(primaryOrder1?.[0]).toBeDefined();
+      expect(primaryOrder2?.[0]).toBeDefined();
+      expect(primaryOrder1?.[0]).not.toBe(primaryOrder2?.[0]);
+      // ...yet the exit decision is identical: the explicit opt-out vetoes the
+      // exit in BOTH orders, so the process never exits.
+      expect(exitFn).not.toHaveBeenCalled();
+    });
+
+    it("a non-primary logger's opt-out vetoes the exit the elected primary would have taken", async () => {
+      // The elected primary keeps the default (exit); an unrelated logger opts
+      // out afterwards. The opt-out must still win — this is the exact case the
+      // old primary-only decision got wrong (it exited, silently ignoring the
+      // documented per-logger opt-out).
+      const { stub: primaryStub } = makeCaptureLogger("crash-veto-primary"); // default true, elected
+      makeCaptureLogger("crash-veto-optout", { exitOnUncaught: false });
+
+      __crashCaptureInternals.invokeUncaught(new Error("vetoed"));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // The crash is still recorded exactly once, through the elected primary:
+      // consensus governs only whether to EXIT, never where the crash is logged.
+      expect(primaryStub.log).toHaveBeenCalledTimes(1);
+      // The process does NOT exit: a single opt-out vetoes the whole process.
+      expect(exitFn).not.toHaveBeenCalled();
+    });
+
+    it("still exits when every registered logger keeps the default exit policy", async () => {
+      // Consensus over multiple loggers that all allow exit must still exit; the
+      // veto only fires on an explicit opt-out, so an all-default fleet is
+      // unaffected.
+      makeCaptureLogger("crash-consensus-exit-a"); // default exitOnUncaught: true
+      makeCaptureLogger("crash-consensus-exit-b"); // default exitOnUncaught: true
+
+      __crashCaptureInternals.invokeUncaught(new Error("all-agree-exit"));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(exitFn).toHaveBeenCalledTimes(1);
+      expect(exitFn).toHaveBeenCalledWith(1);
     });
 
     it("re-elects a new primary after the current primary is shut down", async () => {
@@ -3116,6 +4079,30 @@ describe("createLogger", () => {
         expect(empty.log as unknown as jest.Mock).toHaveBeenCalledTimes(1);
       });
 
+      it("counts a transport-less opt-out toward the exit veto", async () => {
+        // The exit vote concerns process lifetime, not persistence, so it reads
+        // the raw `registered` map rather than `getPrimaryEntry`'s writable-only
+        // view: a logger with zero transports (skipped during primary election)
+        // still votes. Here a writable default-exit logger is elected primary
+        // while a transport-less logger opts out — the opt-out must still veto.
+        const { stub: primaryStub } = makeCaptureLogger("crash-vote-writable"); // default true, elected
+        const optOutNoTransports = fakeLogger({ transports: [] });
+        __crashCaptureInternals.registerCrashCapture(optOutNoTransports, {
+          exitOnUncaught: false,
+          hasFileTransport: false,
+        });
+
+        __crashCaptureInternals.invokeUncaught(new Error("transport-less-veto"));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        // The writable logger is elected and records the crash...
+        expect(primaryStub.log).toHaveBeenCalledTimes(1);
+        // ...the transport-less logger records nothing (it was not elected)...
+        expect(optOutNoTransports.log as unknown as jest.Mock).not.toHaveBeenCalled();
+        // ...but its opt-out still counts toward the vote, vetoing the exit.
+        expect(exitFn).not.toHaveBeenCalled();
+      });
+
       it("routes through the real process.exit when no exit fn is injected", async () => {
         const exitSpy = jest
           .spyOn(process, "exit")
@@ -3426,6 +4413,2405 @@ describe("createLogger", () => {
       expect(parsedMeta.a).toEqual({ password: "[REDACTED]", keep: "visible" });
       expect(parsedMeta.b).toEqual({ password: "[REDACTED]", keep: "visible" });
     });
+
+    // -----------------------------------------------------------------------
+    // Depth-bounded redaction — a deep payload must not crash the caller
+    //
+    // The redaction walk is plain recursion, and winston runs its formats
+    // synchronously inside `logger.log()`. Unbounded, the walk overflows the
+    // stack at roughly HALF the depth `JSON.stringify` tolerates (measured:
+    // RangeError at 2000, while JSON.stringify is still fine at 4000) — so
+    // merely ENABLING `maskMetaKeys` turned a working `logger.info()` into a
+    // synchronous `RangeError` thrown back at the application, for a payload
+    // (~18KB of JSON) reachable by logging a parsed request body.
+    // -----------------------------------------------------------------------
+
+    /** Builds a `{child:{child:…}}` chain `depth` levels deep with a secret leaf. */
+    const buildDeepMeta = (depth: number): Record<string, unknown> => {
+      const root: Record<string, unknown> = {};
+      let cursor = root;
+      for (let i = 0; i < depth; i += 1) {
+        const next: Record<string, unknown> = {};
+        cursor.child = next;
+        cursor = next;
+      }
+      cursor.password = "topsecret";
+      return root;
+    };
+
+    /** Walks `depth` `child` hops into a rendered/parsed metadata chain. */
+    const descend = (value: unknown, depth: number): any => {
+      let cursor: any = value;
+      for (let i = 0; i < depth; i += 1) cursor = cursor.child;
+      return cursor;
+    };
+
+    it("pretty mode: logs a 3000-deep metadata payload instead of throwing RangeError at the caller", () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-deep-pretty",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      // The assertion is the absence of a throw: pre-fix this call raised
+      // `RangeError: Maximum call stack size exceeded` out of `logger.info`.
+      expect(() => logger.info("Deep", { payload: buildDeepMeta(3000) })).not.toThrow();
+      teardownLogger(logger);
+
+      const rendered = chunks.join("");
+      // The line is genuinely emitted, not merely "not thrown".
+      expect(rendered).toContain("[INFO] (mask-deep-pretty)");
+      expect(rendered).toContain("Deep");
+      expect(rendered).toContain("[MaxDepth]");
+      // The over-deep leaf is never reached, so its secret cannot leak either.
+      expect(rendered).not.toContain("topsecret");
+    });
+
+    it("json mode: logs a 3000-deep metadata payload instead of throwing RangeError at the caller", () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-deep-json",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format: "json",
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      expect(() => logger.info("Deep", { payload: buildDeepMeta(3000) })).not.toThrow();
+      teardownLogger(logger);
+
+      const rendered = chunks.join("");
+      const parsed = JSON.parse(rendered) as { message: string; payload: unknown };
+      expect(parsed.message).toBe("Deep");
+      expect(descend(parsed.payload, MAX_REDACT_DEPTH).child).toBe("[MaxDepth]");
+      expect(rendered).not.toContain("topsecret");
+    });
+
+    it("bounds a deep ARRAY chain (the array recursive site threads depth too)", () => {
+      // Coverage guard: every other depth test drives a plain-object chain, so
+      // a dropped `depth + 1` at the array site would leave the original
+      // RangeError reachable via `[[[…]]]` while the suite stayed green.
+      let arr: unknown[] = ["leaf"];
+      for (let i = 0; i < 3000; i += 1) arr = [arr];
+
+      expect(() => redactValue(arr, new Set(["password"]), new WeakSet())).not.toThrow();
+      const out = redactValue(arr, new Set(["password"]), new WeakSet());
+      // The array AT the ceiling is still walked; the one nested inside it is
+      // the first replaced — same boundary the json-mode test pins.
+      let cursor: any = out;
+      for (let i = 0; i < MAX_REDACT_DEPTH; i += 1) cursor = cursor[0];
+      expect(cursor[0]).toBe("[MaxDepth]");
+    });
+
+    it("bounds a deep CLASS-INSTANCE chain (the data-bearing recursive site threads depth too)", () => {
+      // Same coverage guard for the third recursive site. A data-bearing
+      // instance is walked by its own enumerable keys, a distinct branch from
+      // both the array and plain-object paths.
+      class Node {
+        public child?: Node;
+        public password = "topsecret";
+      }
+      const root = new Node();
+      let cursor = root;
+      for (let i = 0; i < 3000; i += 1) {
+        cursor.child = new Node();
+        cursor = cursor.child;
+      }
+
+      expect(() => redactValue(root, new Set(["password"]), new WeakSet())).not.toThrow();
+      const out = redactValue(root, new Set(["password"]), new WeakSet());
+      let node: any = out;
+      for (let i = 0; i < MAX_REDACT_DEPTH; i += 1) node = node.child;
+      expect(node.child).toBe("[MaxDepth]");
+      // The instance at the ceiling is still walked, so its own keys redact.
+      expect(node.password).toBe("[REDACTED]");
+    });
+
+    it("pretty mode: a payload at depth 255 is still redacted normally (the guard must not fire early)", () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-depth-255",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      // 254 `child` hops below the `payload` key puts the secret-bearing leaf
+      // at metadata depth 255 — inside the 256 ceiling.
+      logger.info("Shallow", { payload: buildDeepMeta(254) });
+      teardownLogger(logger);
+
+      const rendered = chunks.join("");
+      const metaJson = rendered.slice(rendered.indexOf("{")).trim();
+      const parsed = JSON.parse(metaJson) as { payload: unknown };
+      expect(descend(parsed.payload, 254).password).toBe("[REDACTED]");
+      expect(rendered).not.toContain("[MaxDepth]");
+      expect(rendered).not.toContain("topsecret");
+    });
+
+    // -----------------------------------------------------------------------
+    // Fail-closed redaction — a throwing getter must not crash the log call,
+    // and must never fall back to emitting the raw (unredacted) value.
+    // -----------------------------------------------------------------------
+
+    /** A data-bearing instance whose enumerable getter throws when read. */
+    const buildHostileMeta = () => {
+      class Hostile {
+        public safe = "visible";
+        get boom(): string {
+          throw new Error("getter exploded");
+        }
+      }
+      const instance = new Hostile();
+      // Make the throwing getter an OWN enumerable key so `Object.keys` in the
+      // redaction walk reads (and detonates) it.
+      Object.defineProperty(instance, "boom", {
+        enumerable: true,
+        get() {
+          throw new Error("getter exploded");
+        },
+      });
+      return instance;
+    };
+
+    it("pretty mode: a metadata getter that throws degrades to a marker instead of crashing logger.info", () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-hostile-pretty",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      expect(() =>
+        logger.info("Hostile", { evil: buildHostileMeta(), password: "topsecret" }),
+      ).not.toThrow();
+      teardownLogger(logger);
+
+      const rendered = chunks.join("");
+      // The line still renders...
+      expect(rendered).toContain("[INFO] (mask-hostile-pretty)");
+      expect(rendered).toContain("Hostile");
+      // ...and fails CLOSED: the bag collapses to the marker rather than
+      // falling back to the raw metadata, which would have leaked `password`.
+      expect(rendered).toContain("_redactionFailed");
+      expect(rendered).not.toContain("topsecret");
+    });
+
+    it("json mode: a metadata getter that throws degrades that key only, leaving other keys redacted", () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-hostile-json",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format: "json",
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      expect(() =>
+        logger.info("Hostile", {
+          evil: buildHostileMeta(),
+          nested: { password: "topsecret" },
+          password: "topsecret",
+        }),
+      ).not.toThrow();
+      teardownLogger(logger);
+
+      const rendered = chunks.join("");
+      const parsed = JSON.parse(rendered) as Record<string, any>;
+      expect(parsed.message).toBe("Hostile");
+      // Only the offending key degrades...
+      expect(parsed.evil).toBe("[RedactionFailed]");
+      // ...every other key still redacts normally (the failure is per-key, so
+      // one hostile value cannot suppress the rest of the masking).
+      expect(parsed.password).toBe("[REDACTED]");
+      expect(parsed.nested).toEqual({ password: "[REDACTED]" });
+      expect(rendered).not.toContain("topsecret");
+    });
+
+    it("json mode: a key redacted AFTER a throwing one is not misreported as [Circular]", () => {
+      // Regression guard for `seen` contamination, and it only has teeth with a
+      // very specific shape — an earlier version of this test had none.
+      //
+      // The throw unwinds out of the walk without running the `seen.delete` each
+      // branch performs on its way out, so the objects on the abandoned path stay
+      // marked "on the active path". `buildMetaRedactor` swaps in a fresh WeakSet
+      // on failure; if it reused the contaminated one, a later key legitimately
+      // holding one of those objects would render "[Circular]" and its real data
+      // would vanish.
+      //
+      // Two constraints make that state reachable, and both were learned the hard
+      // way (removing the reset left the previous version of this test green):
+      //  1. The contaminated object must be an ANCESTOR of the thrower, not a
+      //     sibling under it. Both walk branches read their children eagerly
+      //     (`Object.entries` / `value[key]`), so a throwing getter detonates
+      //     BEFORE any of its siblings are added to `seen` — only the objects on
+      //     the path ABOVE it are left behind.
+      //  2. The later key's re-walk must SUCCEED, or both branches yield a
+      //     sentinel and the assertion cannot tell them apart. Hence a getter
+      //     that fails only on its first read — modelling a lazily-initialised
+      //     field (a lazy decrypt, a cache miss on a briefly-unavailable
+      //     resource) whose second read resolves.
+      let reads = 0;
+      const inner = {
+        get lazy(): string {
+          if (reads++ === 0) {
+            throw new Error("first read fails");
+          }
+          return "REAL-DATA";
+        },
+      };
+      const ancestor = { password: "topsecret", keep: "visible", inner };
+
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-seen-reset",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format: "json",
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      // Key order matters: `evil` is walked (and throws, contaminating `seen`
+      // with `ancestor` and `inner`) before `later` re-references `ancestor`.
+      logger.info("Trap", { evil: ancestor, later: ancestor });
+      teardownLogger(logger);
+
+      const parsed = JSON.parse(chunks.join("")) as Record<string, any>;
+      expect(parsed.evil).toBe("[RedactionFailed]");
+      // The load-bearing assertion: WITHOUT the fresh WeakSet this is the string
+      // "[Circular]" and every field below is lost.
+      expect(parsed.later).not.toBe("[Circular]");
+      expect(parsed.later).toEqual({
+        password: "[REDACTED]",
+        keep: "visible",
+        inner: { lazy: "REAL-DATA" },
+      });
+    });
+
+    // -----------------------------------------------------------------------
+    // Phase 4 — the redaction must not mutate the caller's own object.
+    //
+    // Winston hands the format chain the CALLER'S object, uncloned, on three
+    // reachable log forms (verified against the installed winston):
+    //   - `logger.info(obj)` with a truthy `obj.message`
+    //     (create-logger.js:76 — `const info = msg && msg.message && msg || ...`)
+    //   - `logger.log("info", obj)` (logger.js:252 — `msg[LEVEL] = msg.level = level`)
+    //   - `logger.info("msg", meta)` — here winston builds a fresh info and
+    //     merges `meta`'s keys onto it, so the top level is safe, but the
+    //     NESTED objects are still shared by reference with the caller.
+    // A format that assigns `info[key] = "[REDACTED]"` therefore overwrites
+    // live application state rather than a log line. `buildMetaRedactor`
+    // returns a fresh info object instead; `formatMessage` (pretty mode) has
+    // always been non-mutating and is pinned here against regression.
+    //
+    // Note what is deliberately NOT asserted, and why the payload below owns no
+    // `timestamp` key. TWO reserved slots are written onto the caller's object,
+    // neither of them additive (each overwrites a caller-owned key of that
+    // name), and only one of them engine-owned:
+    //   - `level` / the `LEVEL` Symbol — written by WINSTON before any format
+    //     runs (`create-logger.js:79`, `logger.js:237`).
+    //   - `timestamp` — written by THIS package's own `buildTimestampCapture`,
+    //     the first format in both chains, which overwrites a caller-supplied
+    //     `timestamp` in place. That is exact parity with
+    //     `winston.format.timestamp({ format })` (`logform/timestamp.js:15-19`)
+    //     and is mandatory: `timestamp` is a RESERVED_INFO_KEY rendered as the
+    //     log's own `UTC:` line, so honoring a caller's value would let caller
+    //     data forge the log's timestamp column.
+    // Both are pinned by the "reserved-slot boundary" suite below rather than
+    // left to an assumption in a comment.
+    //
+    // The contract under test HERE is therefore the narrower, real one: no
+    // caller-supplied METADATA value is destroyed.
+    // -----------------------------------------------------------------------
+
+    /** Builds the payload used by every mutation-safety case below. */
+    const buildCreds = (): Record<string, any> => ({
+      message: "connecting",
+      host: "db",
+      password: "hunter2",
+      nested: { password: "nested-secret", keep: "visible" },
+    });
+
+    /**
+     * Asserts the caller's object still holds every original value, and that
+     * the nested object is still the SAME object it started as (a redactor
+     * that swapped in a redacted copy would leave the original intact but
+     * unreachable — the same data loss, one level down).
+     */
+    const expectCredsIntact = (creds: Record<string, any>, nested: object): void => {
+      expect(creds.password).toBe("hunter2");
+      expect(creds.host).toBe("db");
+      expect(creds.message).toBe("connecting");
+      expect(creds.nested).toBe(nested);
+      expect(creds.nested.password).toBe("nested-secret");
+      expect(creds.nested.keep).toBe("visible");
+    };
+
+    /**
+     * Renders one log line through a Stream transport in the requested format
+     * mode with `maskMetaKeys: ["password"]`, letting the caller drive the
+     * exact winston log form under test.
+     */
+    const renderWithMask = (
+      moduleName: string,
+      format: "json" | "pretty",
+      emit: (logger: winston.Logger) => void,
+    ): string => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format,
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      emit(logger);
+      teardownLogger(logger);
+      return chunks.join("");
+    };
+
+    describe.each([["json"], ["pretty"]] as const)("format: %s", (format) => {
+      it("does not mutate the caller's object on the single-object form", () => {
+        const creds = buildCreds();
+        const nested = creds.nested;
+
+        const rendered = renderWithMask(`mask-mutate-single-${format}`, format, (logger) => {
+          logger.info(creds);
+        });
+
+        // The caller's live object is untouched...
+        expectCredsIntact(creds, nested);
+        // ...while the emitted line is fully redacted at both levels.
+        expect(rendered).not.toContain("hunter2");
+        expect(rendered).not.toContain("nested-secret");
+        expect(rendered).toContain("[REDACTED]");
+        expect(rendered).toContain("db");
+        expect(rendered).toContain("visible");
+      });
+
+      it("does not mutate the caller's object on the 2-arg object form", () => {
+        const creds = buildCreds();
+        const nested = creds.nested;
+
+        const rendered = renderWithMask(`mask-mutate-2arg-${format}`, format, (logger) => {
+          logger.info("Connecting", creds);
+        });
+
+        expectCredsIntact(creds, nested);
+        expect(rendered).not.toContain("hunter2");
+        expect(rendered).not.toContain("nested-secret");
+        expect(rendered).toContain("[REDACTED]");
+      });
+
+      it('does not mutate the caller\'s object on logger.log("info", obj)', () => {
+        const creds = buildCreds();
+        const nested = creds.nested;
+
+        const rendered = renderWithMask(`mask-mutate-log-${format}`, format, (logger) => {
+          logger.log("info", creds);
+        });
+
+        expectCredsIntact(creds, nested);
+        expect(rendered).not.toContain("hunter2");
+        expect(rendered).not.toContain("nested-secret");
+        expect(rendered).toContain("[REDACTED]");
+      });
+    });
+
+    it("buildMetaRedactor returns a fresh object and leaves the input untouched", () => {
+      // Unit-level counterpart to the end-to-end cases above: the redactor's
+      // OWN contract is "read `info`, return a new one".
+      const formatter = __loggerInternals.buildMetaRedactor(new Set(["password"]));
+      const input: Record<string, unknown> = {
+        level: "info",
+        message: "connecting",
+        password: "hunter2",
+        nested: { password: "nested-secret" },
+      };
+
+      const transformed = formatter.transform(input as any) as Record<string, unknown>;
+
+      expect(transformed).not.toBe(input);
+      expect(input.password).toBe("hunter2");
+      expect(input.nested).toEqual({ password: "nested-secret" });
+      expect(transformed.password).toBe("[REDACTED]");
+      expect(transformed.nested).toEqual({ password: "[REDACTED]" });
+      // Reserved fields ride across onto the copy.
+      expect(transformed.level).toBe("info");
+      expect(transformed.message).toBe("connecting");
+    });
+
+    it("buildMetaRedactor carries Symbol slots across to the returned object", () => {
+      // `LEVEL` is written by `Logger._transform` BEFORE the format chain runs
+      // and is what `winston-transport`'s `_write` gates the level filter on;
+      // `SPLAT` carries interpolation args. Dropping either while returning a
+      // copy would silently break downstream serialization / filtering, so the
+      // copy must carry every Symbol-keyed slot.
+      const LEVEL = Symbol.for("level");
+      const SPLAT = Symbol.for("splat");
+      const formatter = __loggerInternals.buildMetaRedactor(new Set(["password"]));
+      const input: Record<string | symbol, unknown> = {
+        level: "info",
+        message: "connecting",
+        password: "hunter2",
+        [LEVEL]: "info",
+        [SPLAT]: ["a", 1],
+      };
+
+      const transformed = formatter.transform(input as any) as unknown as Record<
+        string | symbol,
+        unknown
+      >;
+
+      expect(transformed).not.toBe(input);
+      expect(transformed[LEVEL]).toBe("info");
+      expect(transformed[SPLAT]).toEqual(["a", 1]);
+    });
+
+    it("buildMetaRedactor returns the input by identity on the empty-mask fast path", () => {
+      // The zero-allocation fast path is load-bearing for the default config:
+      // with no `maskMetaKeys` the redactor must not copy the info at all.
+      const formatter = __loggerInternals.buildMetaRedactor(new Set<string>());
+      const input: Record<string, unknown> = { level: "info", message: "hi", password: "hunter2" };
+
+      expect(formatter.transform(input as any)).toBe(input);
+      expect(input.password).toBe("hunter2");
+    });
+
+    it("a masked key whose getter throws is redacted without taking the line down", () => {
+      // The masked value is discarded either way, so the redactor never reads
+      // it — a throwing getter on a masked key cannot reach the caller.
+      const creds: Record<string, unknown> = { message: "connecting", host: "db" };
+      Object.defineProperty(creds, "password", {
+        enumerable: true,
+        get() {
+          throw new Error("hostile getter");
+        },
+      });
+
+      let rendered = "";
+      expect(() => {
+        rendered = renderWithMask("mask-hostile-getter", "json", (logger) => {
+          logger.info(creds);
+        });
+      }).not.toThrow();
+
+      const parsed = JSON.parse(rendered.trim()) as Record<string, unknown>;
+      expect(parsed.password).toBe("[REDACTED]");
+      expect(parsed.host).toBe("db");
+    });
+
+    it("an accessor-only own key whose nested value throws fails closed without a set-on-getter TypeError", () => {
+      // Checklist 4.3, the second required accessor-only case: a NON-masked own
+      // property defined with only a getter (no setter), whose value carries a
+      // nested throwing getter so `redactValue` throws and the redactor takes
+      // its fail-closed branch. In the pre-fix code that branch wrote
+      // `info[key] = "[RedactionFailed]"` back onto the caller's own object —
+      // which, for a getter-only property, raises
+      // `TypeError: Cannot set property … which has only a getter` in strict
+      // mode. That TypeError escaped the format and was thrown out of the
+      // application's `logger.info(...)`. Returning a fresh object removes the
+      // write entirely, so the line renders and the caller never sees the throw.
+      const payload: Record<string, unknown> = { message: "connecting", host: "db" };
+      Object.defineProperty(payload, "detail", {
+        enumerable: true,
+        // Getter-only: assigning `payload.detail = …` would throw. Each read
+        // yields an object whose non-masked `token` getter throws, so the
+        // deep walk raises before it can finish this key.
+        get() {
+          const inner: Record<string, unknown> = {};
+          Object.defineProperty(inner, "token", {
+            enumerable: true,
+            get() {
+              throw new Error("nested boom");
+            },
+          });
+          return inner;
+        },
+      });
+
+      let rendered = "";
+      expect(() => {
+        rendered = renderWithMask("mask-accessor-nested-throw", "json", (logger) => {
+          logger.info(payload);
+        });
+      }).not.toThrow();
+
+      const parsed = JSON.parse(rendered.trim()) as Record<string, unknown>;
+      // The hostile key fails closed to the marker; every sibling still renders.
+      expect(parsed.detail).toBe("[RedactionFailed]");
+      expect(parsed.host).toBe("db");
+      expect(parsed.message).toBe("connecting");
+    });
+
+    // -----------------------------------------------------------------------
+    // Prototype-pollution hardening for the fresh-object rebuild.
+    //
+    // Returning a FRESH object (Phase 4) means a caller-supplied own key named
+    // "__proto__" is no longer written onto an object that already owns it.
+    // `next["__proto__"] = …` on a plain `{}` invokes `Object.prototype`'s
+    // `__proto__` SETTER — silently dropping the key from the emitted line and
+    // repointing `next`'s prototype for the rest of the pipeline. Such a key is
+    // trivially reachable via `logger.info(JSON.parse(body))`, where JSON.parse
+    // mints a genuine own enumerable "__proto__" data property. `buildMetaRedactor`
+    // therefore skips FORBIDDEN_KEYS, exactly as `redactValue` does on every
+    // nested rebuild.
+    // -----------------------------------------------------------------------
+
+    it("buildMetaRedactor drops a __proto__ metadata key without corrupting the returned object", () => {
+      const formatter = __loggerInternals.buildMetaRedactor(new Set(["password"]));
+      // JSON.parse creates a real own enumerable "__proto__" data property.
+      const input = JSON.parse(
+        '{"level":"info","message":"hi","__proto__":{"password":"leak"},"keep":"visible"}',
+      ) as Record<string, unknown>;
+      expect(Object.prototype.hasOwnProperty.call(input, "__proto__")).toBe(true);
+
+      const out = formatter.transform(input as any) as unknown as Record<string, unknown>;
+
+      // The prototype-pollution key is skipped entirely...
+      expect(Object.prototype.hasOwnProperty.call(out, "__proto__")).toBe(false);
+      // ...the fresh object's prototype is untouched (not repointed by a setter)...
+      expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+      // ...and every legitimate key still rides across.
+      expect(out.message).toBe("hi");
+      expect(out.keep).toBe("visible");
+    });
+
+    it("logs a __proto__-bearing payload cleanly without breaking the json line", () => {
+      // Integration smoke test: a payload carrying an own "__proto__" key must
+      // not throw, must still render its legitimate siblings, and must not
+      // surface the injected object as a data field. The DISCRIMINATING guard
+      // for the prototype skip is the unit test above (it asserts the returned
+      // object's prototype is untouched) — a value planted on an object's
+      // prototype is never emitted by `JSON.stringify`, so the difference the
+      // skip makes is not observable in the rendered line, only on the object.
+      const payload = JSON.parse(
+        '{"message":"connecting","__proto__":{"role":"admin"},"keep":"visible"}',
+      ) as Record<string, unknown>;
+
+      let rendered = "";
+      expect(() => {
+        rendered = renderWithMask("mask-proto-key", "json", (logger) => {
+          logger.info(payload);
+        });
+      }).not.toThrow();
+
+      const parsed = JSON.parse(rendered.trim()) as Record<string, unknown>;
+      expect(parsed.keep).toBe("visible");
+      expect(parsed.message).toBe("connecting");
+      // The injected key is not surfaced as a data field, and its contents
+      // never leak into the line.
+      expect(Object.prototype.hasOwnProperty.call(parsed, "__proto__")).toBe(false);
+      expect(rendered).not.toContain("admin");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // A top-level `toJSON` must be resolved, then redacted.
+  //
+  // `buildMetaRedactor` rebuilds into a plain `{}`, which discards the info's
+  // prototype. On the single-object form the info IS the caller's DTO, so the
+  // rebuild made `json()` stop finding `toJSON` and emit every own field —
+  // including ones the DTO deliberately withheld. Enabling `maskMetaKeys` then
+  // disclosed MORE than leaving it off, which is the exact inversion the option
+  // exists to prevent.
+  //
+  // The fix resolves `toJSON` here (on the real instance, inside a try/catch)
+  // and redacts its OUTPUT. Merely passing a `toJSON`-defining info through by
+  // identity would fix the withholding but silently void `maskMetaKeys` — the
+  // `toJSON`-surfaces-a-masked-key test below is what pins that apart.
+  // ---------------------------------------------------------------------------
+  describe("top-level toJSON is resolved then redacted", () => {
+    const renderJson = (
+      moduleName: string,
+      emit: (logger: winston.Logger) => void,
+      maskMetaKeys?: string[],
+    ): string => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format: "json",
+        ...(maskMetaKeys ? { maskMetaKeys } : {}),
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      emit(logger);
+      teardownLogger(logger);
+      return chunks.join("");
+    };
+
+    class UserDto {
+      public message = "user loaded";
+      public email = "u@example.com";
+      public ssn = "123-45-6789";
+      toJSON(): Record<string, unknown> {
+        // `ssn` is deliberately withheld.
+        return { message: this.message, email: this.email };
+      }
+    }
+
+    it("honors a withheld field when maskMetaKeys is set (regression: enabling the mask leaked it)", () => {
+      const rendered = renderJson("tojson-withhold", (logger) => logger.info(new UserDto()), [
+        "password",
+      ]);
+      expect(rendered).not.toContain("123-45-6789");
+      expect(rendered).toContain("user loaded");
+    });
+
+    it("emits exactly the same line with the mask on as with it off (mask-on ⊆ mask-off canary)", () => {
+      // The load-bearing invariant: turning a redaction feature ON must never
+      // emit MORE than leaving it off.
+      const withMask = renderJson("tojson-on", (logger) => logger.info(new UserDto()), [
+        "password",
+      ]);
+      const withoutMask = renderJson("tojson-off", (logger) => logger.info(new UserDto()));
+      expect(JSON.parse(withMask.trim())).toEqual(JSON.parse(withoutMask.trim()));
+    });
+
+    it("still redacts a masked key that the toJSON output SURFACES", () => {
+      // This is the test that rejects the tempting "just pass a toJSON-defining
+      // info through by identity" fix: that would honor the withholding but
+      // emit this password in cleartext, voiding the operator's explicit
+      // instruction with no `redactPaths` escape hatch on `createLogger`.
+      class CredDto {
+        public message = "connecting";
+        public password = "hunter2";
+        toJSON(): Record<string, unknown> {
+          return { message: this.message, password: this.password };
+        }
+      }
+      const dto = new CredDto();
+      const rendered = renderJson("tojson-surface", (logger) => logger.info(dto), ["password"]);
+
+      expect(rendered).toContain("[REDACTED]");
+      expect(rendered).not.toContain("hunter2");
+      // ...and the caller's own object still holds the real secret.
+      expect(dto.password).toBe("hunter2");
+    });
+
+    it("resolves a toJSON that reads a private #field without crashing the caller", () => {
+      // Pins why the prototype must NOT be copied onto the rebuild
+      // (`Object.create(getPrototypeOf(info))` / `setPrototypeOf` / copying
+      // `toJSON` across): the copy is not a real instance, so a brand check on
+      // `this.#secret` throws a TypeError from inside the unwrapped `json()`,
+      // crashing `logger.info(dto)`. Invoking toJSON on the REAL instance here
+      // is what makes this work.
+      class PrivDto {
+        #secret = "PRIVATE-VAL";
+        public message = "priv";
+        toJSON(): Record<string, unknown> {
+          return { message: this.message, shown: this.#secret };
+        }
+      }
+      let rendered = "";
+      expect(() => {
+        rendered = renderJson("tojson-private", (logger) => logger.info(new PrivDto()), [
+          "password",
+        ]);
+      }).not.toThrow();
+      expect(rendered).toContain("PRIVATE-VAL");
+    });
+
+    it("keeps a top-level ARRAY info an array, with no toJSON involved", () => {
+      // `logger.log("info", ["a","b"])` takes winston's object branch
+      // (`logger.js:245` — an array IS an object), so `info` IS the array and
+      // no `toJSON` is in play. The plain rebuild would render
+      // `{"0":"a","1":"b","level":"info","timestamp":"…"}` while the no-mask
+      // line renders `["a","b"]` (json()'s array branch ignores the level /
+      // timestamp props winston assigned onto the array) — which is why the
+      // delegation is gated on `Array.isArray(subject) || resolvedViaToJSON`
+      // rather than on the toJSON resolve alone.
+      const withMask = renderJson("arrinfo-on", (l) => l.log("info", ["a", "b"] as never), [
+        "password",
+      ]);
+      const withoutMask = renderJson("arrinfo-off", (l) => l.log("info", ["a", "b"] as never));
+      expect(JSON.parse(withMask.trim())).toEqual(["a", "b"]);
+      expect(JSON.parse(withMask.trim())).toEqual(JSON.parse(withoutMask.trim()));
+    });
+
+    it("still redacts a masked key nested inside a top-level array info", () => {
+      const rendered = renderJson(
+        "arrinfo-secret",
+        (l) => l.log("info", [{ password: "pw", keep: "k" }] as never),
+        ["password"],
+      );
+      expect(rendered).toContain("[REDACTED]");
+      expect(rendered).not.toContain("pw");
+    });
+
+    it("keeps a toJSON returning an ARRAY an array (not an index-keyed object)", () => {
+      // The plain rebuild is `Object.keys` into a fresh `{}`, which would render
+      // `{"0":"a","1":"b"}` here while the no-mask line renders `["a","b"]` —
+      // the same mask-diverges-from-no-mask defect in a new shape. Non-plain
+      // toJSON outputs are delegated to `redactValue` instead.
+      class ArrDto {
+        public message = "m";
+        toJSON(): unknown[] {
+          return ["a", "b"];
+        }
+      }
+      const withMask = renderJson("tojson-arr-on", (l) => l.info(new ArrDto()), ["password"]);
+      const withoutMask = renderJson("tojson-arr-off", (l) => l.info(new ArrDto()));
+      expect(JSON.parse(withMask.trim())).toEqual(["a", "b"]);
+      expect(JSON.parse(withMask.trim())).toEqual(JSON.parse(withoutMask.trim()));
+    });
+
+    it("still redacts a masked key nested inside a toJSON that returns an array", () => {
+      // Proves the array delegation redacts rather than passing through: this is
+      // the case a bare `return info` for non-plain outputs would have leaked.
+      class ArrSecret {
+        public message = "m";
+        toJSON(): unknown[] {
+          return [{ password: "pw", keep: "k" }];
+        }
+      }
+      const rendered = renderJson("tojson-arr-secret", (l) => l.info(new ArrSecret()), [
+        "password",
+      ]);
+      expect(rendered).toContain("[REDACTED]");
+      expect(rendered).not.toContain("pw");
+      expect(rendered).toContain("keep");
+    });
+
+    it("hands a toJSON returning a built-in back to the serializer (redactValue identity branch)", () => {
+      // `redactValue` returns a `Date`/`Map` by identity — its own rule for a
+      // value owning no key-addressable secret. We must not attach symbols to a
+      // caller-owned value, so `info` is returned and the serializer resolves it
+      // exactly as the no-mask line does.
+      class DateDto {
+        public message = "m";
+        toJSON(): Date {
+          return new Date("2024-01-01T00:00:00Z");
+        }
+      }
+      const withMask = renderJson("tojson-date-on", (l) => l.info(new DateDto()), ["password"]);
+      const withoutMask = renderJson("tojson-date-off", (l) => l.info(new DateDto()));
+      expect(withMask.trim()).toBe(withoutMask.trim());
+    });
+
+    it("fails closed when redacting a non-plain toJSON output throws", () => {
+      class ArrHostile {
+        public message = "arr-hostile";
+        toJSON(): unknown[] {
+          return [
+            {
+              get boom(): string {
+                throw new Error("element getter exploded");
+              },
+            },
+          ];
+        }
+      }
+      let rendered = "";
+      expect(() => {
+        rendered = renderJson("tojson-arr-throws", (l) => l.info(new ArrHostile()), ["password"]);
+      }).not.toThrow();
+      const parsed = JSON.parse(rendered.trim()) as Record<string, unknown>;
+      expect(parsed._redactionFailed).toBe(true);
+      expect(parsed.message).toBe("arr-hostile");
+    });
+
+    it("passes through a toJSON returning a non-object (no keys to inspect)", () => {
+      class FlatDto {
+        public message = "flat";
+        toJSON(): string {
+          return "flattened";
+        }
+      }
+      const rendered = renderJson("tojson-flat", (logger) => logger.info(new FlatDto()), [
+        "password",
+      ]);
+      // `json()` resolves it downstream, exactly as the no-mask config does.
+      expect(rendered).toContain("flattened");
+    });
+
+    it("fails closed when toJSON throws, without escaping into logger.info", () => {
+      class HostileDto {
+        public message = "hostile";
+        public password = "hunter2";
+        toJSON(): Record<string, unknown> {
+          throw new Error("toJSON exploded");
+        }
+      }
+      let rendered = "";
+      expect(() => {
+        rendered = renderJson("tojson-throws", (logger) => logger.info(new HostileDto()), [
+          "password",
+        ]);
+      }).not.toThrow();
+
+      const parsed = JSON.parse(rendered.trim()) as Record<string, unknown>;
+      expect(parsed._redactionFailed).toBe(true);
+      expect(parsed.message).toBe("hostile");
+      // FAIL CLOSED: rebuilding from the unresolved source would have emitted
+      // the very fields toJSON withholds.
+      expect(rendered).not.toContain("hunter2");
+    });
+
+    it("fails closed when the toJSON GETTER itself throws", () => {
+      const dto: Record<string, unknown> = { message: "getter-hostile", password: "hunter2" };
+      Object.defineProperty(dto, "toJSON", {
+        enumerable: false,
+        get() {
+          throw new Error("toJSON getter exploded");
+        },
+      });
+
+      let rendered = "";
+      expect(() => {
+        rendered = renderJson("tojson-getter", (logger) => logger.info(dto), ["password"]);
+      }).not.toThrow();
+      expect((JSON.parse(rendered.trim()) as Record<string, unknown>)._redactionFailed).toBe(true);
+      expect(rendered).not.toContain("hunter2");
+    });
+
+    it("applies to the 2-arg object form too (logger.log('info', dto))", () => {
+      // `logger.js:246` passes the caller's object by identity just as the
+      // single-object form does, so it carries the same prototype.
+      const rendered = renderJson(
+        "tojson-2arg",
+        (logger) => logger.log("info", new UserDto() as unknown as string),
+        ["password"],
+      );
+      expect(rendered).not.toContain("123-45-6789");
+      expect(rendered).toContain("user loaded");
+    });
+
+    /**
+     * Captures what winston's Console transport actually writes.
+     *
+     * It writes to `console._stdout`, NOT to `process.stdout` directly
+     * (`winston/lib/winston/transports/console.js:85-87` — "Node.js maps
+     * `process.stdout` to `console._stdout`"). Those are the same object in a
+     * bare Node process, but jest replaces the global `console` with its own
+     * buffered Console whose `_stdout` is a different stream — so patching
+     * `process.stdout` captures nothing under a full-suite run while appearing
+     * to work when this file runs alone. Patch the channel winston really uses,
+     * falling back to `process.stdout` if a future winston drops `_stdout`.
+     */
+    const captureConsole = (emit: () => void): string => {
+      const written: string[] = [];
+      const target =
+        (console as unknown as { _stdout?: NodeJS.WritableStream })._stdout ?? process.stdout;
+      const original = target.write.bind(target);
+      (target as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
+        written.push(String(chunk));
+        return true;
+      };
+      try {
+        emit();
+      } finally {
+        (target as unknown as { write: unknown }).write = original;
+      }
+      return written.join("");
+    };
+
+    it("honors a top-level toJSON on the CONSOLE too when a mask is configured", () => {
+      // The eager resolve happens in the logger-level chain, so the withheld
+      // field never enters the rebuilt info at all. Since Phase 16.1 the Console
+      // transport carries no format in json mode and simply emits the
+      // logger-level `sharedFormat`'s already-serialized `info[MESSAGE]`, so the
+      // console line is byte-identical to the file line. (Before the fix the
+      // console ran its own duplicate chain and leaked `ssn` here.)
+      const consoleOut = captureConsole(() => {
+        const logger = createLogger({
+          moduleName: "tojson-console-mask",
+          includeFile: false,
+          includeGlobalFile: false,
+          format: "json",
+          maskMetaKeys: ["password"],
+        });
+        logger.info(new UserDto());
+        teardownLogger(logger);
+      });
+
+      expect(consoleOut).not.toContain("123-45-6789");
+      expect(consoleOut).toContain("user loaded");
+    });
+
+    it("honors a top-level toJSON on the console with NO mask too (Phase 16.1 closed the console/file divergence)", () => {
+      // PRE-16.1 this was a pinned boundary: with no `maskMetaKeys`,
+      // `buildMetaRedactor` is a zero-allocation identity pass, so the real DTO
+      // instance reached the Console transport, which ran its OWN duplicate json
+      // chain over the shallow clone winston hands it (`Object.assign({}, info)`)
+      // — a clone that cannot carry a prototype, so the console's serializer
+      // never found `toJSON` and re-exposed the `ssn` the DTO withholds, diverging
+      // from the file line. Phase 16.1 dropped that duplicate chain: in json mode
+      // the Console transport carries no format and emits the logger-level
+      // `sharedFormat`'s already-serialized `info[MESSAGE]`, so console and file
+      // are byte-identical and the withheld field stays withheld on both.
+      let fileOut = "";
+      const consoleOut = captureConsole(() => {
+        const stream = new PassThrough();
+        stream.on("data", (chunk) => {
+          fileOut += chunk.toString();
+        });
+        const logger = createLogger({
+          moduleName: "tojson-console-nomask",
+          includeConsole: true,
+          includeFile: false,
+          includeGlobalFile: false,
+          format: "json",
+          additionalTransports: [new winston.transports.Stream({ stream })],
+        });
+        logger.info(new UserDto());
+        teardownLogger(logger);
+      });
+
+      expect(consoleOut).not.toContain("123-45-6789");
+      expect(consoleOut).toContain("user loaded");
+      // The divergence is gone: the console line equals the file line exactly.
+      expect(consoleOut.trim()).toBe(fileOut.trim());
+    });
+
+    it("leaves an Error info unaffected (errors() already flattened it)", () => {
+      // `logform/errors.js:16` copies own ENUMERABLE props onto a plain object,
+      // so a prototype `toJSON` never survives to reach the resolve block.
+      class ErrWithToJSON extends Error {
+        toJSON(): Record<string, unknown> {
+          return { message: "should-not-be-used" };
+        }
+      }
+      const rendered = renderJson(
+        "tojson-error",
+        (logger) => logger.error(new ErrWithToJSON("boom-tojson")),
+        ["password"],
+      );
+      expect(rendered).toContain("boom-tojson");
+      expect(rendered).not.toContain("should-not-be-used");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Reserved-slot boundary (Phase 16.5) — the documented limit of the
+  // mutation-safety guarantee above, pinned rather than left to a comment.
+  //
+  // Only `level` / `[LEVEL]` is now overwritten in place on the caller's object,
+  // and that write is WINSTON's own (`create-logger.js:79`), before any format
+  // runs — unavoidable. `timestamp` is NO LONGER an in-place overwrite: Phase
+  // 16.5 made `buildTimestampCapture` copy-on-write for a plain-object info and
+  // sequenced it after `errors({ stack: true })`, so a caller-supplied
+  // `timestamp` on live state is left intact while the log still renders the
+  // captured instant. The bare-winston canary below records the exact hazard
+  // that fix avoids — bare winston still destroys the caller's `timestamp` in
+  // place — so if a winston release ever changes that, the divergence is
+  // revisited on purpose rather than by drift.
+  // ---------------------------------------------------------------------------
+  describe("reserved-slot boundary (level in place; timestamp copy-on-write)", () => {
+    const renderTo = (
+      moduleName: string,
+      format: "json" | "pretty",
+      emit: (logger: winston.Logger) => void,
+    ): string => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      emit(logger);
+      teardownLogger(logger);
+      return chunks.join("");
+    };
+
+    describe.each([["json"], ["pretty"]] as const)("format: %s", (format) => {
+      it("leaves a caller-supplied timestamp intact (copy-on-write) while rendering the captured instant", () => {
+        // Branch: plain object WITH an own `timestamp`. The proven Phase 16.5
+        // defect — `logger.info({ message, timestamp, id })` used to overwrite
+        // `event.timestamp` on live state. Copy-on-write leaves it untouched.
+        const event = {
+          message: "webhook received",
+          timestamp: "2024-01-01T00:00:00Z",
+          id: 7,
+        };
+
+        const rendered = renderTo(`reserved-ts-${format}`, format, (logger) => {
+          logger.info(event);
+        });
+
+        // The caller's object is NOT mutated.
+        expect(event.timestamp).toBe("2024-01-01T00:00:00Z");
+        expect(event.id).toBe(7);
+        expect(event.message).toBe("webhook received");
+        // ...but the log line still renders the CAPTURED instant, never the
+        // caller-forged value (which does not appear anywhere in the line).
+        expect(rendered).not.toContain("2024-01-01T00:00:00Z");
+        expect(rendered).toMatch(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+      });
+
+      it("does not add a timestamp to a plain-object caller that had none", () => {
+        // Branch: plain object WITHOUT an own `timestamp`. Copy-on-write means
+        // the caller's object never gains a `timestamp` property (only winston's
+        // own `level` lands on it, before any format runs).
+        const event: Record<string, unknown> = { message: "hi", id: 9 };
+
+        renderTo(`reserved-nots-${format}`, format, (logger) => {
+          logger.info(event);
+        });
+
+        expect(Object.prototype.hasOwnProperty.call(event, "timestamp")).toBe(false);
+        expect(event.id).toBe(9);
+      });
+
+      it("still renders an Error's message and stack (errors() flattens before the capture copies)", () => {
+        // The highest-value test in this suite. Phase 16.5 sequences
+        // `errors({ stack: true })` AHEAD of `buildTimestampCapture`, so a logged
+        // Error is flattened to a plain object with own-ENUMERABLE message/stack
+        // before the copy-on-write runs — the copy preserves them. A naive
+        // copy-on-write placed BEFORE `errors()` would instead rebuild the raw
+        // Error into a plain object, dropping its own NON-enumerable message and
+        // stack and defeating `errors.js:15`'s `instanceof Error` gate (verified:
+        // the payload collapses to `{"level":"error","timestamp":"..."}`). This
+        // fails the moment the ordering is reverted.
+        const rendered = renderTo(`reserved-err-${format}`, format, (logger) => {
+          logger.error(new Error("boom-reserved"));
+        });
+
+        expect(rendered).toContain("boom-reserved");
+        expect(rendered).toContain("Error: boom-reserved");
+        expect(rendered).toMatch(/\bat\b/);
+      });
+
+      it("leaves an Error's own enumerable timestamp intact and still renders it (branch: Error WITH own timestamp)", () => {
+        // Branch: Error WITH an own enumerable `timestamp`. `errors()` copies the
+        // Error's own enumerable props onto its fresh plain object, so the copy
+        // carries `timestamp` — and the copy-on-write capture overwrites it only
+        // on that engine-owned copy, never on the caller's Error. Message/stack
+        // still render.
+        const err = new Error("boom-err-ts") as Error & { timestamp?: string };
+        err.timestamp = "2024-01-01T00:00:00Z";
+
+        const rendered = renderTo(`reserved-err-ts-${format}`, format, (logger) => {
+          logger.error(err);
+        });
+
+        expect(err.timestamp).toBe("2024-01-01T00:00:00Z");
+        expect(rendered).toContain("boom-err-ts");
+        expect(rendered).toContain("Error: boom-err-ts");
+        expect(rendered).not.toContain("2024-01-01T00:00:00Z");
+      });
+    });
+
+    it("bare winston's own format.timestamp({ format }) still mutates in place (canary the fix diverges from)", () => {
+      // This is the hazard Phase 16.5's copy-on-write avoids. Bare winston's
+      // `format.timestamp({ format })` overwrites the caller's `timestamp` in
+      // place (`logform/timestamp.js:15-19`), destroying live state. This package
+      // deliberately diverges. If a winston release ever stops doing this, the
+      // divergence is revisited on purpose rather than by drift.
+      const stream = new PassThrough();
+      const bare = winston.createLogger({
+        format: winston.format.combine(
+          winston.format.timestamp({ format: __loggerInternals.TIMESTAMP_FORMAT }),
+          winston.format.json(),
+        ),
+        transports: [new winston.transports.Stream({ stream })],
+      });
+      const event = { message: "m", timestamp: "2024-01-01T00:00:00Z", id: 7 };
+
+      bare.info(event);
+
+      // Bare winston destroys the caller's timestamp in place — what we avoid.
+      expect(event.timestamp).not.toBe("2024-01-01T00:00:00Z");
+      expect(event.timestamp).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+      expect(event.id).toBe(7);
+      bare.close();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 16 — hot-path performance (byte-identical output)
+  //
+  // 16.1 drops the duplicate json-mode Console format chain (the console now
+  // reuses the logger-level `sharedFormat`'s `info[MESSAGE]`); 16.2 guards the
+  // per-log `moment` timezone parse on `ctx.timezones.length > 0` and removes an
+  // identity `.map`; 16.4 wraps `winston.format.json()` so a serializer throw
+  // degrades to a sentinel line instead of crashing the caller. These tests pin
+  // that none of it changed the emitted bytes on the happy path.
+  // ---------------------------------------------------------------------------
+  describe("Phase 16 — hot-path performance (byte-identical output)", () => {
+    const FIXED_ISO = "2031-03-04T05:06:07Z";
+    const FIXED_TS = "2031-03-04 05:06:07";
+    const fixedClock = (): Date => new Date(FIXED_ISO);
+
+    const captureConsole = (emit: () => void): string => {
+      const written: string[] = [];
+      const target =
+        (console as unknown as { _stdout?: NodeJS.WritableStream })._stdout ?? process.stdout;
+      const original = target.write.bind(target);
+      (target as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
+        written.push(String(chunk));
+        return true;
+      };
+      try {
+        emit();
+      } finally {
+        (target as unknown as { write: unknown }).write = original;
+      }
+      return written.join("");
+    };
+
+    const renderStream = (
+      options: Parameters<typeof createLogger>[0],
+      emit: (logger: winston.Logger) => void,
+    ): string => {
+      const stream = new PassThrough();
+      let out = "";
+      stream.on("data", (chunk) => {
+        out += chunk.toString();
+      });
+      const logger = createLogger({
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        clock: fixedClock,
+        ...options,
+        additionalTransports: [
+          // `eol: "\n"` keeps the byte-for-byte assertions platform-independent
+          // (winston's Stream transport otherwise appends `os.EOL`, i.e. CRLF on
+          // Windows). The formatter's own trailing `\n` is unaffected.
+          new winston.transports.Stream({ stream, eol: "\n" }),
+          ...(options?.additionalTransports ?? []),
+        ],
+      });
+      emit(logger);
+      teardownLogger(logger);
+      return out;
+    };
+
+    it("16.1 json mode: the Console line is byte-identical to the file line", () => {
+      let fileOut = "";
+      const consoleOut = captureConsole(() => {
+        const stream = new PassThrough();
+        stream.on("data", (chunk) => {
+          fileOut += chunk.toString();
+        });
+        const logger = createLogger({
+          moduleName: "perf-json",
+          format: "json",
+          includeConsole: true,
+          includeFile: false,
+          includeGlobalFile: false,
+          clock: fixedClock,
+          additionalTransports: [new winston.transports.Stream({ stream })],
+        });
+        logger.info("hello", { userId: 42, nested: { a: [1, 2, 3] } });
+        teardownLogger(logger);
+      });
+
+      expect(consoleOut.trim()).toBe(fileOut.trim());
+      const parsed = JSON.parse(consoleOut.trim()) as Record<string, unknown>;
+      expect(parsed.message).toBe("hello");
+      expect(parsed.module).toBe("perf-json");
+      expect(parsed.userId).toBe(42);
+      expect(parsed.timestamp).toBe(FIXED_TS);
+    });
+
+    it("16.1 json mode with maskMetaKeys: console and file lines stay byte-identical", () => {
+      let fileOut = "";
+      const consoleOut = captureConsole(() => {
+        const stream = new PassThrough();
+        stream.on("data", (chunk) => {
+          fileOut += chunk.toString();
+        });
+        const logger = createLogger({
+          moduleName: "perf-json-mask",
+          format: "json",
+          includeConsole: true,
+          includeFile: false,
+          includeGlobalFile: false,
+          maskMetaKeys: ["password"],
+          clock: fixedClock,
+          additionalTransports: [new winston.transports.Stream({ stream })],
+        });
+        logger.info("login", { password: "hunter2", userId: 7 });
+        teardownLogger(logger);
+      });
+
+      expect(consoleOut.trim()).toBe(fileOut.trim());
+      expect(consoleOut).toContain('"password":"[REDACTED]"');
+      expect(consoleOut).not.toContain("hunter2");
+    });
+
+    it("16.2 pretty mode with NO extraTimezones: renders exactly the UTC line and nothing more", () => {
+      const out = renderStream({ moduleName: "perf-pretty" }, (logger) => logger.info("hi"));
+      expect(out).toBe(`UTC: ${FIXED_TS}\n[INFO] (perf-pretty)\nhi\n\n`);
+    });
+
+    it("16.2 pretty mode WITH extraTimezones: UTC line then one line per zone, in order (byte-identical)", () => {
+      const zones = ["Europe/London", "America/New_York"];
+      const out = renderStream({ moduleName: "perf-pretty-tz", extraTimezones: zones }, (logger) =>
+        logger.info("hi"),
+      );
+
+      // Build the expected zone lines the same way the formatter does, so the
+      // assertion is DST-robust and still byte-exact.
+      const captured = moment.utc(FIXED_TS, "YYYY-MM-DD HH:mm:ss");
+      const zoneLines = zones
+        .map((zone) => `${zone}: ${captured.clone().tz(zone).format("YYYY-MM-DD HH:mm:ss")}`)
+        .join("\n");
+      expect(out).toBe(`UTC: ${FIXED_TS}\n${zoneLines}\n[INFO] (perf-pretty-tz)\nhi\n\n`);
+    });
+
+    it("16.2 pretty console (no timestamps) is unchanged by the timezone guard", () => {
+      // The console pretty format omits timestamps entirely, so the guard never
+      // runs there; pin that the console line is still the plain colorize-free
+      // `[LEVEL] (label)\nmessage` form.
+      const consoleOut = captureConsole(() => {
+        const logger = createLogger({
+          moduleName: "perf-pretty-console",
+          includeConsole: true,
+          includeFile: false,
+          includeGlobalFile: false,
+          colorize: false,
+          extraTimezones: ["Europe/London"],
+          clock: fixedClock,
+        });
+        logger.info("hi");
+        teardownLogger(logger);
+      });
+      expect(consoleOut.trim()).toBe("[INFO] (perf-pretty-console)\nhi");
+      // The console line never carries a UTC/timezone line.
+      expect(consoleOut).not.toContain("UTC:");
+      expect(consoleOut).not.toContain("Europe/London");
+    });
+
+    it("16.2 with NO extraTimezones skips the mirror-parse (moment.utc 2-arg form is never called)", () => {
+      // Teeth for the 16.2 optimization: the `moment.utc(utcString, TIMESTAMP_FORMAT)`
+      // mirror-parse (two string args) is the ~9µs the guard removes and must NOT
+      // run when there are no extra timezones. Output is byte-identical either
+      // way (the loop never iterates), so only a call-count spy catches a silent
+      // revert of the `ctx.timezones.length > 0` guard. Other moment.utc calls —
+      // the capture's `moment.utc(clock())`, a single Date arg — are unrelated.
+      const spy = jest.spyOn(moment, "utc");
+      try {
+        renderStream({ moduleName: "perf-tz-guard-off" }, (logger) => logger.info("hi"));
+        const mirrorParseCalls = spy.mock.calls.filter(
+          (args) => args.length === 2 && typeof args[0] === "string" && typeof args[1] === "string",
+        );
+        expect(mirrorParseCalls).toHaveLength(0);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("16.2 WITH extraTimezones runs the mirror-parse (guard's other branch)", () => {
+      const spy = jest.spyOn(moment, "utc");
+      try {
+        renderStream(
+          { moduleName: "perf-tz-guard-on", extraTimezones: ["Europe/London"] },
+          (logger) => logger.info("hi"),
+        );
+        const mirrorParseCalls = spy.mock.calls.filter(
+          (args) => args.length === 2 && typeof args[0] === "string" && typeof args[1] === "string",
+        );
+        expect(mirrorParseCalls.length).toBeGreaterThanOrEqual(1);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("16.4 json mode: a serializer-exhausting payload degrades to a sentinel line, no throw at the caller", () => {
+      // A payload deep enough to exhaust JSON.stringify itself throws RangeError
+      // from inside winston's own `json()`. With NO maskMetaKeys the redactor's
+      // depth guard never runs, so pre-16.4 this crashed the caller's own
+      // logger.info(...). 16.4 wraps `json()` so it degrades to a sentinel.
+      const deep: Record<string, unknown> = {};
+      let cursor = deep;
+      for (let i = 0; i < 12000; i++) {
+        const child: Record<string, unknown> = {};
+        cursor.next = child;
+        cursor = child;
+      }
+
+      let fileOut = "";
+      let consoleOut = "";
+      expect(() => {
+        consoleOut = captureConsole(() => {
+          const stream = new PassThrough();
+          stream.on("data", (chunk) => {
+            fileOut += chunk.toString();
+          });
+          const logger = createLogger({
+            moduleName: "perf-json-deep",
+            format: "json",
+            includeConsole: true,
+            includeFile: false,
+            includeGlobalFile: false,
+            clock: fixedClock,
+            additionalTransports: [new winston.transports.Stream({ stream })],
+          });
+          logger.info("too deep", { deep });
+          teardownLogger(logger);
+        });
+      }).not.toThrow();
+
+      // Both the file and console lines carry the same sentinel — 16.1 keeps
+      // them identical on the failure path too.
+      expect(consoleOut.trim()).toBe(fileOut.trim());
+      const parsed = JSON.parse(consoleOut.trim()) as Record<string, unknown>;
+      expect(parsed._unserializable).toBe(true);
+      expect(parsed.level).toBe("info");
+      expect(parsed.module).toBe("perf-json-deep");
+      expect(parsed.timestamp).toBe(FIXED_TS);
+    });
+
+    it("16.4 json mode with maskMetaKeys never reaches the sentinel (depth guard bounds first)", () => {
+      // When a mask is configured, buildMetaRedactor bounds the graph to
+      // MAX_REDACT_DEPTH before json() runs, so the serializer never throws and
+      // the line renders normally — the sentinel path is unreachable here.
+      const deep: Record<string, unknown> = {};
+      let cursor = deep;
+      for (let i = 0; i < 12000; i++) {
+        const child: Record<string, unknown> = {};
+        cursor.next = child;
+        cursor = child;
+      }
+      const out = renderStream(
+        { moduleName: "perf-json-deep-mask", format: "json", maskMetaKeys: ["password"] },
+        (logger) => logger.info("deep but masked", { password: "hunter2", deep }),
+      );
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed._unserializable).toBeUndefined();
+      expect(parsed.message).toBe("deep but masked");
+      // The top-level masked key is redacted; the deep payload is bounded by the
+      // redactor's MAX_REDACT_DEPTH guard, so json() never throws.
+      expect(parsed.password).toBe("[REDACTED]");
+    });
+
+    it("json mode: a throwing metadata getter degrades to a sentinel, no throw at the caller", () => {
+      // A caller metadata value can be a getter — caller code that may throw.
+      // In json mode with NO maskMetaKeys the getter survives untouched to
+      // `json()`, whose serializer invokes it and throws; buildSafeJsonFormat
+      // must catch and degrade to a sentinel rather than let it escape out of the
+      // caller's own logger.info(). The injected `module` field is a data string
+      // here, so it is still reported.
+      const payload: Record<string, unknown> = { message: "hostile token" };
+      Object.defineProperty(payload, "token", {
+        enumerable: true,
+        get() {
+          throw new Error("token boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "json-getter", format: "json" }, (logger) =>
+          logger.info(payload),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed._unserializable).toBe(true);
+      expect(parsed.module).toBe("json-getter");
+      expect(parsed.level).toBe("info");
+    });
+
+    it("json mode: a throwing caller `module` getter cannot re-escape the sentinel fallback", () => {
+      // Regression for the sentinel's own re-throw hole. `buildModuleFieldInjector`
+      // leaves a caller-supplied own `module` key untouched in the no-mask
+      // default, so a hostile `{ get module() { throw } }` both makes `json()`
+      // throw AND is the field buildSafeJsonFormat's catch reads while building
+      // the sentinel — pre-fix it re-threw out of logger.info(). The catch must
+      // read `module` defensively; the sentinel then carries no `module` (the
+      // hostile getter could not be read) rather than crashing.
+      const payload: Record<string, unknown> = { message: "hostile module" };
+      Object.defineProperty(payload, "module", {
+        enumerable: true,
+        get() {
+          throw new Error("module boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "json-mod-getter", format: "json" }, (logger) =>
+          logger.info(payload),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed._unserializable).toBe(true);
+      expect(parsed.level).toBe("info");
+      // The hostile getter could not be read, so `module` is absent (undefined →
+      // omitted by JSON.stringify), not a crash and not the label.
+      expect(parsed).not.toHaveProperty("module");
+    });
+
+    it("pretty mode: a throwing metadata getter fails closed instead of crashing the caller", () => {
+      // formatMessage builds its metadata bag by DESCRIPTOR transplant, never
+      // invoking a caller getter during extraction — so a `{ get token() { throw } }`
+      // payload logs a line whose metadata block fails closed (UNSERIALIZABLE)
+      // rather than throwing out of the caller's logger.info() (verified pre-fix:
+      // pretty mode crashed). The level/message lines still render.
+      const payload: Record<string, unknown> = { message: "pretty hostile" };
+      Object.defineProperty(payload, "token", {
+        enumerable: true,
+        get() {
+          throw new Error("pretty boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "pretty-getter" }, (logger) => logger.info(payload));
+      }).not.toThrow();
+      expect(out).toContain("[INFO] (pretty-getter)");
+      expect(out).toContain("pretty hostile");
+      expect(out).toContain("[UNSERIALIZABLE]");
+    });
+
+    it("pretty mode with maskMetaKeys: a throwing non-masked getter fails closed, line still logged", () => {
+      // The mask path reads a non-masked value inside redactValue, which is
+      // wrapped; a throwing getter there degrades the whole metadata block to
+      // `_redactionFailed` rather than crashing. Extraction still never invokes
+      // the getter (descriptor transplant), so the throw is contained.
+      const payload: Record<string, unknown> = { message: "masked hostile", password: "hunter2" };
+      Object.defineProperty(payload, "token", {
+        enumerable: true,
+        get() {
+          throw new Error("masked boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream(
+          { moduleName: "pretty-mask-getter", maskMetaKeys: ["password"] },
+          (logger) => logger.info(payload),
+        );
+      }).not.toThrow();
+      expect(out).toContain("[INFO] (pretty-mask-getter)");
+      expect(out).toContain("masked hostile");
+      expect(out).toContain("_redactionFailed");
+      expect(out).not.toContain("hunter2");
+    });
+
+    it("pretty mode: a throwing `stack` accessor (non-Error payload) fails closed, does not crash", () => {
+      // `stack` is a RESERVED key, but a non-Error caller payload can still carry
+      // a throwing `stack` accessor that `errors()` never neutralizes (it reads
+      // `stack` only for an actual Error). formatMessage reads `stack` inside a
+      // try/catch and fails closed — the stack line is omitted, the caller's
+      // logger.info() does not throw (verified pre-fix: it crashed).
+      const payload: Record<string, unknown> = { message: "pretty stack" };
+      Object.defineProperty(payload, "stack", {
+        enumerable: true,
+        get() {
+          throw new Error("stack boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "pretty-stack-getter" }, (logger) => logger.info(payload));
+      }).not.toThrow();
+      expect(out).toContain("[INFO] (pretty-stack-getter)");
+      expect(out).toContain("pretty stack");
+      expect(out).not.toContain("stack boom");
+    });
+
+    it("json mode + maskMetaKeys: a throwing `stack` accessor fails closed on that key, no throw", () => {
+      // In json mode WITH a mask, buildMetaRedactor copies reserved keys, which
+      // READS `subject.stack`; a throwing accessor there escaped out of
+      // logger.log() pre-fix. The reserved-key copy is now guarded and fails
+      // closed to the RedactionFailed sentinel; the rest of the line still
+      // renders. (No mask → buildSafeJsonFormat catches json()'s throw instead.)
+      const payload: Record<string, unknown> = { message: "json stack", password: "hunter2" };
+      Object.defineProperty(payload, "stack", {
+        enumerable: true,
+        get() {
+          throw new Error("stack boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream(
+          { moduleName: "json-stack-getter", format: "json", maskMetaKeys: ["password"] },
+          (logger) => logger.info(payload),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed.message).toBe("json stack");
+      expect(parsed.stack).toBe("[RedactionFailed]");
+      expect(parsed.password).toBe("[REDACTED]");
+      expect(out).not.toContain("stack boom");
+    });
+
+    it("json mode (no mask): a throwing `stack` accessor degrades to the sentinel, no throw", () => {
+      const payload: Record<string, unknown> = { message: "json stack nomask" };
+      Object.defineProperty(payload, "stack", {
+        enumerable: true,
+        get() {
+          throw new Error("stack boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "json-stack-nomask", format: "json" }, (logger) =>
+          logger.info(payload),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed._unserializable).toBe(true);
+      expect(out).not.toContain("stack boom");
+    });
+
+    it("pretty mode: a throwing `level` accessor (getter+setter) does not crash the caller", () => {
+      // A `level` defined as a throwing getter WITH a setter passes winston's own
+      // `info.level = level` (the setter runs, leaving the accessor live), so
+      // formatMessage's level read would crash the caller pre-fix. readReserved
+      // guards it, falling back to the "info" display level. (A getter-ONLY level
+      // instead crashes at winston's own assignment — the winston-core boundary.)
+      const payload: Record<string, unknown> = { message: "level hostile" };
+      Object.defineProperty(payload, "level", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          throw new Error("level boom");
+        },
+        set() {
+          /* no-op: absorb winston's `info.level = level` so the accessor survives */
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "pretty-level-getter" }, (logger) => logger.info(payload));
+      }).not.toThrow();
+      expect(out).toContain("[INFO] (pretty-level-getter)");
+      expect(out).toContain("level hostile");
+      expect(out).not.toContain("level boom");
+    });
+
+    it("pretty CONSOLE: neutralizeCallerAccessors keeps the console re-clone from crashing on a throwing getter", () => {
+      // winston-transport re-runs the console format over Object.assign({}, info),
+      // which invokes every enumerable own getter and RE-THROWS on error — so a
+      // caller-supplied throwing accessor would crash logger.info() there even
+      // though the logger-level formats are getter-safe. neutralizeCallerAccessors
+      // (added to the pretty chain when a console exists) resolves accessors to
+      // data first. This payload exercises every branch of that format: a throwing
+      // accessor (fails closed), a non-throwing accessor (resolved), a plain data
+      // key (copied), and a FORBIDDEN key (skipped). Verified pre-fix: the default
+      // console logger crashed here.
+      const payload: Record<string, unknown> = { message: "console safe", plain: 7 };
+      Object.defineProperty(payload, "willThrow", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          throw new Error("console boom");
+        },
+      });
+      Object.defineProperty(payload, "computed", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          return "ok-value";
+        },
+      });
+      Object.defineProperty(payload, "constructor", {
+        enumerable: true,
+        configurable: true,
+        writable: true,
+        value: "poison",
+      });
+
+      let consoleOut = "";
+      expect(() => {
+        consoleOut = captureConsole(() => {
+          const logger = createLogger({
+            moduleName: "console-neutralize",
+            format: "pretty",
+            colorize: false,
+            includeConsole: true,
+            includeFile: false,
+            includeGlobalFile: false,
+            clock: fixedClock,
+          });
+          logger.info(payload);
+          teardownLogger(logger);
+        });
+      }).not.toThrow();
+
+      expect(consoleOut).toContain("(console-neutralize)");
+      expect(consoleOut).toContain("console safe");
+      // The non-throwing accessor is resolved to its value...
+      expect(consoleOut).toContain("ok-value");
+      // ...the throwing accessor fails closed (never re-thrown into the clone)...
+      expect(consoleOut).not.toContain("console boom");
+      // ...and the FORBIDDEN prototype-pollution key is skipped, not emitted.
+      expect(consoleOut).not.toContain("poison");
+    });
+
+    it("pretty (console off) + a format-carrying additionalTransport: neutralize still runs, no crash", () => {
+      // neutralize is added whenever a format-carrying transport exists — not
+      // only when the built-in console does. A caller-supplied additionalTransport
+      // that sets its OWN `format` triggers winston-transport's re-clone-and-
+      // rethrow, so a throwing accessor would crash there without neutralize.
+      const stream = new PassThrough();
+      let out = "";
+      stream.on("data", (chunk) => {
+        out += chunk.toString();
+      });
+      const payload: Record<string, unknown> = { message: "at-pretty" };
+      Object.defineProperty(payload, "lazy", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          throw new Error("at-boom");
+        },
+      });
+      expect(() => {
+        const logger = createLogger({
+          moduleName: "at-pretty-test",
+          format: "pretty",
+          includeConsole: false,
+          includeFile: false,
+          includeGlobalFile: false,
+          additionalTransports: [
+            new winston.transports.Stream({ stream, format: winston.format.json(), eol: "\n" }),
+          ],
+        });
+        logger.info(payload);
+        teardownLogger(logger);
+      }).not.toThrow();
+      expect(out).toContain("at-pretty");
+      expect(out).not.toContain("at-boom");
+    });
+
+    it("json + a format-carrying additionalTransport: neutralize is added to the json chain, no crash", () => {
+      // The built-in json console is formatless (safe), but a caller-supplied
+      // format-carrying additionalTransport re-clones the info; neutralize is
+      // added to the json chain when such a transport exists.
+      const stream = new PassThrough();
+      let out = "";
+      stream.on("data", (chunk) => {
+        out += chunk.toString();
+      });
+      const payload: Record<string, unknown> = { message: "at-json" };
+      Object.defineProperty(payload, "lazy", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          throw new Error("at-boom-json");
+        },
+      });
+      expect(() => {
+        const logger = createLogger({
+          moduleName: "at-json-test",
+          format: "json",
+          includeConsole: false,
+          includeFile: false,
+          includeGlobalFile: false,
+          additionalTransports: [
+            new winston.transports.Stream({ stream, format: winston.format.json(), eol: "\n" }),
+          ],
+        });
+        logger.info(payload);
+        teardownLogger(logger);
+      }).not.toThrow();
+      expect(out).toContain("at-json");
+      expect(out).not.toContain("at-boom-json");
+    });
+
+    it("non-plain payload with a getter-only `timestamp` accessor does not crash and renders the captured instant", () => {
+      // buildTimestampCapture keeps a non-plain info in place (to preserve a
+      // DTO's toJSON / an array's arrayness), but must not crash writing
+      // `timestamp` when the instance exposes it as a getter-only/computed field
+      // (`class AuditEvent { get timestamp() {…} }`). It installs an OWN data
+      // property (shadowing the inherited getter) instead of assigning through
+      // it. Verified pre-fix: this threw `Cannot set property timestamp ... which
+      // has only a getter` out of logger.info().
+      class AuditEvent {
+        public message = "user login";
+        // A getter-only accessor is the whole point of this test (a readonly
+        // data field would not reproduce the "set on getter-only throws" crash),
+        // so the class-literal-property-style suggestion does not apply here.
+        // eslint-disable-next-line @typescript-eslint/class-literal-property-style
+        get timestamp(): string {
+          return "2024-immutable";
+        }
+      }
+      for (const format of ["pretty", "json"] as const) {
+        let out = "";
+        expect(() => {
+          out = renderStream({ moduleName: `ts-getter-${format}`, format }, (logger) =>
+            logger.info(new AuditEvent()),
+          );
+        }).not.toThrow();
+        // The CAPTURED instant renders, never the caller's computed getter value.
+        expect(out).toContain("user login");
+        expect(out).toContain(FIXED_TS);
+        expect(out).not.toContain("2024-immutable");
+      }
+    });
+
+    it("non-plain payload with a THROWING `timestamp` accessor does not crash (getter shadowed)", () => {
+      class ThrowingTs {
+        public message = "m";
+        get timestamp(): string {
+          throw new Error("ts boom");
+        }
+      }
+      let out = "";
+      expect(() => {
+        out = renderStream(
+          { moduleName: "ts-throw-json", format: "json", maskMetaKeys: ["password"] },
+          (logger) => logger.info(new ThrowingTs()),
+        );
+      }).not.toThrow();
+      expect(out).not.toContain("ts boom");
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed.message).toBe("m");
+      expect(parsed.timestamp).toBe(FIXED_TS);
+    });
+
+    it("non-plain payload with a non-configurable throwing `timestamp` accessor fails closed (write + read guards), no crash", () => {
+      // The exotic edge: an EXTENSIBLE non-plain instance (so winston's own
+      // `info[LEVEL]` write succeeds) with a NON-CONFIGURABLE own `timestamp`
+      // accessor that throws. `Object.defineProperty` cannot redefine it, so
+      // buildTimestampCapture's write catch leaves it in place, and
+      // formatMessage's `timestamp` read guard then falls back to a fresh
+      // timestamp instead of invoking the throwing getter. Exercises BOTH the
+      // defineProperty catch and the formatMessage timestamp read guard.
+      class LockedThrowingTs {
+        public message = "locked-msg";
+        constructor() {
+          Object.defineProperty(this, "timestamp", {
+            get() {
+              throw new Error("locked-ts-boom");
+            },
+            enumerable: true,
+            configurable: false,
+          });
+        }
+      }
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "ts-locked-pretty" }, (logger) =>
+          logger.info(new LockedThrowingTs()),
+        );
+      }).not.toThrow();
+      expect(out).toContain("[INFO] (ts-locked-pretty)");
+      expect(out).toContain("locked-msg");
+      expect(out).toContain("UTC:");
+      expect(out).not.toContain("locked-ts-boom");
+    });
+
+    it("hostile Error with an own enumerable throwing accessor does not crash pretty mode (errors() wrap)", () => {
+      // `logform/errors.js` flattens an Error via `Object.assign` over its OWN
+      // ENUMERABLE properties (`errors.js:16`), invoking a hostile own-enumerable
+      // getter and throwing at the FIRST format — before neutralizeCallerAccessors
+      // (which runs last) and every downstream guard, escaping out of
+      // `logger.error(...)`. `buildSafeErrorsFormat` wraps `errors()` the way
+      // `buildSafeJsonFormat` wraps `json()`: it degrades to a minimal flattening
+      // that preserves the readable message/stack and marks the degradation,
+      // instead of crashing. (An idiomatic PROTOTYPE getter is immune —
+      // `Object.assign` copies own props only — so this needs an OWN-instance
+      // accessor, e.g. one defined in the constructor.)
+      class HostileError extends Error {
+        constructor(m: string) {
+          super(m);
+          this.name = "HostileError";
+          Object.defineProperty(this, "detail", {
+            enumerable: true,
+            configurable: true,
+            get() {
+              throw new Error("detail boom");
+            },
+          });
+        }
+      }
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "err-hostile-pretty" }, (logger) =>
+          logger.error(new HostileError("pretty error msg")),
+        );
+      }).not.toThrow();
+      expect(out).toContain("[ERROR] (err-hostile-pretty)");
+      expect(out).toContain("pretty error msg");
+      expect(out).toContain("_errorFlattenFailed");
+      expect(out).not.toContain("detail boom");
+    });
+
+    it("hostile Error does not crash json mode; message/stack preserved on the degrade path", () => {
+      class HostileError extends Error {
+        constructor(m: string) {
+          super(m);
+          this.name = "HostileError";
+          Object.defineProperty(this, "detail", {
+            enumerable: true,
+            configurable: true,
+            get() {
+              throw new Error("detail boom");
+            },
+          });
+        }
+      }
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "err-hostile-json", format: "json" }, (logger) =>
+          logger.error(new HostileError("json error msg")),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed.level).toBe("error");
+      expect(parsed.message).toBe("json error msg");
+      expect(typeof parsed.stack).toBe("string");
+      expect(parsed.stack as string).toContain("HostileError");
+      expect(parsed._errorFlattenFailed).toBe(true);
+      expect(parsed.module).toBe("err-hostile-json");
+      expect(out).not.toContain("detail boom");
+    });
+
+    it("hostile Error passed as `message` on the 2-arg log form is flattened getter-safely", () => {
+      // errors.js:33 (`einfo.message instanceof Error`) does `Object.assign(einfo, err)`,
+      // the sibling crash site, reached via `logger.log("error", { message: err })`.
+      class HostileError extends Error {
+        constructor(m: string) {
+          super(m);
+          this.name = "HostileError";
+          Object.defineProperty(this, "detail", {
+            enumerable: true,
+            configurable: true,
+            get() {
+              throw new Error("detail boom");
+            },
+          });
+        }
+      }
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "err-hostile-2arg", format: "json" }, (logger) =>
+          logger.log("error", { message: new HostileError("2arg error msg") }),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed.level).toBe("error");
+      expect(parsed.message).toBe("2arg error msg");
+      expect(parsed._errorFlattenFailed).toBe(true);
+      expect(out).not.toContain("detail boom");
+    });
+
+    it("hostile Error with a throwing `stack` accessor degrades: message kept, stack dropped, no crash", () => {
+      // A DIFFERENT crash site inside `errors()`: a non-enumerable throwing `stack`
+      // accessor is skipped by `Object.assign` (line 16) but read directly by
+      // `errors.js:23` (`info.stack = einfo.stack`), so `errors()` throws there.
+      // The catch then re-reads `stack` defensively — exercising `safeReadFrom`'s
+      // own try/catch — and fails closed on that one field (stack dropped) while
+      // the readable message survives.
+      class StackThrower extends Error {
+        constructor(m: string) {
+          super(m);
+          this.name = "StackThrower";
+          Object.defineProperty(this, "stack", {
+            configurable: true,
+            enumerable: false,
+            get() {
+              throw new Error("stack boom");
+            },
+          });
+        }
+      }
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "err-stack-throw", format: "json" }, (logger) =>
+          logger.error(new StackThrower("stack-thrower msg")),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed.level).toBe("error");
+      expect(parsed.message).toBe("stack-thrower msg");
+      expect(parsed.stack).toBeUndefined();
+      expect(parsed._errorFlattenFailed).toBe(true);
+      expect(out).not.toContain("stack boom");
+    });
+
+    it("a throwing `message` getter on the log()/2-arg form is caught by the errors() wrap (not a boundary)", () => {
+      // On the single-object LEVEL-METHOD form (`logger.error(obj)`) winston reads
+      // `.message` in create-logger.js BEFORE any format runs — an unavoidable
+      // boundary. But on the `logger.log(level, obj)` / 2-arg form the FIRST
+      // `.message` read happens INSIDE `logform/errors.js` (errors.js:28), which is
+      // now wrapped by buildSafeErrorsFormat — so a throwing `message` getter there
+      // degrades instead of crashing the caller. Pins the closed boundary the docs
+      // describe (the single-object form remains a documented winston-core boundary).
+      for (const format of ["pretty", "json"] as const) {
+        const payload: Record<string, unknown> = { data: 1 };
+        Object.defineProperty(payload, "message", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            throw new Error("msg boom");
+          },
+        });
+        let out = "";
+        expect(() => {
+          out = renderStream({ moduleName: `err-msg-2arg-${format}`, format }, (logger) =>
+            logger.log("error", payload),
+          );
+        }).not.toThrow();
+        expect(out).not.toContain("msg boom");
+        expect(out).toContain("_errorFlattenFailed");
+      }
+    });
+
+    it("bare-winston parity: the same hostile Error crashes bare winston + errors()+json, but not this logger", () => {
+      // Proves the crash is a real logform boundary (not an invented one) AND that
+      // buildSafeErrorsFormat closes it. Bare winston composing the SAME
+      // `errors({ stack: true }) + json()` throws synchronously out of `.error()`;
+      // this package's logger degrades instead.
+      class HostileError extends Error {
+        constructor(m: string) {
+          super(m);
+          this.name = "HostileError";
+          Object.defineProperty(this, "detail", {
+            enumerable: true,
+            configurable: true,
+            get() {
+              throw new Error("detail boom");
+            },
+          });
+        }
+      }
+      const bareStream = new PassThrough();
+      const bare = winston.createLogger({
+        transports: [new winston.transports.Stream({ stream: bareStream, eol: "\n" })],
+        format: winston.format.combine(
+          winston.format.errors({ stack: true }),
+          winston.format.json(),
+        ),
+      });
+      // Absorb any re-emitted error so a stray async event cannot crash the runner.
+      bare.on("error", () => undefined);
+      expect(() => bare.error(new HostileError("bare boom"))).toThrow();
+
+      expect(() => {
+        renderStream({ moduleName: "err-parity", format: "json" }, (logger) =>
+          logger.error(new HostileError("guarded")),
+        );
+      }).not.toThrow();
+    });
+
+    it("a NORMAL Error still flattens on the happy path (no degradation marker)", () => {
+      // Regression guard: the wrapper delegates to the real `errors()` for every
+      // non-hostile Error, so normal Error logging is unchanged and carries NO
+      // `_errorFlattenFailed` marker — the happy path is byte-identical to the
+      // un-wrapped format.
+      for (const format of ["pretty", "json"] as const) {
+        let out = "";
+        expect(() => {
+          out = renderStream({ moduleName: `err-normal-${format}`, format }, (logger) =>
+            logger.error(new Error("ordinary failure")),
+          );
+        }).not.toThrow();
+        expect(out).toContain("ordinary failure");
+        expect(out).not.toContain("_errorFlattenFailed");
+      }
+    });
+
+    it("16.5 buildTimestampCapture copy-on-writes a null-prototype info without mutating it", () => {
+      // Exercises the `proto === null` arm of the plain-object branch directly:
+      // an `Object.create(null)` info (no `Object.prototype`) is still a plain
+      // bag, so it must be copy-on-written, not mutated in place.
+      const capture = __loggerInternals.buildTimestampCapture(() => new Date(FIXED_ISO));
+      const info = Object.create(null) as Record<string, unknown>;
+      info.level = "info";
+      info.message = "null-proto";
+      info.id = 5;
+
+      const result = capture.transform(info as never) as Record<string, unknown>;
+
+      // A fresh object carrying the captured timestamp and the original fields.
+      expect(result).not.toBe(info);
+      expect(result.timestamp).toBe(FIXED_TS);
+      expect(result.message).toBe("null-proto");
+      expect(result.id).toBe(5);
+      // The caller's null-prototype object is untouched (no timestamp added).
+      expect(Object.prototype.hasOwnProperty.call(info, "timestamp")).toBe(false);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // JSON mode: module label field (Phase 15)
+  //
+  // In `format: "json"` the emitted line previously carried no module/label
+  // field at all, so the shared `all-logs` file mixed every module's lines with
+  // no way to attribute them. `buildModuleFieldInjector` stamps the module label
+  // as a top-level `module` field (the pretty chain already renders `(label)`).
+  // The field is additive, caller-precedence-respecting, and non-mutating.
+  // ---------------------------------------------------------------------------
+  describe("json mode: module label field (Phase 15)", () => {
+    const renderJsonLine = (
+      moduleName: string | undefined,
+      emit: (logger: winston.Logger) => void,
+      maskMetaKeys?: string[],
+    ): string => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        ...(moduleName === undefined ? {} : { moduleName }),
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format: "json",
+        ...(maskMetaKeys ? { maskMetaKeys } : {}),
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      emit(logger);
+      teardownLogger(logger);
+      return chunks.join("").trim();
+    };
+
+    const parseJson = (
+      moduleName: string | undefined,
+      emit: (logger: winston.Logger) => void,
+      maskMetaKeys?: string[],
+    ): Record<string, unknown> =>
+      JSON.parse(renderJsonLine(moduleName, emit, maskMetaKeys)) as Record<string, unknown>;
+
+    it("stamps a named module as the top-level `module` field, alongside caller metadata", () => {
+      const parsed = parseJson("api", (logger) => logger.info("Login", { userId: 42 }));
+      expect(parsed.module).toBe("api");
+      expect(parsed.message).toBe("Login");
+      expect(parsed.level).toBe("info");
+      expect(parsed.userId).toBe(42);
+      expect(typeof parsed.timestamp).toBe("string");
+    });
+
+    it("stamps the default module as `GLOBAL`, matching the pretty pipeline's label", () => {
+      // The default `moduleName: "global"` renders as `(GLOBAL)` in pretty mode
+      // (`label = moduleName === "global" ? "GLOBAL" : moduleName`), so the json
+      // field must carry the same `GLOBAL` token, not the raw `global`.
+      const explicit = parseJson("global", (logger) => logger.info("boot"));
+      expect(explicit.module).toBe("GLOBAL");
+
+      const omitted = parseJson(undefined, (logger) => logger.info("boot"));
+      expect(omitted.module).toBe("GLOBAL");
+    });
+
+    it("does not silently clobber a caller-supplied `module` metadata key (2-arg form)", () => {
+      const parsed = parseJson("api", (logger) => logger.info("m", { module: "caller-owned" }));
+      // Caller precedence: the caller's own value wins; ours is not added.
+      expect(parsed.module).toBe("caller-owned");
+    });
+
+    it("does not silently clobber a caller-supplied `module` key on the single-object form", () => {
+      const parsed = parseJson("api", (logger) =>
+        logger.info({ message: "m", module: "caller-owned" }),
+      );
+      expect(parsed.module).toBe("caller-owned");
+    });
+
+    it("does not mutate the caller's object when stamping the field (single-object form)", () => {
+      // The injector returns a FRESH object, so the caller's own object never
+      // gains a `module` property. (winston/`buildTimestampCapture` still write
+      // `level`/`timestamp` — the documented reserved-slot boundary — but
+      // `module` is package-added metadata and must not land on caller state.)
+      const event: Record<string, unknown> = { message: "m", id: 7 };
+      parseJson("api", (logger) => logger.info(event));
+      expect(Object.prototype.hasOwnProperty.call(event, "module")).toBe(false);
+      expect(event.id).toBe(7);
+    });
+
+    it("stamps the module on an Error line alongside its message and stack", () => {
+      const parsed = parseJson("api", (logger) => logger.error(new Error("boom-module")));
+      expect(parsed.module).toBe("api");
+      expect(parsed.message).toBe("boom-module");
+      expect(typeof parsed.stack).toBe("string");
+      expect(parsed.stack as string).toContain("Error: boom-module");
+    });
+
+    it("stamps the module when maskMetaKeys is configured (survives redaction)", () => {
+      const parsed = parseJson(
+        "api",
+        (logger) => logger.info("Login", { password: "hunter2", userId: 42 }),
+        ["password"],
+      );
+      expect(parsed.module).toBe("api");
+      expect(parsed.password).toBe("[REDACTED]");
+      expect(parsed.userId).toBe(42);
+    });
+
+    it('maskMetaKeys: ["module"] redacts the injected module field', () => {
+      // The injector runs BEFORE buildMetaRedactor, so the stamped `module` field
+      // is an ordinary metadata key the redactor threads through — masking
+      // "module" must replace the label with [REDACTED], an opt-in the operator
+      // controls. Guards against a future regression that adds "module" to
+      // RESERVED_INFO_KEYS (which would let it bypass the mask check).
+      const parsed = parseJson("api", (logger) => logger.info("hi"), ["module"]);
+      expect(parsed.module).toBe("[REDACTED]");
+    });
+
+    it("boundary: a single-object toJSON DTO line carries NO module field (toJSON owns the line)", () => {
+      class UserDto {
+        public message = "user loaded";
+        toJSON(): Record<string, unknown> {
+          return { message: this.message };
+        }
+      }
+      const parsed = parseJson("api", (logger) => logger.info(new UserDto()));
+      expect(parsed).toEqual({ message: "user loaded" });
+      expect(parsed).not.toHaveProperty("module");
+    });
+
+    it("boundary: an array info stays an array (no index-keyed rebuild, no module)", () => {
+      const parsed = JSON.parse(
+        renderJsonLine("api", (logger) => logger.log("info", ["a", "b"] as never)),
+      ) as unknown;
+      expect(parsed).toEqual(["a", "b"]);
+    });
+
+    it("emits the same `module` field on the console as in the file (json)", () => {
+      const captureConsole = (emit: () => void): string => {
+        const written: string[] = [];
+        const target =
+          (console as unknown as { _stdout?: NodeJS.WritableStream })._stdout ?? process.stdout;
+        const original = target.write.bind(target);
+        (target as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
+          written.push(String(chunk));
+          return true;
+        };
+        try {
+          emit();
+        } finally {
+          (target as unknown as { write: unknown }).write = original;
+        }
+        return written.join("");
+      };
+      const consoleOut = captureConsole(() => {
+        const logger = createLogger({
+          moduleName: "api",
+          includeConsole: true,
+          includeFile: false,
+          includeGlobalFile: false,
+          format: "json",
+        });
+        logger.info("Login", { userId: 42 });
+        teardownLogger(logger);
+      });
+      const parsed = JSON.parse(consoleOut.trim()) as Record<string, unknown>;
+      expect(parsed.module).toBe("api");
+      expect(parsed.userId).toBe(42);
+    });
+
+    it("boundary: a single-object toJSON DTO gets NO module on the console either (no file/console divergence)", () => {
+      // The injector lives only on the logger-level chain, so it skips the DTO
+      // (which still carries its `toJSON`) once, upstream. The console never sees
+      // a second injector, so it cannot re-stamp `module` onto the shallow clone
+      // whose prototype (and `toJSON`) was stripped — console and file agree.
+      const captureConsole = (emit: () => void): string => {
+        const written: string[] = [];
+        const target =
+          (console as unknown as { _stdout?: NodeJS.WritableStream })._stdout ?? process.stdout;
+        const original = target.write.bind(target);
+        (target as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
+          written.push(String(chunk));
+          return true;
+        };
+        try {
+          emit();
+        } finally {
+          (target as unknown as { write: unknown }).write = original;
+        }
+        return written.join("");
+      };
+      class UserDto {
+        public message = "user loaded";
+        toJSON(): Record<string, unknown> {
+          return { message: this.message };
+        }
+      }
+      const consoleOut = captureConsole(() => {
+        const logger = createLogger({
+          moduleName: "api",
+          includeConsole: true,
+          includeFile: false,
+          includeGlobalFile: false,
+          format: "json",
+        });
+        logger.info(new UserDto());
+        teardownLogger(logger);
+      });
+      const parsed = JSON.parse(consoleOut.trim()) as Record<string, unknown>;
+      // (The console line may carry level/timestamp that the file's toJSON output
+      // omits — that is the pre-existing console-vs-file toJSON boundary, pinned
+      // elsewhere. The module-specific guarantee is the only thing under test
+      // here: `module` is absent on the console just as it is on the file.)
+      expect(parsed).not.toHaveProperty("module");
+      expect(parsed.message).toBe("user loaded");
+    });
+
+    it("does not add a `module` metadata field in pretty mode (json-only change)", () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "api",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format: "pretty",
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      logger.info("Login");
+      teardownLogger(logger);
+      const rendered = chunks.join("");
+      expect(rendered).toContain("(api)");
+      expect(rendered).not.toContain('"module"');
+    });
+
+    it("buildModuleFieldInjector: returns a fresh object with the field, preserving symbols", () => {
+      const injector = __loggerInternals.buildModuleFieldInjector("api");
+      const LEVEL = Symbol.for("level");
+      const input: Record<string | symbol, unknown> = {
+        level: "info",
+        message: "m",
+        [LEVEL]: "info",
+      };
+      const out = injector.transform(input as any) as Record<string | symbol, unknown>;
+      expect(out).not.toBe(input);
+      expect(out[__loggerInternals.MODULE_FIELD]).toBe("api");
+      expect(out[LEVEL]).toBe("info");
+      // The input is left untouched.
+      expect(Object.prototype.hasOwnProperty.call(input, "module")).toBe(false);
+    });
+
+    it("buildModuleFieldInjector: skips FORBIDDEN_KEYS when rebuilding the fresh object", () => {
+      const injector = __loggerInternals.buildModuleFieldInjector("api");
+      // A `__proto__` own data property (as `JSON.parse('{"__proto__":{}}')`
+      // mints) must not be copied onto the fresh object — the same
+      // prototype-pollution guard the rest of the pipeline applies.
+      const input = JSON.parse('{"message":"m","__proto__":{"polluted":true}}') as Record<
+        string,
+        unknown
+      >;
+      const out = injector.transform(input as any) as Record<string, unknown>;
+      expect(out.module).toBe("api");
+      expect(Object.prototype.hasOwnProperty.call(out, "__proto__")).toBe(false);
+      expect((out as { polluted?: unknown }).polluted).toBeUndefined();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Formatter totality — a log call must never throw at the caller.
+  //
+  // The pretty printf runs synchronously inside `logger.log()`, so every
+  // JSON.stringify in it propagates out of the application's own
+  // `logger.info(...)` call rather than degrading the line. Both inputs below
+  // crash the DEFAULT, no-mask config — which made enabling `maskMetaKeys`
+  // (whose walk bounds the graph first) paradoxically SAFER than leaving it off.
+  // ---------------------------------------------------------------------------
+  describe("formatter totality (pretty mode never throws at the caller)", () => {
+    const captureStream = () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      return { stream, rendered: () => chunks.join("") };
+    };
+
+    const streamLogger = (moduleName: string, stream: PassThrough) =>
+      createLogger({
+        moduleName,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+    it("logs a deep metadata payload with NO maskMetaKeys instead of throwing RangeError", () => {
+      // Depth 8000 exhausts JSON.stringify itself. Pre-fix, the unguarded
+      // metadata stringify threw RangeError straight out of logger.info.
+      const deep: Record<string, unknown> = {};
+      let cursor = deep;
+      for (let i = 0; i < 8000; i += 1) {
+        const next: Record<string, unknown> = {};
+        cursor.child = next;
+        cursor = next;
+      }
+      const { stream, rendered } = captureStream();
+      const logger = streamLogger("total-deep-nomask", stream);
+
+      expect(() => logger.info("Deep", { payload: deep })).not.toThrow();
+      teardownLogger(logger);
+
+      // The line still renders; only the metadata block degrades.
+      expect(rendered()).toContain("[INFO] (total-deep-nomask)");
+      expect(rendered()).toContain("Deep");
+      expect(rendered()).toContain("[UNSERIALIZABLE]");
+    });
+
+    it("logs a circular message object instead of throwing TypeError", () => {
+      const circular: Record<string, unknown> = { name: "root" };
+      circular.self = circular;
+      const { stream, rendered } = captureStream();
+      const logger = streamLogger("total-circular-msg", stream);
+
+      // `logger.info(obj)` puts the object itself on `info.message`, which the
+      // printf stringifies — pre-fix: "Converting circular structure to JSON".
+      expect(() => logger.info(circular as unknown as string)).not.toThrow();
+      teardownLogger(logger);
+
+      expect(rendered()).toContain("[INFO] (total-circular-msg)");
+      expect(rendered()).toContain("[UNSERIALIZABLE]");
+    });
+
+    it("logs a circular non-string stack instead of throwing TypeError", () => {
+      const circularStack: Record<string, unknown> = { frames: 1 };
+      circularStack.self = circularStack;
+      const { stream, rendered } = captureStream();
+      const logger = streamLogger("total-circular-stack", stream);
+
+      expect(() => logger.info("Boom", { stack: circularStack })).not.toThrow();
+      teardownLogger(logger);
+
+      expect(rendered()).toContain("[INFO] (total-circular-stack)");
+      expect(rendered()).toContain("Boom");
+      expect(rendered()).toContain("[UNSERIALIZABLE]");
+    });
+
+    it("still renders a serializable non-string message and stack unchanged (no false sentinel)", () => {
+      // Pins that the guard only fires on genuine failure — the happy path
+      // must be byte-for-byte what it was before.
+      const { stream, rendered } = captureStream();
+      const logger = streamLogger("total-happy", stream);
+
+      logger.info({ a: 1 } as unknown as string);
+      logger.info("Boom", { stack: { frames: ["a", "b"] } });
+      teardownLogger(logger);
+
+      expect(rendered()).not.toContain("[UNSERIALIZABLE]");
+      expect(rendered()).toContain('"a": 1');
+      expect(rendered()).toContain('"frames"');
+    });
   });
 
   describe("escapeMessageNewlines", () => {
@@ -3495,6 +6881,91 @@ describe("createLogger", () => {
       ) as string;
       expect(output).toContain("alpha\\r\\nbeta");
       expect(output).not.toContain("alpha\r\nbeta");
+    });
+
+    /**
+     * Renders `logger.error(new Error(payload))` through the real pipeline —
+     * which is what makes this test meaningful. `errors({ stack: true })` runs
+     * ahead of the printf and flattens the Error into a string `message` PLUS a
+     * string `stack` whose first line repeats that message, so an Error is the
+     * one input that reaches the printf's stack branch with attacker bytes in
+     * it. Rendering the formatter in isolation would not exercise it.
+     */
+    const renderInjectedError = (escape: boolean): string => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        // The printf's `(label)` is the moduleName (`src/logger.ts:1261`).
+        moduleName: `escape-stack-${escape ? "on" : "off"}`,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        escapeMessageNewlines: escape,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      logger.error(new Error(FORGERY_PAYLOAD));
+      teardownLogger(logger);
+      return chunks.join("");
+    };
+
+    /**
+     * A username-shaped payload that closes the current line and opens a fake
+     * one in the printf's own `${levelToken} (${label})` format.
+     */
+    const FORGERY_PAYLOAD =
+      "login failed for alice\n[ERROR] (admin)\nfake critical event: account drained";
+    const FORGED_LINE = "[ERROR] (admin)";
+
+    it("escapes the stack of an Error so a payload cannot forge a log line", () => {
+      const rendered = renderInjectedError(true);
+      // The core guarantee: no rendered LINE is the forged entry. Asserting on
+      // whole lines (not `toContain`) is what actually pins the defect — the
+      // forged text still appears, escaped and inline, which is the point.
+      const lines = rendered.split("\n");
+      expect(lines).not.toContain(FORGED_LINE);
+      // Nothing on the payload's behalf survived as a real newline byte...
+      expect(rendered).not.toContain("alice\n[ERROR]");
+      // ...but the payload's contents are still fully readable for debugging,
+      // now as visible literal escape sequences, on BOTH the message line and
+      // the stack line below it.
+      expect(rendered).toContain("alice\\n[ERROR] (admin)\\nfake critical event");
+      // The genuine entry this logger produced is of course still a real line.
+      expect(lines).toContain("[ERROR] (escape-stack-on)");
+    });
+
+    it("leaves an Error stack rendering unchanged when omitted (back-compat)", () => {
+      const rendered = renderInjectedError(false);
+      // Default (`false`) behavior is untouched by the stack fix: the stack
+      // renders verbatim, multi-line, raw newlines intact. This is the
+      // back-compat pin — the forged line IS present here, which is precisely
+      // the exposure the opt-in option exists to close.
+      expect(rendered).toContain("alice\n[ERROR] (admin)\nfake critical event");
+      expect(rendered).not.toContain("alice\\n[ERROR]");
+      // A real multi-line stack still spans multiple lines when the option is
+      // off — the trade-off documented on the option applies only when it is on.
+      expect(rendered).toContain("\n    at ");
+    });
+
+    it("escapes a string stack directly through the printf, and passes through when off", () => {
+      // Direct internals call pinning the stack branch itself, independent of
+      // winston's `errors()` flattening — including that a NON-string stack
+      // still goes through safeStringify (whose JSON encoding escapes newlines
+      // on its own) rather than the escape helper.
+      const render = (escape: boolean, stack: unknown): string => {
+        const formatter = __loggerInternals.formatMessage(
+          { label: "test", timezones: [] },
+          { includeTimestamps: false, escapeMessageNewlines: escape },
+        );
+        const info = formatter.transform({ level: "error", message: "boom", stack } as any);
+        return Reflect.get(info as Record<PropertyKey, unknown>, Symbol.for("message")) as string;
+      };
+
+      expect(render(true, "Error: boom\n    at forged")).toContain("Error: boom\\n    at forged");
+      expect(render(false, "Error: boom\n    at forged")).toContain("Error: boom\n    at forged");
+      // Non-string stack: serialized, not escaped — the sequence below is
+      // JSON.stringify's own escaping, present regardless of the option.
+      expect(render(true, { nested: "a\nb" })).toContain("a\\nb");
     });
   });
 
@@ -4260,20 +7731,21 @@ describe("createLogger", () => {
       logger.info("ping");
       teardownLogger(logger);
 
-      // The Console transport's per-transport format must NOT re-run
-      // timestampCapture — the logger-level format already captured the
-      // timestamp via the single clock() call. A second call would produce a
-      // different timestamp on the console JSON line than on the file line.
+      // Since Phase 16.1 the json-mode Console transport carries NO format, so
+      // there is no second format to re-run timestampCapture: clock() fires once
+      // in the logger-level format and both the console and file lines carry that
+      // single captured timestamp.
       expect(clockCalls).toBe(1);
     });
 
-    it("json mode console format preserves the timestamp written by the logger-level format", () => {
-      // Drives both format pipelines manually — the same way Winston does it
-      // internally: logger-level format first, then the Console transport's
-      // per-transport format on a shallow clone of the transformed info.
-      // This bypasses stream-timing concerns and directly asserts the format
-      // composition contract: the Console format must NOT call clock() again
-      // or overwrite info.timestamp.
+    it("json mode Console transport has no format and reuses the logger-level MESSAGE (Phase 16.1)", () => {
+      // Phase 16.1: the json-mode Console transport carries NO per-transport
+      // format. winston-transport's `_write` then emits the logger-level format's
+      // already-serialized `info[MESSAGE]` verbatim (`modern.js`: `if (info &&
+      // !this.format) return this.log(info)`), so the console line is
+      // byte-identical to the file line — same captured timestamp — with the
+      // redaction + json() serialization run exactly once and no second clock()
+      // read that could desync it.
       const fixedDate = new Date("2030-06-15T12:34:56Z");
       const clock = () => fixedDate;
 
@@ -4291,8 +7763,11 @@ describe("createLogger", () => {
         (t) => t instanceof winston.transports.Console,
       );
       const consoleTransportFormat = (
-        consoleTransport as unknown as { format: winston.Logform.Format }
+        consoleTransport as unknown as { format?: winston.Logform.Format }
       ).format;
+
+      // The Console transport has NO format in json mode — it reuses MESSAGE.
+      expect(consoleTransportFormat).toBeUndefined();
 
       const syntheticInfo = {
         level: "info",
@@ -4300,17 +7775,11 @@ describe("createLogger", () => {
         [Symbol.for("level")]: "info",
       };
 
-      // Step 1 — logger-level format: runs timestampCapture → sets info.timestamp
+      // The logger-level format serializes the whole line (with the captured
+      // timestamp) into info[MESSAGE]; the formatless Console transport emits
+      // that same slot, so the console line is exactly this.
       const afterLogger = loggerLevelFormat.transform({ ...syntheticInfo } as any);
       expect(afterLogger).not.toBe(false);
-
-      // Step 2 — Console transport format: runs on a clone of the Step 1 result,
-      // mirroring Winston's `Object.assign({}, info)` clone before per-transport
-      // format execution. Must NOT re-run timestampCapture.
-      const afterConsole = consoleTransportFormat.transform({
-        ...(afterLogger as Record<string, unknown>),
-      } as any);
-      expect(afterConsole).not.toBe(false);
 
       teardownLogger(logger);
 
@@ -4318,15 +7787,7 @@ describe("createLogger", () => {
         Reflect.get(afterLogger as Record<PropertyKey, unknown>, Symbol.for("message")) as string,
       ) as Record<string, unknown>;
 
-      const consoleJson = JSON.parse(
-        Reflect.get(afterConsole as Record<PropertyKey, unknown>, Symbol.for("message")) as string,
-      ) as Record<string, unknown>;
-
-      // The console format must carry the timestamp already written by the
-      // logger-level format, not a new clock() read that would differ.
       expect(loggerJson.timestamp).toBe("2030-06-15 12:34:56");
-      expect(consoleJson.timestamp).toBe("2030-06-15 12:34:56");
-      expect(consoleJson.timestamp).toBe(loggerJson.timestamp);
     });
 
     it("pretty mode calls clock() exactly once per log line (regression guard)", () => {
@@ -4763,5 +8224,162 @@ describe("createLogger", () => {
       const obj = { a: 1 };
       expect(bigintSafeReplacer("k", obj)).toBe(obj);
     });
+  });
+});
+
+/**
+ * Characterization suite for a deliberate boundary: neither format chain
+ * composes `winston.format.splat()`, so a message containing a printf token
+ * (`%s %d %j %i %f %o %O %%`) causes winston to route a trailing metadata
+ * object into its `SPLAT` slot — which nothing in these chains reads — and the
+ * metadata is not emitted.
+ *
+ * These tests pin that behavior deliberately rather than fixing it, for a
+ * reason worth restating at the assertion site: adding `splat()` does NOT
+ * recover the metadata for the canonical one-token/one-object call, and it
+ * would forfeit something more valuable than it buys. `logform/splat.js`
+ * computes `extraSplat = (tokens - escapes) - splat.length`; for
+ * `info("route /a%d", meta)` that is `1 - 1 = 0`, so NO merge occurs and
+ * `util.format` instead consumes the metadata object as the `%d` argument —
+ * rewriting the caller's message to `"route /aNaN"` while STILL dropping the
+ * metadata. The status quo is byte-identical to bare winston's own default
+ * format (`winston/lib/winston/logger.js:105` falls back to `logform/json`
+ * with no splat), and winston's own docs mark interpolation opt-in
+ * ("Requires `winston.format.splat()`").
+ *
+ * The invariant these tests defend is therefore stronger than the metadata
+ * they give up: **this logger renders the caller's message text verbatim and
+ * never passes it through `util.format`.** The percent-encoding case below is
+ * the load-bearing canary for that.
+ */
+describe("printf tokens in a message (winston splat parity)", () => {
+  afterEach(() => {
+    // Mirrors the `createLogger` suite's own hook. Every logger below is torn
+    // down via `teardownLogger` (whose `close()` already evicts its registry
+    // entry), so this is belt-and-braces — it keeps the suite honest if a case
+    // is ever added that reuses a `moduleName`.
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  /** Renders one log line through a Stream transport in the given format mode. */
+  const render = (
+    moduleName: string,
+    format: "json" | "pretty",
+    emit: (logger: winston.Logger) => void,
+  ): string => {
+    const stream = new PassThrough();
+    const chunks: string[] = [];
+    stream.on("data", (chunk) => chunks.push(chunk.toString()));
+    const logger = createLogger({
+      moduleName,
+      includeConsole: false,
+      includeFile: false,
+      includeGlobalFile: false,
+      format,
+      additionalTransports: [new winston.transports.Stream({ stream })],
+    });
+    emit(logger);
+    teardownLogger(logger);
+    return chunks.join("");
+  };
+
+  describe.each([["json"], ["pretty"]] as const)("format: %s", (format) => {
+    it("drops the trailing metadata object but renders the message verbatim", () => {
+      const rendered = render(`splat-drop-${format}`, format, (logger) => {
+        logger.info("route /a%d", { requestId: "r1" });
+      });
+
+      // The message survives byte-for-byte — this is the guarantee.
+      expect(rendered).toContain("route /a%d");
+      // The metadata is the documented casualty...
+      expect(rendered).not.toContain("r1");
+      // ...but the message was never run through `util.format`, so the `%d`
+      // did not consume the object and coerce it to NaN.
+      expect(rendered).not.toContain("NaN");
+    });
+
+    it("does not interpolate printf tokens", () => {
+      const rendered = render(`splat-interp-${format}`, format, (logger) => {
+        logger.info("User %s logged in", "u-42");
+      });
+
+      expect(rendered).toContain("User %s logged in");
+      expect(rendered).not.toContain("u-42");
+    });
+
+    it("keeps metadata when the message contains no printf token", () => {
+      // The contrast case: proves the drop above is token-triggered and that
+      // the test is not passing for some unrelated reason.
+      const rendered = render(`splat-control-${format}`, format, (logger) => {
+        logger.info("route /users", { requestId: "r1" });
+      });
+
+      expect(rendered).toContain("route /users");
+      expect(rendered).toContain("r1");
+    });
+
+    it("renders a percent-encoded URL byte-for-byte and never rewrites it", () => {
+      // SECURITY-LOAD-BEARING CANARY. `formatRegExp` is `/%[scdjifoO%]/`, and
+      // `c`, `d`, `f` are HEX DIGITS — so lowercase percent-encoded octets in
+      // a URL (`%c3`, `%d0`, `%f0`) match as printf tokens. If anyone ever
+      // adds `splat()` to a chain, `util.format` will consume the metadata as
+      // the `%c` argument and emit nothing for it, silently rewriting this URL
+      // to "route /caf3%a9" — an attacker-authored lie about which path was
+      // requested. Today the metadata is merely absent and the URL is true;
+      // log omission is recoverable, log forgery is not. This test fails the
+      // day that trade is reversed.
+      const rendered = render(`splat-pct-${format}`, format, (logger) => {
+        logger.info("route /caf%c3%a9", { ip: "1.2.3.4" });
+      });
+
+      expect(rendered).toContain("route /caf%c3%a9");
+      expect(rendered).not.toContain("caf3%a9");
+      expect(rendered).not.toContain("1.2.3.4");
+    });
+
+    it("renders an escaped percent literally", () => {
+      const rendered = render(`splat-escaped-${format}`, format, (logger) => {
+        logger.info("50%% done", { requestId: "r1" });
+      });
+
+      // `%%` is in `formatRegExp` too, so it triggers the same drop.
+      expect(rendered).toContain("50%% done");
+      expect(rendered).not.toContain("r1");
+    });
+  });
+
+  it("matches bare winston's default format byte-for-byte on a token message", () => {
+    // Parity canary, mirroring the winston-canary pattern used by the
+    // crash-capture suite: the drop is winston's own out-of-the-box behavior,
+    // NOT something this package introduces. If a future winston release
+    // starts composing splat() into its default format, this fails and the
+    // documented boundary must be revisited.
+    const stream = new PassThrough();
+    const chunks: string[] = [];
+    stream.on("data", (chunk) => chunks.push(chunk.toString()));
+    const bare = winston.createLogger({
+      level: "info",
+      transports: [new winston.transports.Stream({ stream })],
+    });
+    bare.info("route /a%d", { requestId: "r1" });
+    bare.close();
+    const bareMessage = JSON.parse(chunks.join("").trim()).message;
+
+    const ours = render("splat-parity", "json", (logger) => {
+      logger.info("route /a%d", { requestId: "r1" });
+    });
+    const ourMessage = JSON.parse(ours.trim()).message;
+
+    expect(bareMessage).toBe("route /a%d");
+    expect(ourMessage).toBe(bareMessage);
+    expect(JSON.parse(ours.trim()).requestId).toBeUndefined();
+  });
+
+  it("confirms util.format is what would rewrite the message, if it were ever applied", () => {
+    // Documents the mechanism the canary above defends against, pinned against
+    // the real `util.format` so the rationale cannot rot into folklore.
+    expect(util.format("route /caf%c3%a9", { ip: "1.2.3.4" })).toBe("route /caf3%a9");
+    expect(util.format("route /a%d", { requestId: "r1" })).toBe("route /aNaN");
   });
 });
