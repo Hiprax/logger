@@ -5,6 +5,7 @@ import DailyRotateFile from "winston-daily-rotate-file";
 import moment from "moment-timezone";
 import { InvalidTimezoneError, LoggerOptionError } from "./errors";
 import { redactValue, FORBIDDEN_KEYS } from "./redact";
+import { bigintSafeReplacer } from "./serialize";
 import { registerCrashCapture, deregisterCrashCapture, resetCrashCapture } from "./crash-capture";
 import { acquireSharedGlobalFile, resetSharedFileRegistry } from "./shared-file-transport";
 import type { LoggerOptions, TimestampContext, LogLevel, RotationStrategy } from "./types";
@@ -704,32 +705,6 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
     }
     return next as unknown as winston.Logform.TransformableInfo;
   })();
-
-/**
- * `JSON.stringify` replacer that converts `BigInt` values to their decimal
- * string representation. Without this replacer, any caller-supplied payload
- * carrying a `BigInt` (e.g. `logger.info("Order", { orderId: 123n })`) would
- * crash the pretty-mode formatter synchronously back at the caller via
- * `TypeError: Do not know how to serialize a BigInt` — `JSON.stringify` has
- * no built-in `BigInt` support.
- *
- * String coercion (rather than emitting a JSON number) is the conservative
- * choice for two reasons:
- * - JSON numbers are IEEE-754 doubles; values above `2^53 - 1`
- *   (`Number.MAX_SAFE_INTEGER`) round-trip with precision loss. Order IDs,
- *   user IDs, and Twitter / X-style snowflake IDs routinely exceed the safe
- *   range — emitting them as strings preserves fidelity end-to-end.
- * - The pretty-mode formatter is consumed by humans reading log files; the
- *   `"123"` string form is unambiguous and matches the convention used by
- *   `logform/json.js`'s built-in `replacer` for `winston.format.json()`
- *   (which also string-coerces BigInts for the same fidelity reason).
- *
- * Usage: pass as the second argument to every `JSON.stringify(...)` call in
- * the pretty-mode pipeline — the message stringification, the stack
- * stringification, and the metadata stringification.
- */
-const bigintSafeReplacer = (_key: string, value: unknown): unknown =>
-  typeof value === "bigint" ? value.toString() : value;
 
 /** Substituted for a value the pretty-mode formatter could not serialize. */
 const UNSERIALIZABLE = "[UNSERIALIZABLE]";
@@ -1492,8 +1467,17 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     if (typeof value === "string") {
       return value;
     }
+    // A bare BigInt renders as its bare digits, matching `formatMessage`'s
+    // short-circuit for the same input — not as the quoted `"123"` a
+    // replacer-driven `JSON.stringify` would produce for a root-level value.
+    if (typeof value === "bigint") {
+      return value.toString();
+    }
     try {
-      const serialized = JSON.stringify(value);
+      // `bigintSafeReplacer` keeps a NESTED BigInt from throwing here and
+      // degrading the whole payload to `String(value)` → `"[object Object]"` —
+      // the same collapse `serializeBody` suffered.
+      const serialized = JSON.stringify(value, bigintSafeReplacer);
       if (typeof serialized === "string") {
         return serialized;
       }

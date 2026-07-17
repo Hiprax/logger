@@ -266,6 +266,37 @@ describe("createRequestLogger", () => {
       includeRequestBody: true,
     });
 
+    // A throwing `toJSON` is a genuine serialization failure. (A BigInt is NOT
+    // one — `bigintSafeReplacer` renders it — see the test below.) No
+    // `redactPaths` are configured, so nothing was mandated and the loose
+    // String() rendering carries no unredacted secret.
+    const { res } = runMiddleware(middleware, {
+      body: [
+        {
+          toJSON() {
+            throw new Error("boom");
+          },
+        },
+      ] as unknown,
+    });
+
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toBe("[object Object]");
+  });
+
+  it("renders a BigInt body rather than collapsing it into the String() fallback", () => {
+    // Regression guard: a BigInt used to make both stringify calls throw, so
+    // this body was emitted as the string "42" instead of the real array.
+    const { logger, log } = createMockLogger();
+
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+    });
+
     const { res } = runMiddleware(middleware, {
       body: [42n] as unknown,
     });
@@ -273,7 +304,8 @@ describe("createRequestLogger", () => {
     res.emit("finish");
 
     const payload = log.mock.calls[0][0];
-    expect(payload.http.requestBody).toBe("42");
+    expect(payload.http.requestBody).toEqual([42n]);
+    expect(payload.http.requestBody).not.toBe("42");
   });
 
   // ---------------------------------------------------------------------------
@@ -950,6 +982,58 @@ describe("createRequestLogger", () => {
         email: "u@example.com",
         password: "[REDACTED]",
       },
+    });
+  });
+
+  it("does not leak a redactPaths target end-to-end when the body carries a BigInt", () => {
+    // The proven end-to-end leak: a single BigInt made the redactPaths
+    // round-trip throw, so every mandated path was skipped and String(body)
+    // joined the array into "1,SUPER-SECRET,5" straight into the log.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      redactPaths: ["body.1"],
+    });
+
+    const { res } = runMiddleware(middleware, {
+      method: "POST",
+      originalUrl: "/orders",
+      body: ["1", "SUPER-SECRET", 5n],
+    });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toEqual(["1", "[REDACTED]", "5"]);
+    const rendered = JSON.stringify(payload, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+    expect(rendered).not.toContain("SUPER-SECRET");
+  });
+
+  it("logs a diagnosable redacted body end-to-end when the body carries a BigInt", () => {
+    // Previously the whole body collapsed to the useless "[object Object]",
+    // silently discarding every diagnostic field.
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      maskBodyKeys: ["password"],
+    });
+
+    const { res } = runMiddleware(middleware, {
+      method: "POST",
+      originalUrl: "/pay",
+      body: { amount: 100n, password: "hunter2", user: "bob" },
+    });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).not.toBe("[object Object]");
+    expect(payload.http.requestBody).toMatchObject({
+      password: "[REDACTED]",
+      user: "bob",
+      amount: 100n,
     });
   });
 
@@ -3471,13 +3555,97 @@ describe("request middleware internals", () => {
       expect(created.toISOString()).toBe("2024-01-01T00:00:00.000Z");
     });
 
-    it("serializeBody falls back to String() (no throw, no leak) when a BigInt body cannot be JSON-serialized under redactPaths", () => {
-      // A body carrying a BigInt cannot be JSON.stringify'd; the round-trip
-      // catch leaves the keyword-masked graph in place and the String()
-      // fallback truncates it. The raw numeric value is never emitted.
-      const out = serializeBody({ big: 10n }, undefined, 3000, ["body.big"]);
-      expect(typeof out).toBe("string");
-      expect(out).toBe("[object Object]");
+    it("serializeBody applies redactPaths to a BigInt-carrying body instead of collapsing it to String()", () => {
+      // Previously a BigInt made the redactPaths round-trip throw, the catch
+      // silently skipped every mandated path, and String(masked) rendered the
+      // whole body as the useless "[object Object]". `bigintSafeReplacer` makes
+      // the round-trip succeed, so the path is honored and the BigInt renders
+      // as its decimal string (matching logform/json.js's convention).
+      const out = serializeBody({ big: 10n }, undefined, 3000, ["body.big"]) as Record<
+        string,
+        unknown
+      >;
+      expect(out).toEqual({ big: "[REDACTED]" });
+      expect(out).not.toBe("[object Object]");
+    });
+
+    it("serializeBody keeps a BigInt body diagnosable (keyword mask applied, no [object Object])", () => {
+      // The BigInt no longer takes the rest of the body down with it: every
+      // diagnostic field survives and maskBodyKeys still redacts.
+      const out = serializeBody({ amount: 100n, password: "hunter2", user: "bob" }, [
+        "password",
+      ]) as Record<string, unknown>;
+      expect(out.password).toBe("[REDACTED]");
+      expect(out.user).toBe("bob");
+      // The BigInt is preserved as a live value; the downstream serializer
+      // (pretty-mode safeStringify / logform's json replacer) string-coerces it.
+      expect(out.amount).toBe(100n);
+      expect(out).not.toBe("[object Object]");
+    });
+
+    it("serializeBody does not leak a redactPaths target through the String() fallback on a BigInt array body", () => {
+      // The proven leak: String() on an array invokes Array.prototype.join, so
+      // the operator-mandated redaction was emitted in cleartext as
+      // "1,SUPER-SECRET,5".
+      const out = serializeBody(["1", "SUPER-SECRET", 5n], undefined, 3000, ["body.1"]);
+      expect(
+        JSON.stringify(out, (_k, v) => (typeof v === "bigint" ? v.toString() : v)),
+      ).not.toContain("SUPER-SECRET");
+      expect(out).toEqual(["1", "[REDACTED]", "5"]);
+    });
+
+    it("serializeBody fails closed with a sentinel when a redactPaths round-trip cannot be applied", () => {
+      // A genuinely unserializable body: `bad` defines toJSON, so redactValue
+      // passes it through by identity and JSON.stringify invokes the throwing
+      // serializer. With mandated paths unapplied, the body must never be
+      // emitted raw.
+      const body = {
+        token: "SUPER-SECRET",
+        bad: {
+          toJSON() {
+            throw new Error("boom");
+          },
+        },
+      };
+      const out = serializeBody(body, undefined, 3000, ["body.token"]);
+      expect(out).toBe("[UNSERIALIZABLE]");
+      expect(String(out)).not.toContain("SUPER-SECRET");
+    });
+
+    it("serializeBody still applies redactPaths to an ordinary circular body (a plain cycle is not a fail-closed trigger)", () => {
+      // Counter-intuitive but load-bearing: redactValue walks first and renders
+      // the cycle as "[Circular]", so the round-trip succeeds and the path is
+      // honored — a plain cycle never degrades the body to the sentinel.
+      const body: Record<string, unknown> = { token: "SUPER-SECRET" };
+      body.self = body;
+      const out = serializeBody(body, undefined, 3000, ["body.token"]) as Record<string, unknown>;
+      expect(out.token).toBe("[REDACTED]");
+      expect(out.self).toBe("[Circular]");
+      expect(JSON.stringify(out)).not.toContain("SUPER-SECRET");
+    });
+
+    it("serializeBody fails closed when a cycle is routed through a toJSON-defining instance", () => {
+      // The exception to the rule above, and the reason it is scoped to
+      // ORDINARY cycles: redactValue passes a toJSON-defining instance through
+      // by identity (its documented boundary) without cycle-tracking it, so the
+      // cycle survives into JSON.stringify and throws. Note the throw is
+      // `RangeError: Maximum call stack size exceeded`, NOT "Converting
+      // circular structure to JSON": JSON.stringify's cycle detection tracks
+      // the value returned by toJSON, and this toJSON mints a FRESH object
+      // every call, so no reference ever repeats and it recurses until the
+      // stack is exhausted. Either way it lands on the fail-closed path — the
+      // safe outcome, and why the fallback must not render `masked` raw.
+      class Node {
+        public parent: unknown = null;
+        toJSON() {
+          return { parent: this.parent };
+        }
+      }
+      const node = new Node();
+      node.parent = node;
+      const out = serializeBody({ token: "SUPER-SECRET", node }, undefined, 3000, ["body.token"]);
+      expect(out).toBe("[UNSERIALIZABLE]");
+      expect(String(out)).not.toContain("SUPER-SECRET");
     });
 
     it("does NOT yield [Circular] when the same built-in is referenced by two keys", () => {

@@ -471,6 +471,37 @@ describe("createLogger", () => {
     teardownLogger(logger);
   });
 
+  it("renders a nested BigInt in the info fallback instead of collapsing to String(value)", () => {
+    // Same defect shape the middleware's serializeBody carried: an unguarded
+    // JSON.stringify threw on the BigInt and String(value) rendered the whole
+    // payload as the useless "[object Object]".
+    const logger = createNoopTransportLogger();
+    (logger as any).info = undefined;
+    const logSpy = jest.fn();
+    (logger as any).log = logSpy;
+
+    (logger as any).obscure({ orderId: 123n, user: "bob" });
+
+    expect(logSpy).toHaveBeenCalledWith({
+      level: "info",
+      message: '{"orderId":"123","user":"bob"}',
+    });
+    teardownLogger(logger);
+  });
+
+  it("renders a bare BigInt payload as its bare digits in the info fallback", () => {
+    // Matches formatMessage's bare-BigInt short-circuit: `123`, not `"123"`.
+    const logger = createNoopTransportLogger();
+    (logger as any).info = undefined;
+    const logSpy = jest.fn();
+    (logger as any).log = logSpy;
+
+    (logger as any).obscure(123n);
+
+    expect(logSpy).toHaveBeenCalledWith({ level: "info", message: "123" });
+    teardownLogger(logger);
+  });
+
   it("handles circular objects by using String fallback", () => {
     const logger = createNoopTransportLogger();
     (logger as any).info = undefined;
@@ -1354,6 +1385,20 @@ describe("createLogger", () => {
   });
 
   describe("internals", () => {
+    it("re-exports a working bigintSafeReplacer after the move to src/serialize.ts", () => {
+      // The replacer now lives in `src/serialize.ts` and is shared with the
+      // request middleware; `__loggerInternals` must keep exposing it, and it
+      // must still be the real implementation rather than a stale stub.
+      const { bigintSafeReplacer } = __loggerInternals;
+      expect(bigintSafeReplacer("k", 123n)).toBe("123");
+      expect(bigintSafeReplacer("k", "plain")).toBe("plain");
+      expect(bigintSafeReplacer("k", 42)).toBe(42);
+      // Behaves correctly as an actual JSON.stringify replacer.
+      expect(JSON.stringify({ id: 9007199254740993n }, bigintSafeReplacer)).toBe(
+        '{"id":"9007199254740993"}',
+      );
+    });
+
     it("generates log paths for empty module names", () => {
       const result = __loggerInternals.buildLogFilePath("/tmp", "");
       expect(result.endsWith(`logs-%DATE%.log`)).toBe(true);

@@ -11,6 +11,7 @@ import type {
 } from "./types";
 import { createLogger } from "./logger";
 import { redactValue, REDACTED } from "./redact";
+import { bigintSafeReplacer } from "./serialize";
 import { RequestLoggerOptionError } from "./errors";
 import type { LogLevel } from "./types";
 
@@ -293,20 +294,35 @@ const serializeBody = (
   // The throw-away `{ requestBody: owned }` wrapper reuses `redactEntryPath`'s
   // `body.` → `requestBody.` alias and prototype-pollution guards; non-body
   // paths (`context.*`, header paths) no-op here and are applied by the
-  // post-assembly loop in `finalize()`. A non-JSON-serializable body (e.g. one
-  // carrying a `BigInt`) throws in `JSON.stringify`; the catch leaves `masked`
-  // as the keyword-masked graph so the `String()` fallback below still runs.
+  // post-assembly loop in `finalize()`. `bigintSafeReplacer` is what keeps a
+  // `BigInt` anywhere in the body from throwing here: without it a single
+  // `BigInt` (an `express.json({ reviver })` product, a protobuf/gRPC adapter,
+  // a 64-bit DB id) failed the round-trip, which — before the fail-closed
+  // return below — meant the operator's mandated paths were silently skipped.
   if (bodyRedactPaths && bodyRedactPaths.length > 0 && masked && typeof masked === "object") {
     try {
-      const owned: unknown = JSON.parse(JSON.stringify(masked));
+      const owned: unknown = JSON.parse(JSON.stringify(masked, bigintSafeReplacer));
       const wrapper: Record<string, unknown> = { requestBody: owned };
       for (const path of bodyRedactPaths) {
         redactEntryPath(wrapper, path);
       }
       masked = wrapper.requestBody;
     } catch {
-      // Body is not JSON-serializable (e.g. a `BigInt` value) — leave `masked`
-      // as the keyword-masked graph; the `String()` fallback below handles it.
+      // FAIL CLOSED. Reaching here means the operator configured `redactPaths`
+      // and NONE of them could be applied to this body — `masked` is still the
+      // graph those paths were meant to scrub. (The guard tests only that the
+      // path list is non-empty, so a list holding purely non-body paths — e.g.
+      // `["context.token"]` — degrades this body too. That is deliberate: the
+      // direction is conservative, and the alternative renderings available
+      // here are worthless anyway.) Falling through to the
+      // `String(masked)` fallback would emit exactly the values the operator
+      // ordered redacted: `String()` on an array invokes
+      // `Array.prototype.join`, so `redactPaths: ["body.1"]` over
+      // `["1", "SUPER-SECRET", 5n]` printed `"1,SUPER-SECRET,5"` in cleartext.
+      // A body whose mandated redactions could not be applied must never be
+      // emitted raw — the sentinel loses one diagnostic field, the fallback
+      // loses the secret.
+      return UNSERIALIZABLE_BODY;
     }
   }
 
@@ -315,12 +331,23 @@ const serializeBody = (
   }
 
   try {
-    const serialized = JSON.stringify(masked);
+    // `bigintSafeReplacer` mirrors the pretty-mode formatter's `safeStringify`
+    // and `logform/json.js`'s built-in replacer, so a BigInt renders as its
+    // decimal string here instead of throwing and collapsing the whole body
+    // into the `String(masked)` fallback (`"[object Object]"`). Note this
+    // serialization is used for the length decision and the `_preview` text;
+    // an under-limit body is returned as the live `masked` object, whose
+    // BigInts the downstream logger renders through the same convention.
+    const serialized = JSON.stringify(masked, bigintSafeReplacer);
     if (serialized.length > maxLength) {
       return buildTruncatedEnvelope(serialized, maxLength);
     }
     return masked;
   } catch {
+    // Safe to render loosely: any `redactPaths` mandated for this body were
+    // already applied above (a failure there returned the sentinel and never
+    // reaches this point), so `masked` carries only `maskBodyKeys`-redacted
+    // data.
     const fallback = String(masked);
     return truncateString(fallback, maxLength);
   }
@@ -356,11 +383,7 @@ const ownContext = (enriched: Record<string, unknown>): Record<string, unknown> 
     // Fall through: a value is not JSON-expressible as-is (commonly a BigInt).
   }
   try {
-    return JSON.parse(
-      JSON.stringify(enriched, (_key, value) =>
-        typeof value === "bigint" ? value.toString() : value,
-      ),
-    ) as Record<string, unknown>;
+    return JSON.parse(JSON.stringify(enriched, bigintSafeReplacer)) as Record<string, unknown>;
   } catch {
     // A circular reference, or a value whose getter / `toJSON` throws.
     return { _unserializable: true };
