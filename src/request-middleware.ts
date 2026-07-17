@@ -172,6 +172,34 @@ const determineLevel = (statusCode: number): LogLevel => {
 };
 
 /**
+ * Reports whether `value` holds at most `maxLength` Unicode code points.
+ *
+ * **Bounded by design.** The walk stops the instant the count exceeds
+ * `maxLength`, so the cost is O(`maxLength`) — never O(input length). That is
+ * what lets `truncateString` measure a 200 kB body against a 3000-char limit
+ * without materializing `Array.from(value)`, which would allocate one array
+ * entry per code point purely to read its `.length` and defeat the very
+ * O(`maxLength`) property the helper advertises.
+ *
+ * A string's `Symbol.iterator` yields code points (it is the same iterator
+ * `for...of` and `Array.from` drive), so an astral-plane character counts as
+ * the single character it is rather than as its two UTF-16 surrogate halves.
+ * It is stepped directly here rather than through `for...of` because only the
+ * count is wanted, never the code point itself.
+ */
+const isWithinCodePointLimit = (value: string, maxLength: number): boolean => {
+  const iterator = value[Symbol.iterator]();
+  let count = 0;
+  while (!iterator.next().done) {
+    count += 1;
+    if (count > maxLength) {
+      return false;
+    }
+  }
+  return true;
+};
+
+/**
  * Truncates a string to fit within `maxLength` total characters, INCLUDING the
  * trailing ellipsis. Returns the input unchanged when it already fits. Result
  * length is exactly `maxLength` Unicode code points for any string longer than
@@ -190,7 +218,21 @@ const determineLevel = (statusCode: number): LogLevel => {
  * grapheme-correct slicing if that matters for your data set.
  */
 const truncateString = (value: string, maxLength: number): string => {
-  if (value.length <= maxLength) {
+  // The fits-already guard MUST count the same unit as the truncation loop
+  // below, or the two disagree on astral-plane input and this helper appends an
+  // ellipsis to a string it never truncated: measuring here in code UNITS
+  // (`value.length`) while the loop counts code POINTS made
+  // `truncateString("[5 emoji]", 8)` return all five emoji plus a `…` — 5 code
+  // points sit comfortably within the limit of 8, yet the log claimed
+  // truncation and the output (11 code units) came out LONGER than the input
+  // (10).
+  //
+  // `value.length <= maxLength` is retained purely as a cheap O(1) pre-check.
+  // It is *sound* in the one direction that matters: a string can never hold
+  // more code points than code units, so anything it accepts genuinely fits.
+  // That keeps the common all-ASCII path walk-free; only when it fails do we
+  // pay for the bounded count.
+  if (value.length <= maxLength || isWithinCodePointLimit(value, maxLength)) {
     return value;
   }
   if (maxLength <= 0) {

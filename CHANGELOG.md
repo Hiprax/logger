@@ -4,6 +4,21 @@
 
 ### Fixed
 
+- **`truncateString` appended a "truncated" ellipsis to strings it never truncated, making the output longer than the input** (`src/request-middleware.ts`, `tests/request-middleware.spec.ts`): the fits-already guard measured `value.length` — UTF-16 **code units** — while the truncation loop counts **code points**. The two units agree on ASCII and diverge on anything astral-plane, so an emoji string that was comfortably within the limit fell past the guard and straight into the loop, which dutifully rebuilt it and appended `…`:
+
+  ```ts
+  truncateString("😀😀😀😀😀", 8); // 5 code points, 10 code units
+  // => "😀😀😀😀😀…"  — nothing was dropped, yet the log claims truncation,
+  //                    and the "truncated" result (11 code units) is LONGER
+  //                    than the input (10) it supposedly shortened.
+  ```
+
+  The damage is a lie in the log rather than a lost byte: nothing is discarded, but a reader (or a downstream tool keying on the ellipsis) is told the body was cut short when it is complete. It also produced the absurd degenerate case `truncateString("😀", 1) === "…"` — a single code point discarded for exceeding a limit of one, because two code units looked like two characters. `README.md:683` already documents the intended contract — string bodies are "truncated to `maxBodyLength` Unicode code points (handles emoji surrogate pairs correctly)" — and the loop honored it; only the guard did not. Emoji, non-Latin scripts outside the BMP, and mathematical alphanumerics all reach it through an ordinary `includeRequestBody` request body.
+
+  The guard now measures code points via a new bounded `isWithinCodePointLimit` helper. **Bounding it is the whole design constraint:** the obvious fix, `Array.from(value).length <= maxLength`, would allocate one array entry per code point of a 200 kB body purely to read a number, destroying the O(`maxLength`) property the helper's own JSDoc advertises and that its 200 kB regression test pins. The helper instead steps the string's code-point iterator and bails the instant the count exceeds `maxLength`, so the cost stays proportional to the limit, never to the input. The cheap `value.length <= maxLength` check is **retained as a fast path** rather than replaced, because it is sound in the one direction that matters — a string can never hold more code points than code units, so anything it accepts genuinely fits — which keeps the overwhelmingly common all-ASCII body walk-free. The `maxLength <= 0` → `""` and `maxLength === 1` → `"…"` branches are unchanged, as is every ASCII result.
+
+  This also reaches `buildTruncatedEnvelope`'s `_preview`, which routes through the same helper. One boundary is now visible there and is deliberately left as-is: `serializeBody`'s size decision (`serialized.length > maxLength`) counts code units, being a payload-size figure, while `_preview` counts code points. An emoji-dense body can therefore trip the envelope on its code-unit size while its code-point length still fits, yielding `_truncated: true` alongside a preview that is the complete body and carries no ellipsis. That is honest — the preview really is whole — and strictly better than the false ellipsis it replaces; `_originalLength` continues to report the serialized code-unit length. Both cases are pinned by tests.
+
 - **`escapeMessageNewlines` did not cover the stack, so wrapping the payload in an `Error` defeated the option entirely** (`src/logger.ts`, `src/types.ts`, `README.md`, `tests/logger.spec.ts`): the option's whole threat model — stated in its own `LoggerOptions` JSDoc — is that caller-supplied data must not be able to forge a log line. It escaped `\r` / `\n` in a string-typed `info.message`, but the pretty-mode printf emitted a string-typed `info.stack` **verbatim** on the very next line. `winston.format.errors({ stack: true })` runs ahead of that printf in both chains and flattens a logged `Error` into a string `message` **plus** a string `stack` whose first line repeats that same message — so the payload dutifully escaped on the message line was re-injected raw one line below it:
 
   ```ts

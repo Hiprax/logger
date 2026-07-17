@@ -2576,28 +2576,59 @@ describe("request middleware internals", () => {
     // iterator instead, so an emoji is kept whole or skipped entirely —
     // never torn in half.
     //
-    // For `truncateString("ab😀😀", 4)`: maxLength=4, so the bounded for...of
-    // collects 3 code points = `['a', 'b', '😀']` then appends `…` —
-    // yielding `"ab😀…"` (4 code points; the first emoji is preserved
-    // intact). Critically, the result must NOT contain a lone surrogate.
-    const truncated = truncateString("ab😀😀", 4);
+    // For `truncateString("ab😀😀😀😀", 4)`: the input is 6 code points, so the
+    // limit of 4 genuinely bites. The bounded for...of collects 3 code points
+    // = `['a', 'b', '😀']` then appends `…` — yielding `"ab😀…"` (4 code
+    // points; the first emoji is preserved intact). Critically, the result
+    // must NOT contain a lone surrogate.
+    const truncated = truncateString("ab😀😀😀😀", 4);
     expect(truncated).toBe("ab😀…");
+    // A real truncation always yields exactly `maxLength` code points.
+    expect(Array.from(truncated).length).toBe(4);
     // Defensive guard: no lone surrogate in the output. `\uD83D` is the high
     // surrogate of `😀` (`😀`); a torn-in-half emoji would surface
     // a `\uD83D` not followed by a low surrogate.
     expect(truncated).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
 
-    // With `maxLength=5` (still less than the 6-code-unit `value.length`,
-    // so the early-exit does not fire), the for...of collects 4 code points:
-    // `['a', 'b', '😀', '😀']` then appends `…` = `"ab😀😀…"`. Both emojis
-    // are kept whole — the truncation strictly trims from the end.
-    expect(truncateString("ab😀😀", 5)).toBe("ab😀😀…");
+    // With `maxLength=5` the for...of collects 4 code points:
+    // `['a', 'b', '😀', '😀']` then appends `…` = `"ab😀😀…"`. Both retained
+    // emojis are kept whole — the truncation strictly trims from the end.
+    expect(truncateString("ab😀😀😀😀", 5)).toBe("ab😀😀…");
 
-    // No truncation needed when the input fits the limit (measured in CODE
-    // UNITS by the early-exit `value.length <= maxLength` branch — preserved
-    // unchanged from the previous implementation for back-compat). `"ab😀😀"`
-    // is 6 UTF-16 code units, so `maxLength=6` returns the input verbatim.
+    // No truncation needed when the input fits the limit. `"ab😀😀"` is 4 code
+    // points (6 UTF-16 code units), so any limit >= 4 returns it verbatim —
+    // the guard measures CODE POINTS, the same unit the loop counts.
+    expect(truncateString("ab😀😀", 4)).toBe("ab😀😀");
     expect(truncateString("ab😀😀", 6)).toBe("ab😀😀");
+  });
+
+  it("truncateString never appends a false ellipsis to a string that already fits", () => {
+    // THE REGRESSION THIS PINS. The fits-already guard used to measure
+    // `value.length` (UTF-16 code UNITS) while the truncation loop counted code
+    // POINTS. On astral-plane input the two units disagree, so a string that
+    // was never truncated had an ellipsis appended anyway: the log claimed a
+    // truncation that never happened, and — absurdly — the "truncated" output
+    // came out LONGER than the input it supposedly shortened.
+    const fiveEmoji = "😀".repeat(5); // 5 code points, 10 code units
+    expect(Array.from(fiveEmoji).length).toBe(5);
+    expect(fiveEmoji.length).toBe(10);
+
+    // 5 code points against a limit of 8: nothing to drop.
+    const result = truncateString(fiveEmoji, 8);
+    expect(result).toBe(fiveEmoji);
+    expect(result).not.toContain("…");
+    // The old code-unit guard produced 11 code units from a 10-code-unit input.
+    expect(result.length).toBeLessThanOrEqual(fiveEmoji.length);
+
+    // The boundary: exactly at the limit is still "fits", not "truncate".
+    expect(truncateString(fiveEmoji, 5)).toBe(fiveEmoji);
+    // One under the limit truncates for real: 4 code points + the ellipsis.
+    expect(truncateString(fiveEmoji, 4)).toBe("😀😀😀…");
+
+    // A single emoji is 1 code point, so it fits a limit of 1 and must be
+    // returned intact rather than replaced by the `maxLength === 1` ellipsis
+    // branch (which the code-unit guard used to reach: 2 code units > 1).
+    expect(truncateString("😀", 1)).toBe("😀");
   });
 
   it("truncateString preserves the documented combining-mark caveat", () => {
@@ -2617,11 +2648,18 @@ describe("request middleware internals", () => {
   // ---------------------------------------------------------------------------
 
   describe("truncateString (Phase 6 — bounded for...of parity)", () => {
-    // Reference implementation preserved from before Phase 6: the old
-    // Array.from-based semantics. Used to verify the new for...of loop
-    // produces byte-identical output for every input class.
+    // Reference implementation: the straightforward, unoptimized Array.from
+    // semantics the helper is meant to be indistinguishable from. Used to
+    // verify the bounded for...of loop produces byte-identical output for
+    // every input class.
+    //
+    // The fits-already guard here measures `Array.from(value).length` — code
+    // POINTS, the same unit the truncation below counts. This oracle
+    // deliberately does NOT reproduce the old `value.length` (code UNIT) guard:
+    // that mismatch WAS the bug, so an oracle carrying it would have ratified
+    // the false ellipsis on every emoji input rather than catching it.
     const arrayFromTruncate = (value: string, maxLength: number): string => {
-      if (value.length <= maxLength) {
+      if (Array.from(value).length <= maxLength) {
         return value;
       }
       if (maxLength <= 0) {
@@ -2685,6 +2723,41 @@ describe("request middleware internals", () => {
     expect(envelope._originalLength).toBe(serialized.length);
     expect(envelope._preview.length).toBe(12);
     expect(envelope._preview.endsWith("…")).toBe(true);
+  });
+
+  it("buildTruncatedEnvelope builds an emoji _preview of exactly maxLength code points", () => {
+    // The `_preview` path routes through `truncateString`, so it inherits the
+    // code-point contract. An emoji payload is where a code-unit slice would
+    // tear a surrogate pair in half and emit a lone half-pair into the log.
+    const serialized = JSON.stringify({ payload: "😀".repeat(50) });
+    const envelope = buildTruncatedEnvelope(serialized, 20);
+    expect(envelope._truncated).toBe(true);
+    // `_originalLength` stays the serialized CODE-UNIT length — it is a
+    // payload-size figure, deliberately not a code-point count.
+    expect(envelope._originalLength).toBe(serialized.length);
+    // The preview is exactly 20 code points (NOT 20 code units — the emoji
+    // make the two differ), with no torn surrogate pair.
+    expect(Array.from(envelope._preview).length).toBe(20);
+    expect(envelope._preview.endsWith("…")).toBe(true);
+    expect(envelope._preview).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+  });
+
+  it("buildTruncatedEnvelope leaves an emoji _preview un-ellipsised when it fits the limit", () => {
+    // The size decision in `serializeBody` (`serialized.length > maxLength`)
+    // counts code UNITS, while `_preview`'s `truncateString` counts code
+    // POINTS. An emoji-dense body can therefore trip the envelope on its
+    // code-unit size while its code-point length still fits the limit — in
+    // which case the preview is the COMPLETE serialized body and carries no
+    // ellipsis. That combination is honest (the preview really is whole);
+    // before the guard fix it produced a false ellipsis on a string nothing
+    // had been dropped from.
+    const serialized = JSON.stringify({ a: "😀😀😀😀😀" }); // 18 code units, 13 code points
+    expect(serialized.length).toBeGreaterThan(14);
+    expect(Array.from(serialized).length).toBeLessThanOrEqual(14);
+
+    const envelope = buildTruncatedEnvelope(serialized, 14);
+    expect(envelope._preview).toBe(serialized);
+    expect(envelope._preview).not.toContain("…");
   });
 
   it("redactUrlQuery is a no-op when there is no query string or no mask set", () => {
