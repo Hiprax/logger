@@ -340,24 +340,16 @@ export interface LoggerOptions {
    * is resolved first and the resulting fields ARE key-redacted, so enabling
    * the mask never emits more than logging the same object without it would.
    *
-   * **Known console boundary (pre-existing, and only when NO mask is set).**
-   * In `format: "json"` the Console transport receives a shallow clone of the
-   * info (`Object.assign({}, info)` in `winston-transport`), which cannot carry
-   * a prototype — so the console's own serializer never finds a `toJSON` on the
-   * log subject. With `maskMetaKeys` configured this does not bite: the
-   * redaction resolves `toJSON` in the logger-level chain, so the withheld
-   * fields never reach the console clone and console output matches the file.
-   * With NO `maskMetaKeys` the redaction is a zero-allocation identity pass, so
-   * `logger.info(dto)` renders the DTO's own fields on the console while the
-   * file honors its `toJSON()`. The same shape divergence remains WITH a mask
-   * for the narrower set of `toJSON` outputs the redaction hands back
-   * untouched — a primitive, or a `Date` / `Map` / already-unchanged instance —
-   * since those also reach the console clone with their prototype intact. Only
-   * a top-level `toJSON`'s field SELECTION or SHAPE is ever affected; masked
-   * keys themselves are redacted before the console's pass runs, on every one
-   * of these paths, so nothing secret differs between the two pipelines. Use
-   * `includeConsole: false`, or normalize such objects to plain objects, if
-   * console output must match the file output exactly.
+   * **Console/file parity (`format: "json"`).** The json-mode Console transport
+   * carries no per-transport format, so `winston-transport` writes the
+   * logger-level chain's already-serialized `info[MESSAGE]` verbatim — the same
+   * bytes the file transports emit. Console and file output are therefore
+   * byte-identical for every payload shape (including a `toJSON`-defining log
+   * subject), with the deep redaction and JSON serialization run exactly once,
+   * whether or not `maskMetaKeys` is configured. No `includeConsole: false`
+   * workaround is needed. (Earlier versions ran a duplicate console format over
+   * a shallow clone that dropped the prototype and could diverge on a `toJSON`
+   * subject; that duplicate chain no longer exists.)
    */
   maskMetaKeys?: string[];
   /**
@@ -451,12 +443,16 @@ export interface RequestLogEntry {
   responseTimeMs: number;
   /**
    * The RESPONSE's declared byte count, parsed from the response
-   * `Content-Length` header. This is a response-side field only — it is
-   * `undefined` for a chunked/streamed response (which carries no
-   * `Content-Length`) and for an aborted request (no bytes sent). It never
-   * falls back to the request's `Content-Length`; reporting the uploaded body
-   * size here would mislabel egress. If you need the request body size, read it
-   * from `requestHeaders["content-length"]` (enable `includeRequestHeaders`).
+   * `Content-Length` header. This is a response-side field only — it reflects
+   * whatever value the response's `Content-Length` header holds at log time, or
+   * `undefined` when the response declared none (a chunked/streamed response, or
+   * a request aborted before any `Content-Length` was set). It is the *declared*
+   * size, not a count of bytes actually transmitted: a response aborted
+   * mid-body after its `Content-Length` was set still reports that declared
+   * figure. It never falls back to the request's `Content-Length`; reporting the
+   * uploaded body size here would mislabel egress. If you need the request body
+   * size, read it from `requestHeaders["content-length"]` (enable
+   * `includeRequestHeaders`).
    */
   contentLength?: number;
   ip?: string;

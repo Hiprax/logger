@@ -1088,6 +1088,42 @@ describe("createLogger", () => {
       expect(__loggerInternals.normalizeMaxSize(undefined)).toBeUndefined();
     });
 
+    it("folds a case-varying globalModuleName into one shared global-file transport (P13/shared-file)", () => {
+      // The shared-file registry key is normalized the same way the module
+      // registry key is (`buildRegistryKey` — Windows-only lowercase, POSIX
+      // identity). Two DISTINCT module loggers whose `globalModuleName` differs
+      // only in case target the same physical global file on a case-insensitive
+      // filesystem, so they must share ONE `DailyRotateFile`, not open two
+      // rotators fighting over it. On a case-sensitive filesystem the two names
+      // are genuinely different files, so two transports is correct there.
+      const root = createTempDir();
+      const a = createLogger({
+        moduleName: "svc-a",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: true,
+        globalModuleName: "SharedLog",
+      });
+      const b = createLogger({
+        moduleName: "svc-b",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: true,
+        globalModuleName: "sharedlog",
+      });
+
+      // Two different module loggers (distinct module keys), so neither is a
+      // cache hit of the other; the assertion is purely about the shared-file key.
+      expect(b).not.toBe(a);
+      const expectedShared = process.platform === "win32" ? 1 : 2;
+      expect(__sharedFileInternals.sharedFileRegistry.size).toBe(expectedShared);
+
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
     it("does not warn a second time when the same mismatched options recur", () => {
       const root = createTempDir();
       const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -5677,6 +5713,41 @@ describe("createLogger", () => {
       expect(consoleOut).not.toContain("Europe/London");
     });
 
+    it("16.2 with NO extraTimezones skips the mirror-parse (moment.utc 2-arg form is never called)", () => {
+      // Teeth for the 16.2 optimization: the `moment.utc(utcString, TIMESTAMP_FORMAT)`
+      // mirror-parse (two string args) is the ~9µs the guard removes and must NOT
+      // run when there are no extra timezones. Output is byte-identical either
+      // way (the loop never iterates), so only a call-count spy catches a silent
+      // revert of the `ctx.timezones.length > 0` guard. Other moment.utc calls —
+      // the capture's `moment.utc(clock())`, a single Date arg — are unrelated.
+      const spy = jest.spyOn(moment, "utc");
+      try {
+        renderStream({ moduleName: "perf-tz-guard-off" }, (logger) => logger.info("hi"));
+        const mirrorParseCalls = spy.mock.calls.filter(
+          (args) => args.length === 2 && typeof args[0] === "string" && typeof args[1] === "string",
+        );
+        expect(mirrorParseCalls).toHaveLength(0);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("16.2 WITH extraTimezones runs the mirror-parse (guard's other branch)", () => {
+      const spy = jest.spyOn(moment, "utc");
+      try {
+        renderStream(
+          { moduleName: "perf-tz-guard-on", extraTimezones: ["Europe/London"] },
+          (logger) => logger.info("hi"),
+        );
+        const mirrorParseCalls = spy.mock.calls.filter(
+          (args) => args.length === 2 && typeof args[0] === "string" && typeof args[1] === "string",
+        );
+        expect(mirrorParseCalls.length).toBeGreaterThanOrEqual(1);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
     it("16.4 json mode: a serializer-exhausting payload degrades to a sentinel line, no throw at the caller", () => {
       // A payload deep enough to exhaust JSON.stringify itself throws RangeError
       // from inside winston's own `json()`. With NO maskMetaKeys the redactor's
@@ -5743,6 +5814,627 @@ describe("createLogger", () => {
       // The top-level masked key is redacted; the deep payload is bounded by the
       // redactor's MAX_REDACT_DEPTH guard, so json() never throws.
       expect(parsed.password).toBe("[REDACTED]");
+    });
+
+    it("json mode: a throwing metadata getter degrades to a sentinel, no throw at the caller", () => {
+      // A caller metadata value can be a getter — caller code that may throw.
+      // In json mode with NO maskMetaKeys the getter survives untouched to
+      // `json()`, whose serializer invokes it and throws; buildSafeJsonFormat
+      // must catch and degrade to a sentinel rather than let it escape out of the
+      // caller's own logger.info(). The injected `module` field is a data string
+      // here, so it is still reported.
+      const payload: Record<string, unknown> = { message: "hostile token" };
+      Object.defineProperty(payload, "token", {
+        enumerable: true,
+        get() {
+          throw new Error("token boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "json-getter", format: "json" }, (logger) =>
+          logger.info(payload),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed._unserializable).toBe(true);
+      expect(parsed.module).toBe("json-getter");
+      expect(parsed.level).toBe("info");
+    });
+
+    it("json mode: a throwing caller `module` getter cannot re-escape the sentinel fallback", () => {
+      // Regression for the sentinel's own re-throw hole. `buildModuleFieldInjector`
+      // leaves a caller-supplied own `module` key untouched in the no-mask
+      // default, so a hostile `{ get module() { throw } }` both makes `json()`
+      // throw AND is the field buildSafeJsonFormat's catch reads while building
+      // the sentinel — pre-fix it re-threw out of logger.info(). The catch must
+      // read `module` defensively; the sentinel then carries no `module` (the
+      // hostile getter could not be read) rather than crashing.
+      const payload: Record<string, unknown> = { message: "hostile module" };
+      Object.defineProperty(payload, "module", {
+        enumerable: true,
+        get() {
+          throw new Error("module boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "json-mod-getter", format: "json" }, (logger) =>
+          logger.info(payload),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed._unserializable).toBe(true);
+      expect(parsed.level).toBe("info");
+      // The hostile getter could not be read, so `module` is absent (undefined →
+      // omitted by JSON.stringify), not a crash and not the label.
+      expect(parsed).not.toHaveProperty("module");
+    });
+
+    it("pretty mode: a throwing metadata getter fails closed instead of crashing the caller", () => {
+      // formatMessage builds its metadata bag by DESCRIPTOR transplant, never
+      // invoking a caller getter during extraction — so a `{ get token() { throw } }`
+      // payload logs a line whose metadata block fails closed (UNSERIALIZABLE)
+      // rather than throwing out of the caller's logger.info() (verified pre-fix:
+      // pretty mode crashed). The level/message lines still render.
+      const payload: Record<string, unknown> = { message: "pretty hostile" };
+      Object.defineProperty(payload, "token", {
+        enumerable: true,
+        get() {
+          throw new Error("pretty boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "pretty-getter" }, (logger) => logger.info(payload));
+      }).not.toThrow();
+      expect(out).toContain("[INFO] (pretty-getter)");
+      expect(out).toContain("pretty hostile");
+      expect(out).toContain("[UNSERIALIZABLE]");
+    });
+
+    it("pretty mode with maskMetaKeys: a throwing non-masked getter fails closed, line still logged", () => {
+      // The mask path reads a non-masked value inside redactValue, which is
+      // wrapped; a throwing getter there degrades the whole metadata block to
+      // `_redactionFailed` rather than crashing. Extraction still never invokes
+      // the getter (descriptor transplant), so the throw is contained.
+      const payload: Record<string, unknown> = { message: "masked hostile", password: "hunter2" };
+      Object.defineProperty(payload, "token", {
+        enumerable: true,
+        get() {
+          throw new Error("masked boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream(
+          { moduleName: "pretty-mask-getter", maskMetaKeys: ["password"] },
+          (logger) => logger.info(payload),
+        );
+      }).not.toThrow();
+      expect(out).toContain("[INFO] (pretty-mask-getter)");
+      expect(out).toContain("masked hostile");
+      expect(out).toContain("_redactionFailed");
+      expect(out).not.toContain("hunter2");
+    });
+
+    it("pretty mode: a throwing `stack` accessor (non-Error payload) fails closed, does not crash", () => {
+      // `stack` is a RESERVED key, but a non-Error caller payload can still carry
+      // a throwing `stack` accessor that `errors()` never neutralizes (it reads
+      // `stack` only for an actual Error). formatMessage reads `stack` inside a
+      // try/catch and fails closed — the stack line is omitted, the caller's
+      // logger.info() does not throw (verified pre-fix: it crashed).
+      const payload: Record<string, unknown> = { message: "pretty stack" };
+      Object.defineProperty(payload, "stack", {
+        enumerable: true,
+        get() {
+          throw new Error("stack boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "pretty-stack-getter" }, (logger) => logger.info(payload));
+      }).not.toThrow();
+      expect(out).toContain("[INFO] (pretty-stack-getter)");
+      expect(out).toContain("pretty stack");
+      expect(out).not.toContain("stack boom");
+    });
+
+    it("json mode + maskMetaKeys: a throwing `stack` accessor fails closed on that key, no throw", () => {
+      // In json mode WITH a mask, buildMetaRedactor copies reserved keys, which
+      // READS `subject.stack`; a throwing accessor there escaped out of
+      // logger.log() pre-fix. The reserved-key copy is now guarded and fails
+      // closed to the RedactionFailed sentinel; the rest of the line still
+      // renders. (No mask → buildSafeJsonFormat catches json()'s throw instead.)
+      const payload: Record<string, unknown> = { message: "json stack", password: "hunter2" };
+      Object.defineProperty(payload, "stack", {
+        enumerable: true,
+        get() {
+          throw new Error("stack boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream(
+          { moduleName: "json-stack-getter", format: "json", maskMetaKeys: ["password"] },
+          (logger) => logger.info(payload),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed.message).toBe("json stack");
+      expect(parsed.stack).toBe("[RedactionFailed]");
+      expect(parsed.password).toBe("[REDACTED]");
+      expect(out).not.toContain("stack boom");
+    });
+
+    it("json mode (no mask): a throwing `stack` accessor degrades to the sentinel, no throw", () => {
+      const payload: Record<string, unknown> = { message: "json stack nomask" };
+      Object.defineProperty(payload, "stack", {
+        enumerable: true,
+        get() {
+          throw new Error("stack boom");
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "json-stack-nomask", format: "json" }, (logger) =>
+          logger.info(payload),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed._unserializable).toBe(true);
+      expect(out).not.toContain("stack boom");
+    });
+
+    it("pretty mode: a throwing `level` accessor (getter+setter) does not crash the caller", () => {
+      // A `level` defined as a throwing getter WITH a setter passes winston's own
+      // `info.level = level` (the setter runs, leaving the accessor live), so
+      // formatMessage's level read would crash the caller pre-fix. readReserved
+      // guards it, falling back to the "info" display level. (A getter-ONLY level
+      // instead crashes at winston's own assignment — the winston-core boundary.)
+      const payload: Record<string, unknown> = { message: "level hostile" };
+      Object.defineProperty(payload, "level", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          throw new Error("level boom");
+        },
+        set() {
+          /* no-op: absorb winston's `info.level = level` so the accessor survives */
+        },
+      });
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "pretty-level-getter" }, (logger) => logger.info(payload));
+      }).not.toThrow();
+      expect(out).toContain("[INFO] (pretty-level-getter)");
+      expect(out).toContain("level hostile");
+      expect(out).not.toContain("level boom");
+    });
+
+    it("pretty CONSOLE: neutralizeCallerAccessors keeps the console re-clone from crashing on a throwing getter", () => {
+      // winston-transport re-runs the console format over Object.assign({}, info),
+      // which invokes every enumerable own getter and RE-THROWS on error — so a
+      // caller-supplied throwing accessor would crash logger.info() there even
+      // though the logger-level formats are getter-safe. neutralizeCallerAccessors
+      // (added to the pretty chain when a console exists) resolves accessors to
+      // data first. This payload exercises every branch of that format: a throwing
+      // accessor (fails closed), a non-throwing accessor (resolved), a plain data
+      // key (copied), and a FORBIDDEN key (skipped). Verified pre-fix: the default
+      // console logger crashed here.
+      const payload: Record<string, unknown> = { message: "console safe", plain: 7 };
+      Object.defineProperty(payload, "willThrow", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          throw new Error("console boom");
+        },
+      });
+      Object.defineProperty(payload, "computed", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          return "ok-value";
+        },
+      });
+      Object.defineProperty(payload, "constructor", {
+        enumerable: true,
+        configurable: true,
+        writable: true,
+        value: "poison",
+      });
+
+      let consoleOut = "";
+      expect(() => {
+        consoleOut = captureConsole(() => {
+          const logger = createLogger({
+            moduleName: "console-neutralize",
+            format: "pretty",
+            colorize: false,
+            includeConsole: true,
+            includeFile: false,
+            includeGlobalFile: false,
+            clock: fixedClock,
+          });
+          logger.info(payload);
+          teardownLogger(logger);
+        });
+      }).not.toThrow();
+
+      expect(consoleOut).toContain("(console-neutralize)");
+      expect(consoleOut).toContain("console safe");
+      // The non-throwing accessor is resolved to its value...
+      expect(consoleOut).toContain("ok-value");
+      // ...the throwing accessor fails closed (never re-thrown into the clone)...
+      expect(consoleOut).not.toContain("console boom");
+      // ...and the FORBIDDEN prototype-pollution key is skipped, not emitted.
+      expect(consoleOut).not.toContain("poison");
+    });
+
+    it("pretty (console off) + a format-carrying additionalTransport: neutralize still runs, no crash", () => {
+      // neutralize is added whenever a format-carrying transport exists — not
+      // only when the built-in console does. A caller-supplied additionalTransport
+      // that sets its OWN `format` triggers winston-transport's re-clone-and-
+      // rethrow, so a throwing accessor would crash there without neutralize.
+      const stream = new PassThrough();
+      let out = "";
+      stream.on("data", (chunk) => {
+        out += chunk.toString();
+      });
+      const payload: Record<string, unknown> = { message: "at-pretty" };
+      Object.defineProperty(payload, "lazy", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          throw new Error("at-boom");
+        },
+      });
+      expect(() => {
+        const logger = createLogger({
+          moduleName: "at-pretty-test",
+          format: "pretty",
+          includeConsole: false,
+          includeFile: false,
+          includeGlobalFile: false,
+          additionalTransports: [
+            new winston.transports.Stream({ stream, format: winston.format.json(), eol: "\n" }),
+          ],
+        });
+        logger.info(payload);
+        teardownLogger(logger);
+      }).not.toThrow();
+      expect(out).toContain("at-pretty");
+      expect(out).not.toContain("at-boom");
+    });
+
+    it("json + a format-carrying additionalTransport: neutralize is added to the json chain, no crash", () => {
+      // The built-in json console is formatless (safe), but a caller-supplied
+      // format-carrying additionalTransport re-clones the info; neutralize is
+      // added to the json chain when such a transport exists.
+      const stream = new PassThrough();
+      let out = "";
+      stream.on("data", (chunk) => {
+        out += chunk.toString();
+      });
+      const payload: Record<string, unknown> = { message: "at-json" };
+      Object.defineProperty(payload, "lazy", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          throw new Error("at-boom-json");
+        },
+      });
+      expect(() => {
+        const logger = createLogger({
+          moduleName: "at-json-test",
+          format: "json",
+          includeConsole: false,
+          includeFile: false,
+          includeGlobalFile: false,
+          additionalTransports: [
+            new winston.transports.Stream({ stream, format: winston.format.json(), eol: "\n" }),
+          ],
+        });
+        logger.info(payload);
+        teardownLogger(logger);
+      }).not.toThrow();
+      expect(out).toContain("at-json");
+      expect(out).not.toContain("at-boom-json");
+    });
+
+    it("non-plain payload with a getter-only `timestamp` accessor does not crash and renders the captured instant", () => {
+      // buildTimestampCapture keeps a non-plain info in place (to preserve a
+      // DTO's toJSON / an array's arrayness), but must not crash writing
+      // `timestamp` when the instance exposes it as a getter-only/computed field
+      // (`class AuditEvent { get timestamp() {…} }`). It installs an OWN data
+      // property (shadowing the inherited getter) instead of assigning through
+      // it. Verified pre-fix: this threw `Cannot set property timestamp ... which
+      // has only a getter` out of logger.info().
+      class AuditEvent {
+        public message = "user login";
+        // A getter-only accessor is the whole point of this test (a readonly
+        // data field would not reproduce the "set on getter-only throws" crash),
+        // so the class-literal-property-style suggestion does not apply here.
+        // eslint-disable-next-line @typescript-eslint/class-literal-property-style
+        get timestamp(): string {
+          return "2024-immutable";
+        }
+      }
+      for (const format of ["pretty", "json"] as const) {
+        let out = "";
+        expect(() => {
+          out = renderStream({ moduleName: `ts-getter-${format}`, format }, (logger) =>
+            logger.info(new AuditEvent()),
+          );
+        }).not.toThrow();
+        // The CAPTURED instant renders, never the caller's computed getter value.
+        expect(out).toContain("user login");
+        expect(out).toContain(FIXED_TS);
+        expect(out).not.toContain("2024-immutable");
+      }
+    });
+
+    it("non-plain payload with a THROWING `timestamp` accessor does not crash (getter shadowed)", () => {
+      class ThrowingTs {
+        public message = "m";
+        get timestamp(): string {
+          throw new Error("ts boom");
+        }
+      }
+      let out = "";
+      expect(() => {
+        out = renderStream(
+          { moduleName: "ts-throw-json", format: "json", maskMetaKeys: ["password"] },
+          (logger) => logger.info(new ThrowingTs()),
+        );
+      }).not.toThrow();
+      expect(out).not.toContain("ts boom");
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed.message).toBe("m");
+      expect(parsed.timestamp).toBe(FIXED_TS);
+    });
+
+    it("non-plain payload with a non-configurable throwing `timestamp` accessor fails closed (write + read guards), no crash", () => {
+      // The exotic edge: an EXTENSIBLE non-plain instance (so winston's own
+      // `info[LEVEL]` write succeeds) with a NON-CONFIGURABLE own `timestamp`
+      // accessor that throws. `Object.defineProperty` cannot redefine it, so
+      // buildTimestampCapture's write catch leaves it in place, and
+      // formatMessage's `timestamp` read guard then falls back to a fresh
+      // timestamp instead of invoking the throwing getter. Exercises BOTH the
+      // defineProperty catch and the formatMessage timestamp read guard.
+      class LockedThrowingTs {
+        public message = "locked-msg";
+        constructor() {
+          Object.defineProperty(this, "timestamp", {
+            get() {
+              throw new Error("locked-ts-boom");
+            },
+            enumerable: true,
+            configurable: false,
+          });
+        }
+      }
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "ts-locked-pretty" }, (logger) =>
+          logger.info(new LockedThrowingTs()),
+        );
+      }).not.toThrow();
+      expect(out).toContain("[INFO] (ts-locked-pretty)");
+      expect(out).toContain("locked-msg");
+      expect(out).toContain("UTC:");
+      expect(out).not.toContain("locked-ts-boom");
+    });
+
+    it("hostile Error with an own enumerable throwing accessor does not crash pretty mode (errors() wrap)", () => {
+      // `logform/errors.js` flattens an Error via `Object.assign` over its OWN
+      // ENUMERABLE properties (`errors.js:16`), invoking a hostile own-enumerable
+      // getter and throwing at the FIRST format — before neutralizeCallerAccessors
+      // (which runs last) and every downstream guard, escaping out of
+      // `logger.error(...)`. `buildSafeErrorsFormat` wraps `errors()` the way
+      // `buildSafeJsonFormat` wraps `json()`: it degrades to a minimal flattening
+      // that preserves the readable message/stack and marks the degradation,
+      // instead of crashing. (An idiomatic PROTOTYPE getter is immune —
+      // `Object.assign` copies own props only — so this needs an OWN-instance
+      // accessor, e.g. one defined in the constructor.)
+      class HostileError extends Error {
+        constructor(m: string) {
+          super(m);
+          this.name = "HostileError";
+          Object.defineProperty(this, "detail", {
+            enumerable: true,
+            configurable: true,
+            get() {
+              throw new Error("detail boom");
+            },
+          });
+        }
+      }
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "err-hostile-pretty" }, (logger) =>
+          logger.error(new HostileError("pretty error msg")),
+        );
+      }).not.toThrow();
+      expect(out).toContain("[ERROR] (err-hostile-pretty)");
+      expect(out).toContain("pretty error msg");
+      expect(out).toContain("_errorFlattenFailed");
+      expect(out).not.toContain("detail boom");
+    });
+
+    it("hostile Error does not crash json mode; message/stack preserved on the degrade path", () => {
+      class HostileError extends Error {
+        constructor(m: string) {
+          super(m);
+          this.name = "HostileError";
+          Object.defineProperty(this, "detail", {
+            enumerable: true,
+            configurable: true,
+            get() {
+              throw new Error("detail boom");
+            },
+          });
+        }
+      }
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "err-hostile-json", format: "json" }, (logger) =>
+          logger.error(new HostileError("json error msg")),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed.level).toBe("error");
+      expect(parsed.message).toBe("json error msg");
+      expect(typeof parsed.stack).toBe("string");
+      expect(parsed.stack as string).toContain("HostileError");
+      expect(parsed._errorFlattenFailed).toBe(true);
+      expect(parsed.module).toBe("err-hostile-json");
+      expect(out).not.toContain("detail boom");
+    });
+
+    it("hostile Error passed as `message` on the 2-arg log form is flattened getter-safely", () => {
+      // errors.js:33 (`einfo.message instanceof Error`) does `Object.assign(einfo, err)`,
+      // the sibling crash site, reached via `logger.log("error", { message: err })`.
+      class HostileError extends Error {
+        constructor(m: string) {
+          super(m);
+          this.name = "HostileError";
+          Object.defineProperty(this, "detail", {
+            enumerable: true,
+            configurable: true,
+            get() {
+              throw new Error("detail boom");
+            },
+          });
+        }
+      }
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "err-hostile-2arg", format: "json" }, (logger) =>
+          logger.log("error", { message: new HostileError("2arg error msg") }),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed.level).toBe("error");
+      expect(parsed.message).toBe("2arg error msg");
+      expect(parsed._errorFlattenFailed).toBe(true);
+      expect(out).not.toContain("detail boom");
+    });
+
+    it("hostile Error with a throwing `stack` accessor degrades: message kept, stack dropped, no crash", () => {
+      // A DIFFERENT crash site inside `errors()`: a non-enumerable throwing `stack`
+      // accessor is skipped by `Object.assign` (line 16) but read directly by
+      // `errors.js:23` (`info.stack = einfo.stack`), so `errors()` throws there.
+      // The catch then re-reads `stack` defensively — exercising `safeReadFrom`'s
+      // own try/catch — and fails closed on that one field (stack dropped) while
+      // the readable message survives.
+      class StackThrower extends Error {
+        constructor(m: string) {
+          super(m);
+          this.name = "StackThrower";
+          Object.defineProperty(this, "stack", {
+            configurable: true,
+            enumerable: false,
+            get() {
+              throw new Error("stack boom");
+            },
+          });
+        }
+      }
+      let out = "";
+      expect(() => {
+        out = renderStream({ moduleName: "err-stack-throw", format: "json" }, (logger) =>
+          logger.error(new StackThrower("stack-thrower msg")),
+        );
+      }).not.toThrow();
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(parsed.level).toBe("error");
+      expect(parsed.message).toBe("stack-thrower msg");
+      expect(parsed.stack).toBeUndefined();
+      expect(parsed._errorFlattenFailed).toBe(true);
+      expect(out).not.toContain("stack boom");
+    });
+
+    it("a throwing `message` getter on the log()/2-arg form is caught by the errors() wrap (not a boundary)", () => {
+      // On the single-object LEVEL-METHOD form (`logger.error(obj)`) winston reads
+      // `.message` in create-logger.js BEFORE any format runs — an unavoidable
+      // boundary. But on the `logger.log(level, obj)` / 2-arg form the FIRST
+      // `.message` read happens INSIDE `logform/errors.js` (errors.js:28), which is
+      // now wrapped by buildSafeErrorsFormat — so a throwing `message` getter there
+      // degrades instead of crashing the caller. Pins the closed boundary the docs
+      // describe (the single-object form remains a documented winston-core boundary).
+      for (const format of ["pretty", "json"] as const) {
+        const payload: Record<string, unknown> = { data: 1 };
+        Object.defineProperty(payload, "message", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            throw new Error("msg boom");
+          },
+        });
+        let out = "";
+        expect(() => {
+          out = renderStream({ moduleName: `err-msg-2arg-${format}`, format }, (logger) =>
+            logger.log("error", payload),
+          );
+        }).not.toThrow();
+        expect(out).not.toContain("msg boom");
+        expect(out).toContain("_errorFlattenFailed");
+      }
+    });
+
+    it("bare-winston parity: the same hostile Error crashes bare winston + errors()+json, but not this logger", () => {
+      // Proves the crash is a real logform boundary (not an invented one) AND that
+      // buildSafeErrorsFormat closes it. Bare winston composing the SAME
+      // `errors({ stack: true }) + json()` throws synchronously out of `.error()`;
+      // this package's logger degrades instead.
+      class HostileError extends Error {
+        constructor(m: string) {
+          super(m);
+          this.name = "HostileError";
+          Object.defineProperty(this, "detail", {
+            enumerable: true,
+            configurable: true,
+            get() {
+              throw new Error("detail boom");
+            },
+          });
+        }
+      }
+      const bareStream = new PassThrough();
+      const bare = winston.createLogger({
+        transports: [new winston.transports.Stream({ stream: bareStream, eol: "\n" })],
+        format: winston.format.combine(
+          winston.format.errors({ stack: true }),
+          winston.format.json(),
+        ),
+      });
+      // Absorb any re-emitted error so a stray async event cannot crash the runner.
+      bare.on("error", () => undefined);
+      expect(() => bare.error(new HostileError("bare boom"))).toThrow();
+
+      expect(() => {
+        renderStream({ moduleName: "err-parity", format: "json" }, (logger) =>
+          logger.error(new HostileError("guarded")),
+        );
+      }).not.toThrow();
+    });
+
+    it("a NORMAL Error still flattens on the happy path (no degradation marker)", () => {
+      // Regression guard: the wrapper delegates to the real `errors()` for every
+      // non-hostile Error, so normal Error logging is unchanged and carries NO
+      // `_errorFlattenFailed` marker — the happy path is byte-identical to the
+      // un-wrapped format.
+      for (const format of ["pretty", "json"] as const) {
+        let out = "";
+        expect(() => {
+          out = renderStream({ moduleName: `err-normal-${format}`, format }, (logger) =>
+            logger.error(new Error("ordinary failure")),
+          );
+        }).not.toThrow();
+        expect(out).toContain("ordinary failure");
+        expect(out).not.toContain("_errorFlattenFailed");
+      }
     });
 
     it("16.5 buildTimestampCapture copy-on-writes a null-prototype info without mutating it", () => {
@@ -5867,6 +6559,16 @@ describe("createLogger", () => {
       expect(parsed.module).toBe("api");
       expect(parsed.password).toBe("[REDACTED]");
       expect(parsed.userId).toBe(42);
+    });
+
+    it('maskMetaKeys: ["module"] redacts the injected module field', () => {
+      // The injector runs BEFORE buildMetaRedactor, so the stamped `module` field
+      // is an ordinary metadata key the redactor threads through — masking
+      // "module" must replace the label with [REDACTED], an opt-in the operator
+      // controls. Guards against a future regression that adds "module" to
+      // RESERVED_INFO_KEYS (which would let it bypass the mask check).
+      const parsed = parseJson("api", (logger) => logger.info("hi"), ["module"]);
+      expect(parsed.module).toBe("[REDACTED]");
     });
 
     it("boundary: a single-object toJSON DTO line carries NO module field (toJSON owns the line)", () => {

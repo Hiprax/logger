@@ -742,7 +742,32 @@ const buildTimestampCapture = (clock: () => Date) =>
       next.timestamp = timestamp;
       return next as unknown as winston.Logform.TransformableInfo;
     }
-    info.timestamp = timestamp;
+    // Non-plain infos (arrays, class / `toJSON` DTOs) keep an in-place write to
+    // preserve their exact shape and prototype (a plain rebuild would strip an
+    // array's arrayness or a DTO's `toJSON`). But a bare `info.timestamp = …`
+    // assignment THROWS in strict mode when the caller's instance exposes
+    // `timestamp` as a getter-only accessor — an idiomatic immutable/computed
+    // field (`class AuditEvent { get timestamp() { … } }`) — escaping out of the
+    // caller's own log call. Define an OWN data property instead: it shadows an
+    // inherited getter without invoking it and converts an own configurable
+    // accessor to data, so downstream reads see the captured value rather than a
+    // live (possibly throwing) accessor. Wrapped so an exotic non-configurable
+    // own accessor degrades to leaving the caller's object untouched (downstream
+    // falls back to a fresh timestamp) rather than crashing. A genuinely
+    // non-extensible (frozen) payload has already crashed at winston's own
+    // `info[LEVEL]` write, before any format runs — the unavoidable winston-core
+    // boundary, not this write.
+    try {
+      Object.defineProperty(info, "timestamp", {
+        value: timestamp,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    } catch {
+      // Non-configurable own `timestamp` accessor/data property — cannot install
+      // the captured value; leave the caller's object as-is.
+    }
     return info;
   })();
 
@@ -951,10 +976,13 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
     const next: Record<string | symbol, unknown> = {};
     if (resolveFailed) {
       // `level` is winston's own write. `message` is a caller slot, so reading
-      // it can in principle re-enter caller code — but `errors.js:28` reads
-      // `.message` on this same object on every reachable path before this
-      // format runs, so a getter that throws on read has already detonated
-      // upstream. Keeping the line identifiable is worth that narrow residual.
+      // it can in principle re-enter caller code — but a throwing `message`
+      // getter is never live by the time this format runs: on the single-object
+      // level-method form winston reads `.message` (`create-logger.js`) before
+      // any format and it detonates there; on the `log()` / 2-arg form
+      // `errors.js:28` reads it inside `buildSafeErrorsFormat`, which catches the
+      // throw and resolves the slot. Keeping the line identifiable is worth the
+      // narrow residual of re-reading a non-throwing getter.
       next.level = source.level;
       next.message = source.message;
       next._redactionFailed = true;
@@ -980,7 +1008,22 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
         continue;
       }
       if (RESERVED_INFO_KEYS.has(key)) {
-        next[key] = subject[key];
+        // Reserved slots are copied unredacted — but the copy READS
+        // `subject[key]`, and a caller can supply a throwing accessor on a
+        // reserved key that no upstream format neutralized. `level` is
+        // winston-written, `timestamp` is the data property the capture wrote,
+        // and a throwing `message` getter is never live here (it detonates at
+        // winston-core on the single-object level-method form, or is caught by
+        // `buildSafeErrorsFormat` on the `log()` / 2-arg form) — but a non-`Error`
+        // payload can carry a throwing `stack` accessor (`logger.info({ message,
+        // get stack() { throw } })`, format `"json"` + `maskMetaKeys`), which
+        // would otherwise escape out of `logger.log()` (verified by probe).
+        // Guard the read and fail closed on this key only.
+        try {
+          next[key] = subject[key];
+        } catch {
+          next[key] = REDACTION_FAILED;
+        }
         continue;
       }
       if (maskMetaKeys.has(key.toLowerCase())) {
@@ -1032,9 +1075,12 @@ const MODULE_FIELD = "module";
  * that produced it. JSON mode previously carried no module identifier at all,
  * defeating the shared file for the structured-shipping audience it exists to
  * serve. Added ONLY to the json branch, and only to the logger-level
- * `sharedFormat` (the Console transport inherits the field through winston's
- * shallow clone — see the chain-construction comment); the pretty chain already
- * renders the label positionally.
+ * `sharedFormat` (the json-mode Console transport carries no per-transport
+ * format, so `winston-transport`'s `_write` emits this `sharedFormat`'s
+ * already-serialized `info[MESSAGE]` — the field is baked into that string, so
+ * console and file agree with no console-side re-serialization; see the
+ * chain-construction comment); the pretty chain already renders the label
+ * positionally.
  *
  * Contract (mirrors `buildMetaRedactor`'s caller-safety discipline):
  *
@@ -1205,16 +1251,186 @@ const buildSafeJsonFormat = (): winston.Logform.Format => {
       return jsonFormat.transform(info, jsonFormat.options);
     } catch {
       const source = info as unknown as Record<string | symbol, unknown>;
+      // This catch IS the total-json safety net, so it must never itself throw.
+      // Every field it reads can, in the limit, be a caller-supplied throwing
+      // accessor that survived to here: `module` because `buildModuleFieldInjector`
+      // leaves a caller's own `module` key untouched (the no-mask default), and
+      // `timestamp` because an exotic non-configurable `timestamp` accessor can
+      // survive `buildTimestampCapture` — and such a getter is exactly what can
+      // make `json()` throw and land us in this catch. (`level` is winston-written
+      // by this point, but is read through the same guard for uniformity.)
+      // Reading any of them unguarded would re-throw the very exception this catch
+      // exists to contain, escaping out of `logger.log()` and defeating the
+      // total-json guarantee (verified by probe). Guard every read.
+      const safeRead = (key: string | symbol): unknown => {
+        try {
+          return source[key];
+        } catch {
+          return undefined;
+        }
+      };
       source[MESSAGE_SLOT] = safeStringify({
-        level: source.level,
-        timestamp: source.timestamp,
-        module: source[MODULE_FIELD],
+        level: safeRead("level"),
+        timestamp: safeRead("timestamp"),
+        module: safeRead(MODULE_FIELD),
         [JSON_SERIALIZE_FAILED]: true,
       });
       return info;
     }
   })();
 };
+
+/** Marker key stamped on a line whose Error could not be flattened getter-safely. */
+const ERROR_FLATTEN_FAILED = "_errorFlattenFailed";
+
+/**
+ * Wraps `winston.format.errors({ stack: true })` so a throw while flattening a
+ * hostile Error degrades to a minimal, defensively-read flattening instead of
+ * propagating out of `logger.log()`.
+ *
+ * `logform/errors.js` flattens an Error via `Object.assign` over the Error's OWN
+ * ENUMERABLE properties (`errors.js:16` for an `Error` info; `errors.js:33` for a
+ * `message`-is-`Error` info), which INVOKES every own enumerable getter. A
+ * caller-supplied Error carrying an own enumerable THROWING accessor — e.g.
+ * `Object.defineProperty(this, "detail", { enumerable: true, get() { throw } })`
+ * in a constructor, a real lazy-field / ORM-error pattern — therefore throws
+ * synchronously at this FIRST format, before `neutralizeCallerAccessors` (which
+ * runs last) and before every downstream guard, escaping out of the caller's own
+ * `logger.error(...)` in BOTH format modes and the default config. (An idiomatic
+ * ES-class `get x() {}` lives on the prototype, and `Object.assign` copies own
+ * properties only, so ordinary Error subclasses are unaffected.)
+ *
+ * This is exact bare-winston parity — but `errors()` is a format THIS package
+ * composes, so it is closed exactly the way the json serializer is (see
+ * {@link buildSafeJsonFormat}): the happy path delegates to the real `errors()`
+ * transform UNCHANGED, so output is byte-identical for every non-hostile Error
+ * and normal Error logging is untouched; only this catch — which today fires on
+ * nothing but an otherwise-unconditional crash — degrades. The Error's `message`
+ * and `stack` (the highest-value fields) are preserved when individually
+ * readable; only the hostile own field(s) are dropped, and an
+ * `_errorFlattenFailed: true` marker records the degradation. A log call must
+ * never take the process down.
+ */
+const buildSafeErrorsFormat = (): winston.Logform.Format => {
+  const errorsFormat = winston.format.errors({ stack: true });
+  return winston.format((info) => {
+    try {
+      return errorsFormat.transform(info, errorsFormat.options);
+    } catch {
+      const source = info as unknown as Record<string | symbol, unknown>;
+      // Never let the safety net itself throw: every read below is a
+      // caller-controlled value that may be a throwing accessor, so the read is
+      // wrapped — a throw, OR a null/undefined target, fails closed to undefined
+      // (reading a key off null/undefined throws a TypeError the catch absorbs, so
+      // no separate nullish guard is needed).
+      const safeReadFrom = (obj: unknown, key: string): unknown => {
+        try {
+          return (obj as Record<string, unknown>)[key];
+        } catch {
+          return undefined;
+        }
+      };
+      // The Error is `info` itself (single-object form, `logger.error(err)`) or
+      // `info.message` (the `log()` / 2-arg form, `logger.log("error", { message: err })`).
+      const errObj = info instanceof Error ? info : safeReadFrom(info, "message");
+      const next: Record<string | symbol, unknown> = {
+        level: safeReadFrom(info, "level"),
+        // The Error's message and stack are the highest-value fields; preserve them
+        // when individually readable (a throwing accessor on either fails closed to
+        // undefined, dropping only that field, never the whole line).
+        message: safeReadFrom(errObj, "message"),
+        stack: safeReadFrom(errObj, "stack"),
+        [ERROR_FLATTEN_FAILED]: true,
+      };
+      // Carry the engine Symbol slots (`LEVEL` gates transport level-filtering;
+      // `MESSAGE` / `SPLAT` for downstream) exactly as every other rebuild in this
+      // pipeline does; the downstream serializer overwrites `MESSAGE` regardless.
+      for (const slot of Object.getOwnPropertySymbols(source)) {
+        next[slot] = source[slot];
+      }
+      return next as unknown as winston.Logform.TransformableInfo;
+    }
+  })();
+};
+
+/**
+ * Resolves every caller-supplied own ENUMERABLE accessor on the info to a plain
+ * data value (getter-safe) so a format-carrying transport's re-clone cannot
+ * crash the caller.
+ *
+ * `winston-transport` re-runs a transport's OWN format over
+ * `Object.assign({}, info)` and then **re-throws** any error that produced
+ * (`modern.js` `_write`: `if (errState) throw errState`). `Object.assign`
+ * INVOKES every enumerable own getter — so a caller-supplied throwing accessor
+ * (a hostile getter, or a realistic lazy / ORM getter that throws out of
+ * context) that survived the logger-level chain crashes the caller's own
+ * `logger.info(...)` at the CONSOLE transport, the built-in format-carrying
+ * transport in pretty mode. The logger-level formats are each getter-safe on
+ * their own, but they leave the caller's live accessors on the info that fans
+ * out to the transports, and the console's clone re-invokes them.
+ *
+ * It runs LAST in the logger-level chain — AFTER the mode's own serializer has
+ * already produced `info[MESSAGE]` (pretty: `formatMessage`; json:
+ * `buildSafeJsonFormat`), so the file / console-MESSAGE output is unchanged —
+ * and only when a format-carrying transport actually exists (see
+ * `hasFormatCarryingAdditionalTransport` and the per-branch wiring). It rebuilds
+ * the info with each own enumerable accessor replaced by its resolved value (a
+ * throwing accessor fails closed to `undefined`), data properties and the engine
+ * Symbol slots carried across by reference, and `FORBIDDEN_KEYS` skipped (the
+ * same prototype-pollution guard every fresh rebuild in this pipeline applies).
+ * The format-carrying transport then re-renders from accessor-free data.
+ *
+ * This covers EVERY format-carrying transport the logger can fan out to: the
+ * pretty-mode built-in Console, and any caller-supplied `additionalTransports`
+ * entry that sets its own `format` (in BOTH pretty and json mode). The json-mode
+ * built-in Console is formatless (it reads the serialized `info[MESSAGE]`), so it
+ * needs no neutralization. A logger with NO format-carrying transport skips this
+ * format entirely, preserving the Phase 16 hot-path win.
+ *
+ * The only remaining crash of this class is the unavoidable winston-CORE
+ * boundary, reached strictly BEFORE any composed format runs and therefore
+ * unfixable without forking winston or dropping those call forms: a throwing
+ * `message` getter on the single-object LEVEL-METHOD form (`logger.error(obj)`,
+ * where `create-logger.js` reads `msg.message` before any format runs) — NOT on
+ * the `log()` / 2-arg form, whose first `.message` read is inside
+ * `logform/errors.js`, now wrapped by {@link buildSafeErrorsFormat} and therefore
+ * caught, not a boundary; a throwing metadata getter on the multi-arg
+ * `logger.info(msg, meta)` form (winston merges the meta via `Object.assign` in
+ * `logger.js` before any format); a getter-only `level`; or a frozen/non-extensible
+ * payload (winston writes `level` / `info[LEVEL]` onto the caller's object). A
+ * hostile Error whose OWN ENUMERABLE accessor throws when `logform/errors.js`
+ * flattens it via `Object.assign` is likewise NOT on this list — that crash
+ * happens INSIDE a package-composed format, so it too is closed by
+ * {@link buildSafeErrorsFormat} (which wraps `errors()` the way
+ * {@link buildSafeJsonFormat} wraps `json()`), not left to the caller.
+ */
+const neutralizeCallerAccessors = winston.format((info) => {
+  const source = info as unknown as Record<string | symbol, unknown>;
+  const next: Record<string | symbol, unknown> = {};
+  for (const key of Object.keys(source)) {
+    if (FORBIDDEN_KEYS.has(key)) {
+      continue;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    if (descriptor) {
+      if (descriptor.get !== undefined || descriptor.set !== undefined) {
+        try {
+          next[key] = source[key];
+        } catch {
+          // A throwing caller accessor fails closed rather than crashing the
+          // format-carrying transport's re-clone.
+          next[key] = undefined;
+        }
+      } else {
+        next[key] = descriptor.value;
+      }
+    }
+  }
+  for (const slot of Object.getOwnPropertySymbols(source)) {
+    next[slot] = source[slot];
+  }
+  return next as unknown as winston.Logform.TransformableInfo;
+})();
 
 const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
   winston.format.printf((info) => {
@@ -1231,7 +1447,27 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
     // The strip pattern matches the full ANSI SGR sequence (`\x1b[<digits>m`);
     // the leading `\x1b` (ESC, 0x1B) is required so the regex actually removes
     // the codes instead of leaving the bare ESC byte behind.
-    const rawLevel = typeof info.level === "string" ? info.level : "info";
+    // Reserved-slot values are read through this guard because a caller can
+    // supply a THROWING accessor on a reserved key that survives to the printf:
+    // `stack` on a non-`Error` payload (`errors()` only touches it for an actual
+    // `Error`), a `timestamp` accessor that survived `buildTimestampCapture`'s
+    // `defineProperty` (an exotic non-configurable one), and `level` defined as a
+    // throwing getter WITH a setter (winston's `info.level = level` runs the
+    // setter and leaves the accessor live, so it passes winston-core). Unguarded,
+    // any such read would throw out of the caller's own `logger.info(...)`
+    // (verified by probe). `message` is NOT routed here — a throwing `message`
+    // getter is never live by the time this printf runs: it detonates at
+    // winston-core on the single-object level-method form, or is caught by
+    // `buildSafeErrorsFormat` on the `log()` / 2-arg form. Fail closed.
+    const readReserved = (key: string): unknown => {
+      try {
+        return (info as Record<string, unknown>)[key];
+      } catch {
+        return undefined;
+      }
+    };
+    const rawLevelValue = readReserved("level");
+    const rawLevel = typeof rawLevelValue === "string" ? rawLevelValue : "info";
     const strippedLevel = rawLevel.replace(/\x1b\[[0-9;]*m/g, "");
     const level = strippedLevel.toUpperCase();
     const label = ctx.label;
@@ -1269,7 +1505,43 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
       escapeMessageNewlines ? value.replace(/\r/g, "\\r").replace(/\n/g, "\\n") : value;
     const message = typeof info.message === "string" ? escapeIfEnabled(rawMessage) : rawMessage;
 
-    const { stack, level: _level, message: _msg, timestamp: capturedTimestamp, ...metadata } = info;
+    // `stack` and `timestamp` are read through the same `readReserved` guard: on
+    // a throwing accessor the stack line is omitted and the timestamp falls back
+    // to a fresh `moment.utc()` read, rather than crashing the caller.
+    const stack = readReserved("stack");
+    const capturedTimestamp = readReserved("timestamp");
+    // Build the metadata bag WITHOUT invoking any caller getters. A rest
+    // destructure (`...metadata`) would read every remaining own-enumerable
+    // property to snapshot its value — and a metadata value can be a
+    // caller-supplied getter, i.e. caller code that may throw. That read sits
+    // ahead of (and OUTSIDE) the redaction try/catch below, so a throwing
+    // getter would escape the printf and be thrown out of the caller's own
+    // `logger.info(...)` — the same caller-crash class `buildTimestampCapture`
+    // (copy-on-write, descriptor copy) and the json chain's `buildSafeJsonFormat`
+    // already close (verified by probe: a `{ get token() { throw } }` payload
+    // crashed pretty mode). Transplanting each own property by DESCRIPTOR keeps
+    // the getter lazy, so it is invoked only later — inside the guarded
+    // `redactValue` call (fails closed to `{ _redactionFailed: true }`) or
+    // `safeStringify` (fails closed to the `UNSERIALIZABLE` sentinel) — never
+    // here. `timestamp` is extracted by name above (a data property written by
+    // the capture) and `stack` is read defensively above; `level` and `message`
+    // are read elsewhere (`info.level` / `info.message` directly) and skipped in
+    // the loop below; a throwing `message` getter is never live by the time this
+    // printf runs (it detonates at winston-core on the single-object level-method
+    // form, or is caught by `buildSafeErrorsFormat` on the `log()` / 2-arg form —
+    // see the reserved-slot boundary). Symbol slots (`MESSAGE` / `LEVEL` / `SPLAT`) are
+    // excluded by `Object.keys`, matching the old rest destructure's effect on
+    // output (JSON.stringify ignores symbols).
+    const metadata: Record<string, unknown> = {};
+    for (const key of Object.keys(info)) {
+      if (key === "stack" || key === "level" || key === "message" || key === "timestamp") {
+        continue;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(info, key);
+      if (descriptor) {
+        Object.defineProperty(metadata, key, descriptor);
+      }
+    }
     // When the consumer configured `maskMetaKeys`, deep-redact the metadata
     // BEFORE serialization so secrets never reach the log line. The redaction
     // is purely functional (returns a fresh object), so the original `info`
@@ -1773,6 +2045,20 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
       ? new Set<string>(maskMetaKeys.map((key) => key.toLowerCase()))
       : undefined;
 
+  // A format-carrying transport makes `winston-transport` re-run that format
+  // over `Object.assign({}, info)` and RE-THROW on error (`modern.js`), which
+  // invokes every enumerable own getter — so a caller-supplied throwing accessor
+  // that survived the getter-safe logger-level chain would crash `logger.log()`
+  // there. `neutralizeCallerAccessors` resolves those accessors to data before
+  // the info fans out to the transports; it is only needed when such a transport
+  // exists. The pretty-mode built-in Console is format-carrying (handled per
+  // branch below); the json-mode Console is formatless (it reuses the serialized
+  // `info[MESSAGE]`) so it does NOT count. A caller-supplied `additionalTransports`
+  // entry that sets its OWN `format` counts in BOTH modes.
+  const hasFormatCarryingAdditionalTransport = additionalTransportsCopy.some(
+    (transport) => (transport as { format?: unknown }).format != null,
+  );
+
   let sharedFormat: winston.Logform.Format;
   // Undefined in json mode: the Console transport carries no per-transport
   // format there and reuses the logger-level `sharedFormat`'s output (see below).
@@ -1809,19 +2095,29 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     // clock-once and console==file guarantees structural: there is no second
     // format to re-read the clock or re-serialize, so the console cannot diverge
     // from the file.
-    sharedFormat = winston.format.combine(
-      winston.format.errors({ stack: true }),
+    const jsonPieces: winston.Logform.Format[] = [
+      buildSafeErrorsFormat(),
       timestampCapture,
       buildModuleFieldInjector(label),
       buildMetaRedactor(maskMetaKeySet),
       buildSafeJsonFormat(),
-    );
+    ];
+    if (hasFormatCarryingAdditionalTransport) {
+      // The built-in json Console is formatless and reads the already-serialized
+      // `info[MESSAGE]`, so it is safe — but a caller-supplied format-carrying
+      // `additionalTransport` re-clones the info (`Object.assign`) and re-throws,
+      // so resolve caller accessors to data first. Runs LAST, after
+      // `buildSafeJsonFormat` set `info[MESSAGE]`, so the console line is unchanged.
+      jsonPieces.push(neutralizeCallerAccessors);
+    }
+    sharedFormat = winston.format.combine(...jsonPieces);
     consoleFormat = undefined;
   } else {
     // Pretty branch — preserves the existing human-readable printf output
-    // for backward compatibility. `errors({ stack: true })` runs FIRST so a
-    // logged Error is flattened to a plain object (with own-enumerable
-    // `message` / `stack`) before `timestampCapture` copy-on-writes it; the
+    // for backward compatibility. `buildSafeErrorsFormat()` (the getter-safe
+    // `errors({ stack: true })` wrapper) runs FIRST so a logged Error is flattened
+    // to a plain object (with own-enumerable `message` / `stack`) before
+    // `timestampCapture` copy-on-writes it; the
     // capture sets `info.timestamp` at log-call time via the single `clock()`
     // call, and the printf in `formatMessage` prefers that captured value over a
     // live `moment.utc()` read. All formats run synchronously in one
@@ -1831,11 +2127,25 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
       maskMetaKeys: maskMetaKeySet,
       escapeMessageNewlines,
     });
-    sharedFormat = winston.format.combine(
-      winston.format.errors({ stack: true }),
+    // When the console transport is present it re-runs its own format over
+    // `Object.assign({}, info)` (winston-transport), which invokes every
+    // enumerable own getter and RE-THROWS on error — so a caller-supplied
+    // throwing accessor would crash `logger.info(...)` there even though the
+    // logger-level formats above are each getter-safe. `neutralizeCallerAccessors`
+    // runs LAST (after `fileFormat` set `info[MESSAGE]`, so the file output is
+    // unchanged) to resolve those accessors to data before the info fans out to
+    // the transports. Only added when a console exists — a file-only logger has
+    // no format-carrying transport, so it pays nothing and keeps the hot-path
+    // win from Phase 16.
+    const prettyPieces: winston.Logform.Format[] = [
+      buildSafeErrorsFormat(),
       timestampCapture,
       fileFormat,
-    );
+    ];
+    if (includeConsole || hasFormatCarryingAdditionalTransport) {
+      prettyPieces.push(neutralizeCallerAccessors);
+    }
+    sharedFormat = winston.format.combine(...prettyPieces);
     // `winston.format.colorize()` returns a Format-shaped object that ALSO
     // exposes a public `colorize(level, message)` helper used to wrap an
     // arbitrary string in the ANSI codes for a given level. We use that
@@ -1929,7 +2239,17 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     // handle on shutdown, never the shared transport other loggers still use.
     registerTransport(
       acquireSharedGlobalFile({
-        key: globalFilename,
+        // Normalize the shared-file registry key the SAME way the module
+        // registry key is (`buildRegistryKey` — Windows-only lowercase, POSIX
+        // identity). Without this the shared-file registry keyed on the raw
+        // `globalFilename`, so on a case-insensitive filesystem two loggers
+        // whose `globalModuleName` differs only in case ("SharedLog" vs
+        // "sharedlog") opened TWO independent `DailyRotateFile` rotators on ONE
+        // physical file — the exact "two rotators renaming/pruning each other"
+        // bug the module registry avoids. `createTransport` still receives the
+        // original-case `globalFilename` for the actual file path, so only the
+        // registry-equality key is folded, never the on-disk name.
+        key: buildRegistryKey(globalFilename),
         level,
         rotationSignature: JSON.stringify(resolvedGlobalRotation),
         createTransport: () =>
