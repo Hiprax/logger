@@ -3479,6 +3479,70 @@ describe("createLogger", () => {
       expect(exitFn).not.toHaveBeenCalled();
     });
 
+    it("makes the exit decision independent of creation order (opt-out honored either way)", async () => {
+      // Two loggers: one opts out, one keeps the default (exit). Whichever is
+      // created first wins the primary election — but the exit decision must be
+      // the SAME in both orders. Before the fix `onFatal` consulted only the
+      // elected primary's policy, so swapping the creation order of these two
+      // unrelated loggers flipped whether the process exited.
+
+      // Order 1: the opt-out logger is created first, so it is elected primary.
+      makeCaptureLogger("crash-order-optout-first", { exitOnUncaught: false });
+      makeCaptureLogger("crash-order-default-first"); // default exitOnUncaught: true
+      const primaryOrder1 = __crashCaptureInternals.getPrimaryEntry();
+      __crashCaptureInternals.invokeUncaught(new Error("fatal-order-1"));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // Fresh coordinator, swapped order: the default (exit) logger is created
+      // first, so it is elected primary this time.
+      resetLoggerRegistry();
+      makeCaptureLogger("crash-order-default-second"); // default true, elected primary
+      makeCaptureLogger("crash-order-optout-second", { exitOnUncaught: false });
+      const primaryOrder2 = __crashCaptureInternals.getPrimaryEntry();
+      __crashCaptureInternals.invokeUncaught(new Error("fatal-order-2"));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // A DIFFERENT logger was elected primary in each order...
+      expect(primaryOrder1?.[0]).toBeDefined();
+      expect(primaryOrder2?.[0]).toBeDefined();
+      expect(primaryOrder1?.[0]).not.toBe(primaryOrder2?.[0]);
+      // ...yet the exit decision is identical: the explicit opt-out vetoes the
+      // exit in BOTH orders, so the process never exits.
+      expect(exitFn).not.toHaveBeenCalled();
+    });
+
+    it("a non-primary logger's opt-out vetoes the exit the elected primary would have taken", async () => {
+      // The elected primary keeps the default (exit); an unrelated logger opts
+      // out afterwards. The opt-out must still win — this is the exact case the
+      // old primary-only decision got wrong (it exited, silently ignoring the
+      // documented per-logger opt-out).
+      const { stub: primaryStub } = makeCaptureLogger("crash-veto-primary"); // default true, elected
+      makeCaptureLogger("crash-veto-optout", { exitOnUncaught: false });
+
+      __crashCaptureInternals.invokeUncaught(new Error("vetoed"));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // The crash is still recorded exactly once, through the elected primary:
+      // consensus governs only whether to EXIT, never where the crash is logged.
+      expect(primaryStub.log).toHaveBeenCalledTimes(1);
+      // The process does NOT exit: a single opt-out vetoes the whole process.
+      expect(exitFn).not.toHaveBeenCalled();
+    });
+
+    it("still exits when every registered logger keeps the default exit policy", async () => {
+      // Consensus over multiple loggers that all allow exit must still exit; the
+      // veto only fires on an explicit opt-out, so an all-default fleet is
+      // unaffected.
+      makeCaptureLogger("crash-consensus-exit-a"); // default exitOnUncaught: true
+      makeCaptureLogger("crash-consensus-exit-b"); // default exitOnUncaught: true
+
+      __crashCaptureInternals.invokeUncaught(new Error("all-agree-exit"));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(exitFn).toHaveBeenCalledTimes(1);
+      expect(exitFn).toHaveBeenCalledWith(1);
+    });
+
     it("re-elects a new primary after the current primary is shut down", async () => {
       const { logger: loggerA, stub: stubA } = makeCaptureLogger("crash-reelect-a", {
         exitOnUncaught: false,
@@ -3826,6 +3890,30 @@ describe("createLogger", () => {
 
         // Nothing better exists, so the exit policy is still honored via it.
         expect(empty.log as unknown as jest.Mock).toHaveBeenCalledTimes(1);
+      });
+
+      it("counts a transport-less opt-out toward the exit veto", async () => {
+        // The exit vote concerns process lifetime, not persistence, so it reads
+        // the raw `registered` map rather than `getPrimaryEntry`'s writable-only
+        // view: a logger with zero transports (skipped during primary election)
+        // still votes. Here a writable default-exit logger is elected primary
+        // while a transport-less logger opts out — the opt-out must still veto.
+        const { stub: primaryStub } = makeCaptureLogger("crash-vote-writable"); // default true, elected
+        const optOutNoTransports = fakeLogger({ transports: [] });
+        __crashCaptureInternals.registerCrashCapture(optOutNoTransports, {
+          exitOnUncaught: false,
+          hasFileTransport: false,
+        });
+
+        __crashCaptureInternals.invokeUncaught(new Error("transport-less-veto"));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        // The writable logger is elected and records the crash...
+        expect(primaryStub.log).toHaveBeenCalledTimes(1);
+        // ...the transport-less logger records nothing (it was not elected)...
+        expect(optOutNoTransports.log as unknown as jest.Mock).not.toHaveBeenCalled();
+        // ...but its opt-out still counts toward the vote, vetoing the exit.
+        expect(exitFn).not.toHaveBeenCalled();
       });
 
       it("routes through the real process.exit when no exit fn is injected", async () => {

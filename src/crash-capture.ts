@@ -19,9 +19,12 @@ import { flushSharedFileTransportsForExit } from "./shared-file-transport";
  * instead of asking winston to install its own handler; the flags are never
  * set on any transport, so winston installs **zero** process listeners. When a
  * fatal event fires, the crash is recorded **once** through a single elected
- * logger (the {@link getPrimaryEntry primary}) and — unless the primary opted out —
- * the process is flushed and terminated with exit code `1`, restoring Node's
- * default crash-on-fatal semantics.
+ * logger (the {@link getPrimaryEntry primary}) and — unless **any** registered
+ * logger opted out (`exitOnUncaught: false`) — the process is flushed and
+ * terminated with exit code `1`, restoring Node's default crash-on-fatal
+ * semantics. The exit decision is a consensus, not the primary's alone: a
+ * process has a single lifetime, so one explicit opt-out vetoes the exit for
+ * all of it (see {@link onFatal}).
  *
  * ## Instance scope
  *
@@ -40,10 +43,16 @@ interface CrashCapturePolicy {
    */
   hasFileTransport: boolean;
   /**
-   * When `true` (the default), a fatal event routed through this logger — when
-   * it is the elected primary — flushes the logger and terminates the process
-   * with exit code `1` after the crash is logged. When `false`, the crash is
-   * logged and the process is left running (the pre-v1.0.0 "limp on" behavior).
+   * Votes on the process-level exit decision after a captured fatal. The
+   * decision is a **consensus** over every registered logger, not this policy
+   * alone: the process exits with code `1` only when EVERY registered logger's
+   * `exitOnUncaught` is `true` (the default). A single `false` on any registered
+   * logger vetoes the exit, leaving the process running (the pre-v1.0.0 "limp
+   * on" behavior) — because a process has one lifetime, so a per-logger opt-out
+   * can only mean "keep the whole process alive". This vote is independent of
+   * primary election: election decides only where the crash is recorded, never
+   * whether to exit. A logger that wants no say at all uses
+   * `captureUncaught: false`, which never registers here.
    */
   exitOnUncaught: boolean;
 }
@@ -229,16 +238,17 @@ const flushThenExit = (logger: winston.Logger): void => {
 
 /**
  * Records the crash through the elected primary logger exactly once, then —
- * when the primary opted into exit semantics — flushes and terminates the
- * process. Never throws: logging must not turn a recoverable capture into a
- * hard crash-in-the-crash-handler.
+ * when the consensus over every registered logger allows it (every registered
+ * `exitOnUncaught` is `true`) — flushes and terminates the process. A single
+ * opt-out anywhere vetoes the exit. Never throws: logging must not turn a
+ * recoverable capture into a hard crash-in-the-crash-handler.
  */
 const onFatal = (kind: "uncaughtException" | "unhandledRejection", err: unknown): void => {
   const primaryEntry = getPrimaryEntry();
   if (!primaryEntry) {
     return;
   }
-  const [primary, policy] = primaryEntry;
+  const [primary] = primaryEntry;
 
   // `exceptions.getAllInfo` / `rejections.getAllInfo` are public winston APIs
   // (declared in winston's shipped typings) and pure — they build the full
@@ -282,9 +292,24 @@ const onFatal = (kind: "uncaughtException" | "unhandledRejection", err: unknown)
     // exception thrown from inside the process fatal-event listener.
   }
 
-  // The primary's policy governs the process-level exit decision; `exiting`
-  // latches so a second fatal during the flush window cannot race a second exit.
-  if (!policy.exitOnUncaught || exiting) {
+  // The process-level exit decision is a CONSENSUS over every registered
+  // logger's policy, not the elected primary's alone. `exitOnUncaught` is
+  // documented as a per-logger opt-out that keeps the process running, and a
+  // process can only exit once — so any single explicit opt-out must veto the
+  // exit for the WHOLE process, independent of which logger happens to win the
+  // primary election (election governs only WHERE the crash is recorded, via
+  // `getPrimaryEntry`, so that decision must not also decide process lifetime —
+  // that coupling is exactly what made a documented opt-out silently depend on
+  // an unrelated logger's creation order). We therefore exit only when every
+  // registered policy allows it. The raw `registered` map is read rather than
+  // `getPrimaryEntry`'s writable-only view: the vote concerns process lifetime,
+  // not whether a given logger can PERSIST the crash, so a transport-less logger
+  // that opted out still counts. `registered` is non-empty here (an empty map
+  // makes `getPrimaryEntry()` return `undefined`, short-circuiting above), so
+  // `every` never reports the vacuous-true of an empty set. `exiting` latches so
+  // a second fatal during the flush window cannot race a second exit.
+  const allowExit = [...registered.values()].every((policy) => policy.exitOnUncaught);
+  if (!allowExit || exiting) {
     return;
   }
   exiting = true;

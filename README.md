@@ -581,6 +581,8 @@ createLogger({ moduleName: "auth", exitOnUncaught: false }); // log the fatal, k
 createLogger({ moduleName: "auth", captureUncaught: false }); // don't participate at all
 ```
 
+A process has a single lifetime, so the exit decision is a **consensus**: the process exits only when every registered logger allows it. A single `exitOnUncaught: false` on **any** logger therefore keeps the whole process running after a captured fatal, regardless of which logger records the crash or the order the loggers were created in. (The crash is still recorded once, through the elected file-backed logger — recording where a crash lands and deciding whether to exit are independent.) A component that wants no say in process lifetime, and no crash recording either, should use `captureUncaught: false` so it never participates.
+
 **Custom transports.** The guarantee holds unconditionally, so an `additionalTransports` entry that sets winston's `handleExceptions` / `handleRejections` has both flags cleared (with a one-time warning). Those flags are what make winston install a listener **per logger**, and leaving them set would both re-create the warning above and log every crash twice.
 
 This does change where crashes land, so it is worth stating plainly: because a crash is recorded **once, through the elected logger**, a transport receives crashes only if it belongs to that logger. If you have a dedicated crash sink (Sentry, an HTTP transport) that previously relied on `handleExceptions` to receive crashes from its own module's logger, attach it to the elected logger instead — otherwise it will stop seeing them. To opt a logger out of crash capture entirely, use `captureUncaught: false`.
