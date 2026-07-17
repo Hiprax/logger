@@ -137,11 +137,11 @@ Winston uses the npm log-level hierarchy. Lower numbers are more severe; a logge
 | `debug`   | 5       |
 | `silly`   | 6       |
 
-**Important:** the default `level: "info"` swallows `http`, `verbose`, `debug`, and `silly` calls — they are silently dropped and never reach any transport. To see HTTP request/response logs from `createRequestLogger`, set the underlying logger's `level` to `"http"` or lower-severity:
+**Important:** the default `level: "info"` swallows `http`, `verbose`, `debug`, and `silly` calls — a message logged at one of those levels is silently dropped and never reaches any transport. This does **not** hide `createRequestLogger` output by default: the request middleware emits normal request/response logs at `info` / `warn` / `error` (status-code-driven), all of which the default `level: "info"` already passes. The `"http"` level only becomes relevant if you override the middleware's `level` option to winston's `"http"` — then the underlying logger's `level` must also be `>= "http"`:
 
 ```ts
 const httpLogger = createLogger({ moduleName: "http", level: "http" });
-app.use(createRequestLogger({ logger: httpLogger }));
+app.use(createRequestLogger({ logger: httpLogger, level: () => "http" }));
 ```
 
 ### RotationStrategy
@@ -176,7 +176,7 @@ The exported `defaultRotation` is frozen — direct mutation throws under strict
 
 **Unknown method fallback**: If you call a method that does not exist on the logger (e.g., `logger.success("done")`), it will log a warning once and route the message through `info()` instead of throwing.
 
-**Instance caching**: Logger instances are cached by `moduleName` + the **resolved** `logDirectory`. The directory is normalized via `path.resolve` (and on Windows lowercased for the cache key only) so `"./logs"`, `path.resolve("./logs")`, and (on Windows) `C:\Logs` vs `c:\logs` collapse to a single cache entry. Symlinks are collapsed via `fs.realpathSync.native` when the directory exists. The same call from different files returns the same instance. Use `resetLoggerRegistry()` to clear the cache (useful for testing or hot-reload scenarios):
+**Instance caching**: Logger instances are cached by `moduleName` + the **resolved** `logDirectory`. The directory is normalized via `path.resolve` (and on Windows lowercased for the cache key only) so `"./logs"`, `path.resolve("./logs")`, and (on Windows) `C:\Logs` vs `c:\logs` collapse to a single cache entry. Symlinks are collapsed via `fs.realpathSync.native` whether or not the directory exists yet (when it is missing, the nearest existing ancestor is resolved and the not-yet-created tail is re-joined), so the cache key is stable across the first-call directory-creation boundary. The same call from different files returns the same instance. Use `resetLoggerRegistry()` to clear the cache (useful for testing or hot-reload scenarios):
 
 ```ts
 import { resetLoggerRegistry } from "@hiprax/logger";
@@ -695,7 +695,7 @@ v1.0.0 removes the `MaxListenersExceededWarning` that appeared once an app creat
 | 2   | A crash is logged **once**, through one elected logger — not once per logger. It also reaches the console now, not only the file transports.                                                                                           | You expected a copy of the crash in every module's file, or parsed the N duplicate traces in `all-logs`.        | No opt-out; the duplicates were the bug.                                                |
 | 3   | The crash payload's `exception: true` / `rejection: true` is replaced by `crash: "uncaughtException" \| "unhandledRejection"`.                                                                                                         | You grep or alert on `"exception":true`.                                                                        | Match on `"crash":` instead.                                                            |
 | 4   | `logger.transports` holds a forwarding **handle** for the global log, not a `DailyRotateFile`. The module-scoped file is still a real `DailyRotateFile`.                                                                               | You introspect `logger.transports` with `instanceof DailyRotateFile`.                                           | Filter for the module file only; expect one match, not two.                             |
-| 5   | An `additionalTransports` entry that sets `handleExceptions` / `handleRejections` has both flags **cleared** (with a warning). Since crashes go only to the elected logger, a crash sink on a non-elected logger stops receiving them. | You attached a crash sink (Sentry, HTTP) to a module logger and relied on those flags to deliver crashes to it. | Attach that transport to the elected logger (the first capture-enabled logger created). |
+| 5   | An `additionalTransports` entry that sets `handleExceptions` / `handleRejections` has both flags **cleared** (with a warning). Since crashes go only to the elected logger, a crash sink on a non-elected logger stops receiving them. | You attached a crash sink (Sentry, HTTP) to a module logger and relied on those flags to deliver crashes to it. | Attach that transport to the elected logger — the first capture-enabled logger that **has a file transport**, falling back to the first with any transport. |
 
 Why #3 is not optional: `exception` / `rejection` are winston-reserved routing flags. `winston-transport` **drops** an `{ exception: true }` record from any transport without `handleExceptions` — the very flag whose removal fixes the listener leak — so keeping the marker would have made every crash silently vanish from the logs. Everything else in the payload is unchanged.
 
