@@ -157,6 +157,22 @@ const validateRotationStrategy = (label: string, rotation: RotationStrategy | un
 const normalizeMaxFiles = (maxFiles: string | undefined): string | undefined =>
   typeof maxFiles === "string" ? maxFiles.toLowerCase() : maxFiles;
 
+/**
+ * Lowercases a string `maxSize` value, mirroring {@link normalizeMaxFiles}.
+ * {@link MAX_SIZE_PATTERN} (and the public `RotationStrategy.maxSize` JSDoc)
+ * document the `k`/`m`/`g` suffix as case-insensitive, and upstream already
+ * lowercases it internally before parsing (`winston-daily-rotate-file`'s
+ * `getMaxSize` → `file-stream-rotator`), so `"20M"` and `"20m"` produce a
+ * byte-identical transport. But `buildOptionsSignature` previously hashed the
+ * RAW `maxSize`, so `"20m"` vs `"20M"` tripped a false-positive "conflicting
+ * options" warning for two functionally identical configs. Normalizing here
+ * before the signature is built (and, for symmetry, inside
+ * `buildRotateTransport`) makes the signature agree with the runtime effect.
+ * Non-string values (`undefined`) pass through unchanged.
+ */
+const normalizeMaxSize = (maxSize: string | undefined): string | undefined =>
+  typeof maxSize === "string" ? maxSize.toLowerCase() : maxSize;
+
 const TIMESTAMP_FORMAT = "YYYY-MM-DD HH:mm:ss";
 const DEFAULT_LOG_DIR = path.resolve(process.cwd(), "logs");
 
@@ -356,10 +372,31 @@ const resolveLogDirectory = (logDirectory: string): string => {
   }
 };
 
-const buildRegistryKey = (moduleName: string, resolvedLogDirectory: string): string => {
-  const normalized = isWindows() ? resolvedLogDirectory.toLowerCase() : resolvedLogDirectory;
-  return `${normalized}::${moduleName}`;
-};
+/**
+ * Builds the `loggerRegistry` cache key from the **resolved module log-file
+ * path** — the exact file `buildLogFilePath(resolvedLogDirectory, moduleName)`
+ * would write to — rather than from the raw `moduleName`.
+ *
+ * Keying on the file path is what makes two module names that *sanitize to the
+ * same file* collapse to one cache entry. `buildLogFilePath` runs each path
+ * segment through `sanitizeSegment`, so `"user api"` and `"user-api"` both
+ * resolve to `.../user-api-%DATE%.log`. Keying on the raw name left those as
+ * two separate registry entries that each built an independent
+ * `DailyRotateFile` on that one physical file — two rotators renaming and
+ * pruning each other's output, with no cache hit and no conflict warning.
+ * Reachable straight from the public API via
+ * `createRequestLogger({ label: "user api" })` (the middleware derives
+ * `moduleName: "http/<label>"`). Keying on the file path folds them together,
+ * so a genuine options divergence now trips the existing conflict warning
+ * instead of silently double-opening the file.
+ *
+ * The path already embeds `resolvedLogDirectory`, so no separate directory
+ * component is needed. Windows-only lowercase normalization is preserved for
+ * case-insensitive equality; the lowercased form is a comparison key only and
+ * is NEVER used for filesystem access.
+ */
+const buildRegistryKey = (moduleFilePath: string): string =>
+  isWindows() ? moduleFilePath.toLowerCase() : moduleFilePath;
 
 /**
  * Frozen default rotation strategy applied to both the module-scoped and the
@@ -420,10 +457,21 @@ export const getDefaultRotation = (): RotationStrategy => ({
  * (lowercased + sorted to be order-independent — security-relevant, so a
  * silently-dropped redaction config must surface as a conflict), `colorize`
  * (the *resolved* `{level, message}` flags, not the raw option shape),
- * `captureUncaught`, and `exitOnUncaught`. Does NOT include
- * `additionalTransports` — function/class instances are not stably comparable;
- * the registry tracks their count separately and the warning surfaces it as a
- * caveat.
+ * `captureUncaught`, `exitOnUncaught`, and an `onTransportError` **presence
+ * marker** (`typeof onTransportError`, i.e. `"function"` vs `"undefined"`).
+ *
+ * The `onTransportError` field is behavior-affecting — it decides whether
+ * transport errors (ENOSPC, EACCES, gzip failure) reach the operator's handler
+ * or fall through to bare `console.error` — yet a function is not stably
+ * comparable, so it is hashed by **presence only**: a second `createLogger()`
+ * that ADDS or REMOVES the callback on a cached key surfaces through the
+ * existing `diffSignatures` conflict warning, but swapping one callback for a
+ * different one does not (both are `"function"`). This mirrors the
+ * `additionalTransports(count)` caveat — presence/count, never deep identity.
+ *
+ * Does NOT include `additionalTransports` — function/class instances are not
+ * stably comparable; the registry tracks their count separately and the warning
+ * surfaces it as a caveat.
  */
 const buildOptionsSignature = (resolved: {
   level: LogLevel;
@@ -441,6 +489,7 @@ const buildOptionsSignature = (resolved: {
   colorize: { level: boolean; message: boolean };
   captureUncaught: boolean;
   exitOnUncaught: boolean;
+  onTransportError: string;
 }): string => {
   return JSON.stringify({
     level: resolved.level,
@@ -458,6 +507,7 @@ const buildOptionsSignature = (resolved: {
     colorize: resolved.colorize,
     captureUncaught: resolved.captureUncaught,
     exitOnUncaught: resolved.exitOnUncaught,
+    onTransportError: resolved.onTransportError,
   });
 };
 
@@ -1123,7 +1173,7 @@ const buildRotateTransport = (options: {
   const transport = new DailyRotateFile({
     filename: options.filename,
     datePattern: rotation.datePattern,
-    maxSize: rotation.maxSize,
+    maxSize: normalizeMaxSize(rotation.maxSize),
     maxFiles: normalizeMaxFiles(rotation.maxFiles),
     zippedArchive: rotation.zippedArchive,
     level: options.level,
@@ -1368,18 +1418,31 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
   // resolved (case-preserving) path is what we hand to the filesystem; the
   // (possibly lowercased) cache key only exists for equality comparisons.
   const resolvedLogDirectory = resolveLogDirectory(logDirectory);
-  const registryKey = buildRegistryKey(moduleName, resolvedLogDirectory);
+  // Key the registry on the resolved MODULE LOG-FILE PATH, not the raw
+  // moduleName. `buildLogFilePath` sanitizes each segment, so two module names
+  // that collapse to the same file (`"user api"` / `"user-api"`, reachable via
+  // `createRequestLogger({ label })`) must share ONE cache entry — and trip the
+  // conflict warning if their options diverge — instead of opening two rotators
+  // on one physical file. Computed here, before the cache lookup, and reused
+  // for the module transport below.
+  const moduleFilename = buildLogFilePath(resolvedLogDirectory, moduleName);
+  const registryKey = buildRegistryKey(moduleFilename);
 
-  // Normalize `maxFiles` the SAME way `buildRotateTransport` does before it
-  // feeds the registry signature below — otherwise two calls that are
-  // functionally identical post-normalization (`"14d"` vs `"14D"`) would hash
-  // to different signatures and trip a false-positive conflict warning.
+  // Normalize `maxSize` and `maxFiles` the SAME way `buildRotateTransport` does
+  // before they feed the registry signature below — otherwise two calls that
+  // are functionally identical post-normalization (`"20m"` vs `"20M"`, `"14d"`
+  // vs `"14D"`) would hash to different signatures and trip a false-positive
+  // conflict warning. `resolvedGlobalRotation` also feeds the shared-file
+  // rotation signature (see `acquireSharedGlobalFile` below), so normalizing
+  // here closes the same false positive across loggers sharing the global file.
   const resolvedRotation: RotationStrategy = { ...defaultRotation, ...rotation };
+  resolvedRotation.maxSize = normalizeMaxSize(resolvedRotation.maxSize);
   resolvedRotation.maxFiles = normalizeMaxFiles(resolvedRotation.maxFiles);
   const resolvedGlobalRotation: RotationStrategy = {
     ...defaultRotation,
     ...(globalRotation ?? rotation),
   };
+  resolvedGlobalRotation.maxSize = normalizeMaxSize(resolvedGlobalRotation.maxSize);
   resolvedGlobalRotation.maxFiles = normalizeMaxFiles(resolvedGlobalRotation.maxFiles);
 
   // Resolve the colorize option to per-flag booleans BEFORE the cache lookup
@@ -1407,6 +1470,10 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     colorize: colorizeFlags,
     captureUncaught,
     exitOnUncaught,
+    // Presence marker only — see `buildOptionsSignature`. Adding/removing the
+    // callback on a cached key surfaces as a conflict; swapping callbacks does
+    // not (both are `"function"`).
+    onTransportError: typeof onTransportError,
   });
 
   const cached = loggerRegistry.get(registryKey);
@@ -1579,7 +1646,7 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     );
   }
 
-  const moduleFilename = buildLogFilePath(resolvedLogDirectory, moduleName);
+  // `moduleFilename` was computed above (it seeds the registry key); reuse it.
   const globalFilename = buildLogFilePath(resolvedLogDirectory, globalModuleName);
 
   if (includeFile) {
@@ -2382,6 +2449,7 @@ export const __loggerInternals = {
   validateRotationStrategy,
   validateRotationField,
   normalizeMaxFiles,
+  normalizeMaxSize,
   validateFormatOption,
   validateMaskMetaKeysOption,
   isValidLogLevel,

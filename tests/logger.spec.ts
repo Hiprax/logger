@@ -984,6 +984,109 @@ describe("createLogger", () => {
       teardownLogger(first);
     });
 
+    it("folds two module names that sanitize to the same file into one cached logger (P13a)", () => {
+      // "user api" and "user-api" both sanitize to `http/user-api-%DATE%.log`,
+      // so they must resolve to the SAME cached instance — not two independent
+      // rotators fighting over one physical file. Reachable via
+      // createRequestLogger({ label: "user api" }) (moduleName "http/<label>").
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const spaced = createLogger({ ...baseOpts(root), moduleName: "http/user api" });
+      const hyphen = createLogger({ ...baseOpts(root), moduleName: "http/user-api" });
+
+      expect(hyphen).toBe(spaced);
+      // Identical options otherwise → no false-positive conflict warning.
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+      teardownLogger(spaced);
+    });
+
+    it("warns when two colliding module names carry divergent options (P13a)", () => {
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({
+        ...baseOpts(root),
+        moduleName: "http/user api",
+        level: "info",
+      });
+      const second = createLogger({
+        ...baseOpts(root),
+        moduleName: "http/user-api",
+        level: "debug",
+      });
+
+      // Same resolved file → same cache key → the options divergence now trips
+      // the existing conflict warning instead of silently double-opening.
+      expect(second).toBe(first);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain("level");
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("does not warn when rotation.maxSize differs only by unit-suffix case (P13b)", () => {
+      // "20m" and "20M" produce a byte-identical transport (upstream lowercases
+      // internally), so the signature must treat them as equal — no
+      // false-positive conflict warning.
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({ ...baseOpts(root), rotation: { maxSize: "20m" } });
+      const second = createLogger({ ...baseOpts(root), rotation: { maxSize: "20M" } });
+
+      expect(second).toBe(first);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("warns when onTransportError presence differs on a cached key (P13c)", () => {
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger(baseOpts(root));
+      const second = createLogger({ ...baseOpts(root), onTransportError: () => undefined });
+
+      // Adding the callback to a cached key must no longer be silently dropped:
+      // the presence marker surfaces it through the conflict warning.
+      expect(second).toBe(first);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain("onTransportError");
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("does not warn when onTransportError is present on both calls (presence-only, P13c)", () => {
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      // Two DIFFERENT callbacks: compared by presence only, both are
+      // "function", so no conflict is reported (documented caveat, mirroring
+      // additionalTransports(count)).
+      const first = createLogger({ ...baseOpts(root), onTransportError: () => undefined });
+      const second = createLogger({ ...baseOpts(root), onTransportError: (err) => void err });
+
+      expect(second).toBe(first);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+      teardownLogger(first);
+    });
+
+    it("normalizeMaxSize lowercases a string unit suffix and passes non-strings through (P13b)", () => {
+      expect(__loggerInternals.normalizeMaxSize("20M")).toBe("20m");
+      expect(__loggerInternals.normalizeMaxSize("0.5M")).toBe("0.5m");
+      expect(__loggerInternals.normalizeMaxSize("1G")).toBe("1g");
+      expect(__loggerInternals.normalizeMaxSize("20m")).toBe("20m");
+      expect(__loggerInternals.normalizeMaxSize(undefined)).toBeUndefined();
+    });
+
     it("does not warn a second time when the same mismatched options recur", () => {
       const root = createTempDir();
       const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -1666,24 +1769,36 @@ describe("createLogger", () => {
     );
 
     it("buildRegistryKey is case-insensitive on Windows and case-sensitive on POSIX", () => {
-      const moduleName = "auth";
-      const upper = path.resolve("/Tmp/Logger");
-      const lower = path.resolve("/tmp/logger");
+      // Phase 13: the key is now the resolved MODULE LOG-FILE PATH, not the raw
+      // moduleName + directory. Case-folding is still Windows-only.
+      const upper = "/Tmp/Logger/auth-%DATE%.log";
+      const lower = "/tmp/logger/auth-%DATE%.log";
       const original = process.platform;
 
       try {
         Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-        const upperKeyWin = __loggerInternals.buildRegistryKey(moduleName, upper);
-        const lowerKeyWin = __loggerInternals.buildRegistryKey(moduleName, lower);
+        const upperKeyWin = __loggerInternals.buildRegistryKey(upper);
+        const lowerKeyWin = __loggerInternals.buildRegistryKey(lower);
         expect(upperKeyWin).toBe(lowerKeyWin);
 
         Object.defineProperty(process, "platform", { value: "linux", configurable: true });
-        const upperKeyPosix = __loggerInternals.buildRegistryKey(moduleName, upper);
-        const lowerKeyPosix = __loggerInternals.buildRegistryKey(moduleName, lower);
+        const upperKeyPosix = __loggerInternals.buildRegistryKey(upper);
+        const lowerKeyPosix = __loggerInternals.buildRegistryKey(lower);
         expect(upperKeyPosix).not.toBe(lowerKeyPosix);
       } finally {
         Object.defineProperty(process, "platform", { value: original, configurable: true });
       }
+    });
+
+    it("buildRegistryKey folds two module names that sanitize to one file into one key", () => {
+      // "user api" and "user-api" both sanitize to `user-api-%DATE%.log`, so
+      // their registry keys must be identical (Phase 13 collision fix).
+      const baseDir = path.resolve("/tmp/logger-key");
+      const spaced = __loggerInternals.buildLogFilePath(baseDir, "http/user api");
+      const hyphen = __loggerInternals.buildLogFilePath(baseDir, "http/user-api");
+      expect(__loggerInternals.buildRegistryKey(spaced)).toBe(
+        __loggerInternals.buildRegistryKey(hyphen),
+      );
     });
 
     it("buildOptionsSignature sorts extraTimezones to ignore input order", () => {
@@ -1702,6 +1817,7 @@ describe("createLogger", () => {
         colorize: { level: true, message: true },
         captureUncaught: true,
         exitOnUncaught: true,
+        onTransportError: "undefined",
       };
       const a = __loggerInternals.buildOptionsSignature({
         ...base,
@@ -1730,6 +1846,7 @@ describe("createLogger", () => {
         colorize: { level: true, message: true },
         captureUncaught: true,
         exitOnUncaught: true,
+        onTransportError: "undefined",
       };
       const a = __loggerInternals.buildOptionsSignature({
         ...base,
@@ -3220,6 +3337,39 @@ describe("createLogger", () => {
       expect(sharedGlobalTransports()[0].options.maxFiles).toBe("7d");
 
       [a, b, c].forEach((logger) => teardownLogger(logger));
+    });
+
+    it("does not warn when two sharing loggers differ only by global maxSize unit case (P13b)", () => {
+      // Two DIFFERENT module names (distinct registry keys, both created) that
+      // share the global file with global rotation maxSize "20m" vs "20M". Since
+      // resolvedGlobalRotation feeds the shared-file rotationSignature and
+      // maxSize is now normalized before it is built, the two signatures agree
+      // and the shared-file rotation-conflict warning must NOT fire. Against the
+      // pre-Phase-13 code (raw maxSize in the signature) this warned.
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+      const root = createTempDir();
+
+      const a = createLogger({
+        moduleName: "size-a",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        globalRotation: { maxSize: "20m", maxFiles: "14d" },
+      });
+      const b = createLogger({
+        moduleName: "size-b",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        globalRotation: { maxSize: "20M", maxFiles: "14d" },
+      });
+
+      const conflictWarnings = warn.mock.calls.filter((call) =>
+        String(call[0]).includes("Conflicting global-file rotation config"),
+      );
+      expect(conflictWarnings).toHaveLength(0);
+
+      [a, b].forEach((logger) => teardownLogger(logger));
     });
 
     it("fans the shared transport's error events out to every sharing logger", () => {
