@@ -281,7 +281,12 @@ export interface LoggerOptions {
    * Set `exitOnUncaught: false` to keep logging fatals without exiting (the
    * pre-v1.0.0 behavior). Only meaningful when {@link captureUncaught} is
    * `true`. When several capture-enabled loggers set different values, the
-   * value of the elected primary logger governs the process-level decision.
+   * process-level decision is a **consensus**: the process exits only when
+   * every registered logger allows it, so a single `exitOnUncaught: false` on
+   * any logger vetoes the exit for the whole process, regardless of which
+   * logger is elected to record the crash or the order the loggers were
+   * created. A process has one lifetime, so a per-logger opt-out can only mean
+   * "keep the whole process alive".
    *
    * This option governs BOTH `uncaughtException` and `unhandledRejection`.
    */
