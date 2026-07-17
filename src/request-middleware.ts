@@ -232,6 +232,16 @@ const buildTruncatedEnvelope = (serialized: string, maxLength: number): Truncate
   _preview: truncateString(serialized, maxLength),
 });
 
+/**
+ * Substituted for `requestBody` when serializing the body fails outright.
+ *
+ * Logging is best-effort per this module's contract, and the body is the only
+ * part of an entry built from arbitrary caller data — so its failure degrades
+ * to this sentinel while the rest of the entry (method, url, status, duration)
+ * is still logged.
+ */
+const UNSERIALIZABLE_BODY = "[UNSERIALIZABLE]";
+
 const serializeBody = (
   body: unknown,
   maskKeys?: string[] | ReadonlySet<string>,
@@ -841,12 +851,27 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
           // Also pass `resolvedRedactPaths` so body-scoped paths are applied to
           // the object graph BEFORE any over-limit truncation collapses it into
           // the `_preview` envelope (see the comment inside `serializeBody`).
-          entry.requestBody = serializeBody(
-            bodySnapshot,
-            bodyMaskSet,
-            maxBodyLength,
-            resolvedRedactPaths,
-          );
+          // Serializing the body is the only step here that runs over
+          // arbitrary caller-supplied data of arbitrary shape, so it is the
+          // only step whose failure is plausible — a metadata getter throwing,
+          // a hostile `toJSON`, a payload no serializer can express. Its
+          // failure must not be allowed to reach the outer catch, which would
+          // discard the ENTIRE entry: the method, url, status, and duration are
+          // all already computed and never touched the body, so dropping them
+          // over a body problem loses the record of a request that did happen.
+          // (That was a cheap way to make a request structurally invisible in
+          // the HTTP log — post a body the serializer chokes on.) Degrade the
+          // body to a sentinel; log everything else.
+          try {
+            entry.requestBody = serializeBody(
+              bodySnapshot,
+              bodyMaskSet,
+              maxBodyLength,
+              resolvedRedactPaths,
+            );
+          } catch {
+            entry.requestBody = UNSERIALIZABLE_BODY;
+          }
         }
 
         entry.requestHeaders = normalizeHeaders(

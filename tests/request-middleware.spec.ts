@@ -276,6 +276,118 @@ describe("createRequestLogger", () => {
     expect(payload.http.requestBody).toBe("42");
   });
 
+  // ---------------------------------------------------------------------------
+  // Depth-bounded body redaction — a deep body must not make the request
+  // structurally invisible in the HTTP log.
+  //
+  // `serializeBody` runs the recursive redaction walk over `req.body`. Unbounded,
+  // that walk overflows the stack on a ~3000-deep body (~18KB — well under
+  // `express.json()`'s 100kb default), `finalize()`'s catch swallowed the
+  // RangeError, and ZERO log entries were emitted for the request — not even the
+  // method/url/status, which never touched the body. That is a cheap way for an
+  // attacker to erase their own requests from the log.
+  // ---------------------------------------------------------------------------
+
+  /** Builds a `{child:{child:…}}` chain `depth` levels deep with a secret leaf. */
+  const buildDeepBody = (depth: number): Record<string, unknown> => {
+    const root: Record<string, unknown> = {};
+    let cursor = root;
+    for (let i = 0; i < depth; i += 1) {
+      const next: Record<string, unknown> = {};
+      cursor.child = next;
+      cursor = next;
+    }
+    cursor.password = "topsecret";
+    return root;
+  };
+
+  it("still logs the entry for a 3000-deep request body instead of dropping it", () => {
+    const { logger, log } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      maskBodyKeys: ["password"],
+      maxBodyLength: 100_000,
+    });
+
+    const { res } = runMiddleware(middleware, {
+      method: "POST",
+      originalUrl: "/deep",
+      body: buildDeepBody(3000),
+    });
+    res.emit("finish");
+
+    // Pre-fix: zero calls — the RangeError from the walk hit finalize()'s catch.
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.method).toBe("POST");
+    expect(payload.http.url).toBe("/deep");
+    expect(payload.http.statusCode).toBe(200);
+    // The body renders, bounded by the depth sentinel; the over-deep secret is
+    // never reached and so cannot leak.
+    expect(JSON.stringify(payload.http.requestBody)).toContain("[MaxDepth]");
+    expect(JSON.stringify(payload.http.requestBody)).not.toContain("topsecret");
+    // The entry was logged normally, not via the never-crash error path.
+    expect(errSpy).not.toHaveBeenCalled();
+  });
+
+  it("redacts a body nested 255 levels deep normally (the depth guard must not fire early)", () => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      maskBodyKeys: ["password"],
+      maxBodyLength: 100_000,
+    });
+
+    const { res } = runMiddleware(middleware, { body: buildDeepBody(255) });
+    res.emit("finish");
+
+    let cursor: any = log.mock.calls[0][0].http.requestBody;
+    for (let i = 0; i < 255; i += 1) cursor = cursor.child;
+    expect(cursor.password).toBe("[REDACTED]");
+    expect(JSON.stringify(log.mock.calls[0][0].http.requestBody)).not.toContain("[MaxDepth]");
+  });
+
+  it("degrades only the body to a sentinel when serialization fails, still logging the entry", () => {
+    // A body whose own enumerable getter throws: the redaction walk reads own
+    // keys, so reading it detonates inside `serializeBody`. Pre-fix that
+    // exception reached finalize()'s catch and took the WHOLE entry with it.
+    const { logger, log } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const body = { safe: "visible" };
+    Object.defineProperty(body, "boom", {
+      enumerable: true,
+      get() {
+        throw new Error("getter exploded");
+      },
+    });
+
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      maskBodyKeys: ["password"],
+    });
+
+    const { res } = runMiddleware(middleware, { method: "POST", originalUrl: "/boom", body });
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    const payload = log.mock.calls[0][0];
+    // Everything that never touched the body still survives...
+    expect(payload.http.method).toBe("POST");
+    expect(payload.http.url).toBe("/boom");
+    expect(payload.http.statusCode).toBe(200);
+    // ...and only the body degrades.
+    expect(payload.http.requestBody).toBe("[UNSERIALIZABLE]");
+    expect(errSpy).not.toHaveBeenCalled();
+  });
+
   it("omits http metadata unless includeHttpContext is true", () => {
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({ logger });

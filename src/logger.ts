@@ -592,12 +592,30 @@ const buildTimestampCapture = (clock: () => Date) =>
  */
 const RESERVED_INFO_KEYS = new Set(["level", "message", "timestamp", "stack"]);
 
+/**
+ * Substituted for a metadata value whose redaction walk threw.
+ *
+ * The redaction walk is not total: reading an own enumerable key invokes a
+ * getter, and a getter is caller code that may throw (as may a `toJSON` on a
+ * proxied value). Since winston runs its formats synchronously inside
+ * `logger.log()`, an escaping exception would surface as a throw from an
+ * ordinary `logger.info()` — the caller's own logging call crashing on account
+ * of the data it tried to log.
+ *
+ * The substitution FAILS CLOSED: it replaces the value with this sentinel
+ * rather than falling back to the raw one. Emitting the unredacted value would
+ * turn a redaction failure into a secret disclosure — precisely the outcome
+ * `maskMetaKeys` exists to prevent — so a value that could not be proven
+ * redacted is never written to the log.
+ */
+const REDACTION_FAILED = "[RedactionFailed]";
+
 const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
   winston.format((info) => {
     if (!maskMetaKeys || maskMetaKeys.size === 0) {
       return info;
     }
-    const seen = new WeakSet<object>();
+    let seen = new WeakSet<object>();
     const ownKeys = Object.keys(info);
     for (const key of ownKeys) {
       if (RESERVED_INFO_KEYS.has(key)) {
@@ -608,11 +626,22 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
         (info as Record<string, unknown>)[key] = "[REDACTED]";
         continue;
       }
-      (info as Record<string, unknown>)[key] = redactValue(
-        original,
-        maskMetaKeys as Set<string>,
-        seen,
-      );
+      try {
+        (info as Record<string, unknown>)[key] = redactValue(
+          original,
+          maskMetaKeys as Set<string>,
+          seen,
+        );
+      } catch {
+        // Fail closed on this key only — the rest of the line still renders.
+        (info as Record<string, unknown>)[key] = REDACTION_FAILED;
+        // The throw unwound out of the walk without running the `seen.delete`
+        // that each branch performs on its way out, so the abandoned subtree's
+        // objects are still recorded as "on the active path". Reusing that
+        // WeakSet would misreport any of them as "[Circular]" if a LATER key
+        // legitimately references one. A fresh set restores the invariant.
+        seen = new WeakSet<object>();
+      }
     }
     return info;
   })();
@@ -643,6 +672,34 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
 const bigintSafeReplacer = (_key: string, value: unknown): unknown =>
   typeof value === "bigint" ? value.toString() : value;
 
+/** Substituted for a value the pretty-mode formatter could not serialize. */
+const UNSERIALIZABLE = "[UNSERIALIZABLE]";
+
+/**
+ * `JSON.stringify` that cannot throw at the caller.
+ *
+ * The pretty-mode printf runs synchronously inside `logger.log()`, so every
+ * `JSON.stringify` in it is a live grenade: an exception does not degrade the
+ * log line, it propagates out of the application's own `logger.info(...)` call.
+ * Two reachable inputs prove it — a payload nested deeply enough to exhaust the
+ * stack (`RangeError`) and a self-referencing value (`TypeError: Converting
+ * circular structure to JSON`) — and both crash the DEFAULT, no-mask config,
+ * which made enabling `maskMetaKeys` (whose walk bounds the graph first)
+ * paradoxically safer than leaving it off.
+ *
+ * A log call must never be the thing that takes an application down: the
+ * sentinel loses one field, the throw loses the process. Note the boundary —
+ * this makes the FORMATTER total, not `JSON.stringify` itself: a value no JSON
+ * serializer can express still renders as the sentinel rather than as data.
+ */
+const safeStringify = (value: unknown, space?: number): string => {
+  try {
+    return JSON.stringify(value, bigintSafeReplacer, space);
+  } catch {
+    return UNSERIALIZABLE;
+  }
+};
+
 const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
   winston.format.printf((info) => {
     const {
@@ -667,7 +724,7 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
         ? info.message
         : typeof info.message === "bigint"
           ? info.message.toString()
-          : (JSON.stringify(info.message, bigintSafeReplacer, 2) ?? String(info.message));
+          : (safeStringify(info.message, 2) ?? String(info.message));
     // When `escapeMessageNewlines` is on AND the original message was a string,
     // rewrite embedded `\r` / `\n` to their visible escape sequences so a
     // user-supplied payload like `"alice\n[ERROR] (admin)\nfake event"` cannot
@@ -685,13 +742,25 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
     // BEFORE serialization so secrets never reach the log line. The redaction
     // is purely functional (returns a fresh object), so the original `info`
     // shape is left untouched for any subsequent formatter in the pipeline.
-    const redactedMetadata =
-      maskMetaKeys && maskMetaKeys.size > 0
-        ? (redactValue(metadata, maskMetaKeys as Set<string>, new WeakSet()) as Record<
-            string,
-            unknown
-          >)
-        : metadata;
+    // The walk itself can throw (a metadata getter is caller code), and winston
+    // runs formats synchronously inside `logger.log()`, so an escaping
+    // exception would crash the caller's own logging call. Fail closed: on
+    // failure the whole metadata bag collapses to a marker rather than falling
+    // back to the raw bag, which would leak the very values `maskMetaKeys` was
+    // configured to hide. The level/message/stack lines still render.
+    const redactedMetadata = ((): Record<string, unknown> => {
+      if (!maskMetaKeys || maskMetaKeys.size === 0) {
+        return metadata;
+      }
+      try {
+        return redactValue(metadata, maskMetaKeys as Set<string>, new WeakSet()) as Record<
+          string,
+          unknown
+        >;
+      } catch {
+        return { _redactionFailed: true };
+      }
+    })();
     const cleanedMeta = Object.keys(redactedMetadata).length > 0 ? redactedMetadata : undefined;
 
     const lines: string[] = [];
@@ -726,11 +795,11 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
     lines.push(`${levelToken} (${label})`, message);
 
     if (stack) {
-      lines.push(typeof stack === "string" ? stack : JSON.stringify(stack, bigintSafeReplacer, 2));
+      lines.push(typeof stack === "string" ? stack : safeStringify(stack, 2));
     }
 
     if (cleanedMeta) {
-      lines.push(JSON.stringify(cleanedMeta, bigintSafeReplacer, 2));
+      lines.push(safeStringify(cleanedMeta, 2));
     }
 
     return `${lines.join("\n")}\n`;
@@ -1158,6 +1227,15 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     // the JSON serialization; `buildMetaRedactor` runs the shared deep
     // redaction over caller-supplied metadata BEFORE `json()` serializes —
     // so secrets never reach the line.
+    //
+    // KNOWN BOUNDARY: `json()` is winston's own serializer and is not wrapped,
+    // so a payload nested deeply enough to exhaust `JSON.stringify` itself
+    // (~8000 levels) still throws `RangeError` out of `logger.log()` here. It
+    // is unreachable whenever `maskMetaKeys` is configured — `buildMetaRedactor`
+    // bounds the graph to `MAX_REDACT_DEPTH` first — and only fires where the
+    // data is genuinely un-JSON-able, matching bare winston rather than adding
+    // a crash of our own. The pretty branch has no equivalent hole: its
+    // stringify sites all route through `safeStringify`.
     //
     // The Console transport receives a SEPARATE format chain that intentionally
     // omits `timestampCapture`. Winston applies the logger-level `sharedFormat`

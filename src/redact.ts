@@ -74,6 +74,23 @@
  *   object so downstream `JSON.stringify`, `for-in`, and `Object.entries`
  *   consumers behave identically to pre-hardening.
  *
+ * - **Depth boundary.** The walk is bounded at `MAX_REDACT_DEPTH` (256) nesting
+ *   levels. An object or array found deeper than that is replaced with the
+ *   literal string `"[MaxDepth]"` instead of being walked. This is a hard
+ *   safety bound, not a tuning knob: the walk is plain recursion, so an
+ *   unbounded one overflows the JavaScript stack (`RangeError: Maximum call
+ *   stack size exceeded`) at roughly HALF the nesting depth `JSON.stringify`
+ *   itself tolerates — measured on V8, `redactValue` throws at depth 2000 while
+ *   `JSON.stringify` is still fine at 4000. Because winston runs its formats
+ *   synchronously inside `logger.log()`, an unbounded overflow surfaces as a
+ *   `RangeError` thrown back at the APPLICATION from an ordinary
+ *   `logger.info()` call — i.e. enabling redaction would make a deep payload
+ *   (a parsed request body ~18KB of JSON is enough) crash the caller. The
+ *   ceiling is set far above any realistic log payload and far below the
+ *   engine's frame limit, so the sentinel is only ever reached by data no
+ *   human would read anyway. Primitives are never affected: the depth check
+ *   sits after the primitive fast-path, so a scalar leaf always renders.
+ *
  * **Redaction boundary (limitation).** Values that define their own `toJSON()`
  * (including `Date`, `URL`, and any class with a custom serializer) are
  * returned by identity and NOT key-redacted — the downstream serializer will
@@ -96,20 +113,38 @@ export const REDACTED = "[REDACTED]";
  */
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
+/**
+ * Maximum nesting depth `redactValue` will walk before substituting
+ * `MAX_DEPTH`. See the module docstring's "Depth boundary" section for why an
+ * unbounded walk is a caller-facing crash rather than a mere inefficiency.
+ */
+export const MAX_REDACT_DEPTH = 256;
+
+/** Substituted for any object/array nested deeper than `MAX_REDACT_DEPTH`. */
+export const MAX_DEPTH = "[MaxDepth]";
+
 export const redactValue = (
   value: unknown,
   maskKeys: Set<string>,
   seen: WeakSet<object>,
   forceCopy = false,
+  depth = 0,
 ): unknown => {
   if (!value || typeof value !== "object") {
     return value;
   }
 
+  // Bound the recursion. Placed AFTER the primitive fast-path so a scalar leaf
+  // at any depth still renders — only a value that would itself recurse is
+  // traded for the sentinel.
+  if (depth > MAX_REDACT_DEPTH) {
+    return MAX_DEPTH;
+  }
+
   if (Array.isArray(value)) {
     if (seen.has(value as object)) return "[Circular]";
     seen.add(value as object);
-    const mapped = value.map((item) => redactValue(item, maskKeys, seen, forceCopy));
+    const mapped = value.map((item) => redactValue(item, maskKeys, seen, forceCopy, depth + 1));
     seen.delete(value as object);
     return mapped;
   }
@@ -157,7 +192,7 @@ export const redactValue = (
         result[key] = REDACTED;
         changed = true;
       } else {
-        const recursed = redactValue(original, maskKeys, seen, forceCopy);
+        const recursed = redactValue(original, maskKeys, seen, forceCopy, depth + 1);
         result[key] = recursed;
         if (recursed !== original) changed = true;
       }
@@ -180,7 +215,7 @@ export const redactValue = (
       }
       acc[key] = maskKeys.has(key.toLowerCase())
         ? REDACTED
-        : redactValue(val, maskKeys, seen, forceCopy);
+        : redactValue(val, maskKeys, seen, forceCopy, depth + 1);
       return acc;
     },
     {},

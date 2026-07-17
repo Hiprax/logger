@@ -25,6 +25,7 @@ import {
   acquireSharedGlobalFile,
   flushSharedFileTransportsForExit,
 } from "../src/shared-file-transport";
+import { MAX_REDACT_DEPTH, redactValue } from "../src/redact";
 import { InvalidTimezoneError, LoggerOptionError } from "../src/errors";
 import { createTempDir, teardownLogger } from "./_helpers";
 
@@ -3996,6 +3997,370 @@ describe("createLogger", () => {
       };
       expect(parsedMeta.a).toEqual({ password: "[REDACTED]", keep: "visible" });
       expect(parsedMeta.b).toEqual({ password: "[REDACTED]", keep: "visible" });
+    });
+
+    // -----------------------------------------------------------------------
+    // Depth-bounded redaction — a deep payload must not crash the caller
+    //
+    // The redaction walk is plain recursion, and winston runs its formats
+    // synchronously inside `logger.log()`. Unbounded, the walk overflows the
+    // stack at roughly HALF the depth `JSON.stringify` tolerates (measured:
+    // RangeError at 2000, while JSON.stringify is still fine at 4000) — so
+    // merely ENABLING `maskMetaKeys` turned a working `logger.info()` into a
+    // synchronous `RangeError` thrown back at the application, for a payload
+    // (~18KB of JSON) reachable by logging a parsed request body.
+    // -----------------------------------------------------------------------
+
+    /** Builds a `{child:{child:…}}` chain `depth` levels deep with a secret leaf. */
+    const buildDeepMeta = (depth: number): Record<string, unknown> => {
+      const root: Record<string, unknown> = {};
+      let cursor = root;
+      for (let i = 0; i < depth; i += 1) {
+        const next: Record<string, unknown> = {};
+        cursor.child = next;
+        cursor = next;
+      }
+      cursor.password = "topsecret";
+      return root;
+    };
+
+    /** Walks `depth` `child` hops into a rendered/parsed metadata chain. */
+    const descend = (value: unknown, depth: number): any => {
+      let cursor: any = value;
+      for (let i = 0; i < depth; i += 1) cursor = cursor.child;
+      return cursor;
+    };
+
+    it("pretty mode: logs a 3000-deep metadata payload instead of throwing RangeError at the caller", () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-deep-pretty",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      // The assertion is the absence of a throw: pre-fix this call raised
+      // `RangeError: Maximum call stack size exceeded` out of `logger.info`.
+      expect(() => logger.info("Deep", { payload: buildDeepMeta(3000) })).not.toThrow();
+      teardownLogger(logger);
+
+      const rendered = chunks.join("");
+      // The line is genuinely emitted, not merely "not thrown".
+      expect(rendered).toContain("[INFO] (mask-deep-pretty)");
+      expect(rendered).toContain("Deep");
+      expect(rendered).toContain("[MaxDepth]");
+      // The over-deep leaf is never reached, so its secret cannot leak either.
+      expect(rendered).not.toContain("topsecret");
+    });
+
+    it("json mode: logs a 3000-deep metadata payload instead of throwing RangeError at the caller", () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-deep-json",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format: "json",
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      expect(() => logger.info("Deep", { payload: buildDeepMeta(3000) })).not.toThrow();
+      teardownLogger(logger);
+
+      const rendered = chunks.join("");
+      const parsed = JSON.parse(rendered) as { message: string; payload: unknown };
+      expect(parsed.message).toBe("Deep");
+      expect(descend(parsed.payload, MAX_REDACT_DEPTH).child).toBe("[MaxDepth]");
+      expect(rendered).not.toContain("topsecret");
+    });
+
+    it("bounds a deep ARRAY chain (the array recursive site threads depth too)", () => {
+      // Coverage guard: every other depth test drives a plain-object chain, so
+      // a dropped `depth + 1` at the array site would leave the original
+      // RangeError reachable via `[[[…]]]` while the suite stayed green.
+      let arr: unknown[] = ["leaf"];
+      for (let i = 0; i < 3000; i += 1) arr = [arr];
+
+      expect(() => redactValue(arr, new Set(["password"]), new WeakSet())).not.toThrow();
+      const out = redactValue(arr, new Set(["password"]), new WeakSet());
+      // The array AT the ceiling is still walked; the one nested inside it is
+      // the first replaced — same boundary the json-mode test pins.
+      let cursor: any = out;
+      for (let i = 0; i < MAX_REDACT_DEPTH; i += 1) cursor = cursor[0];
+      expect(cursor[0]).toBe("[MaxDepth]");
+    });
+
+    it("bounds a deep CLASS-INSTANCE chain (the data-bearing recursive site threads depth too)", () => {
+      // Same coverage guard for the third recursive site. A data-bearing
+      // instance is walked by its own enumerable keys, a distinct branch from
+      // both the array and plain-object paths.
+      class Node {
+        public child?: Node;
+        public password = "topsecret";
+      }
+      const root = new Node();
+      let cursor = root;
+      for (let i = 0; i < 3000; i += 1) {
+        cursor.child = new Node();
+        cursor = cursor.child;
+      }
+
+      expect(() => redactValue(root, new Set(["password"]), new WeakSet())).not.toThrow();
+      const out = redactValue(root, new Set(["password"]), new WeakSet());
+      let node: any = out;
+      for (let i = 0; i < MAX_REDACT_DEPTH; i += 1) node = node.child;
+      expect(node.child).toBe("[MaxDepth]");
+      // The instance at the ceiling is still walked, so its own keys redact.
+      expect(node.password).toBe("[REDACTED]");
+    });
+
+    it("pretty mode: a payload at depth 255 is still redacted normally (the guard must not fire early)", () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-depth-255",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      // 254 `child` hops below the `payload` key puts the secret-bearing leaf
+      // at metadata depth 255 — inside the 256 ceiling.
+      logger.info("Shallow", { payload: buildDeepMeta(254) });
+      teardownLogger(logger);
+
+      const rendered = chunks.join("");
+      const metaJson = rendered.slice(rendered.indexOf("{")).trim();
+      const parsed = JSON.parse(metaJson) as { payload: unknown };
+      expect(descend(parsed.payload, 254).password).toBe("[REDACTED]");
+      expect(rendered).not.toContain("[MaxDepth]");
+      expect(rendered).not.toContain("topsecret");
+    });
+
+    // -----------------------------------------------------------------------
+    // Fail-closed redaction — a throwing getter must not crash the log call,
+    // and must never fall back to emitting the raw (unredacted) value.
+    // -----------------------------------------------------------------------
+
+    /** A data-bearing instance whose enumerable getter throws when read. */
+    const buildHostileMeta = () => {
+      class Hostile {
+        public safe = "visible";
+        get boom(): string {
+          throw new Error("getter exploded");
+        }
+      }
+      const instance = new Hostile();
+      // Make the throwing getter an OWN enumerable key so `Object.keys` in the
+      // redaction walk reads (and detonates) it.
+      Object.defineProperty(instance, "boom", {
+        enumerable: true,
+        get() {
+          throw new Error("getter exploded");
+        },
+      });
+      return instance;
+    };
+
+    it("pretty mode: a metadata getter that throws degrades to a marker instead of crashing logger.info", () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-hostile-pretty",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      expect(() =>
+        logger.info("Hostile", { evil: buildHostileMeta(), password: "topsecret" }),
+      ).not.toThrow();
+      teardownLogger(logger);
+
+      const rendered = chunks.join("");
+      // The line still renders...
+      expect(rendered).toContain("[INFO] (mask-hostile-pretty)");
+      expect(rendered).toContain("Hostile");
+      // ...and fails CLOSED: the bag collapses to the marker rather than
+      // falling back to the raw metadata, which would have leaked `password`.
+      expect(rendered).toContain("_redactionFailed");
+      expect(rendered).not.toContain("topsecret");
+    });
+
+    it("json mode: a metadata getter that throws degrades that key only, leaving other keys redacted", () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-hostile-json",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format: "json",
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+      expect(() =>
+        logger.info("Hostile", {
+          evil: buildHostileMeta(),
+          nested: { password: "topsecret" },
+          password: "topsecret",
+        }),
+      ).not.toThrow();
+      teardownLogger(logger);
+
+      const rendered = chunks.join("");
+      const parsed = JSON.parse(rendered) as Record<string, any>;
+      expect(parsed.message).toBe("Hostile");
+      // Only the offending key degrades...
+      expect(parsed.evil).toBe("[RedactionFailed]");
+      // ...every other key still redacts normally (the failure is per-key, so
+      // one hostile value cannot suppress the rest of the masking).
+      expect(parsed.password).toBe("[REDACTED]");
+      expect(parsed.nested).toEqual({ password: "[REDACTED]" });
+      expect(rendered).not.toContain("topsecret");
+    });
+
+    it("json mode: a key redacted AFTER a throwing one is not misreported as [Circular]", () => {
+      // Regression guard for `seen` contamination. The throw unwinds out of the
+      // walk without running the `seen.delete` each branch performs on its way
+      // out, so the abandoned subtree's objects stay marked "on the active
+      // path". If that WeakSet were reused, a later key legitimately holding
+      // one of those objects would render as "[Circular]" and its real data
+      // would vanish. `buildMetaRedactor` swaps in a fresh set on failure.
+      const shared = { password: "topsecret", keep: "visible" };
+      const hostile = buildHostileMeta();
+      // Put `shared` INSIDE the subtree the throw abandons, then reference it
+      // again from a later top-level key.
+      Object.defineProperty(hostile, "trap", { enumerable: true, value: shared });
+
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "mask-seen-reset",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format: "json",
+        maskMetaKeys: ["password"],
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      // Key order matters: `evil` is walked (and throws) before `later`.
+      logger.info("Trap", { evil: hostile, later: shared });
+      teardownLogger(logger);
+
+      const parsed = JSON.parse(chunks.join("")) as Record<string, any>;
+      expect(parsed.evil).toBe("[RedactionFailed]");
+      expect(parsed.later).toEqual({ password: "[REDACTED]", keep: "visible" });
+      expect(parsed.later).not.toBe("[Circular]");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Formatter totality — a log call must never throw at the caller.
+  //
+  // The pretty printf runs synchronously inside `logger.log()`, so every
+  // JSON.stringify in it propagates out of the application's own
+  // `logger.info(...)` call rather than degrading the line. Both inputs below
+  // crash the DEFAULT, no-mask config — which made enabling `maskMetaKeys`
+  // (whose walk bounds the graph first) paradoxically SAFER than leaving it off.
+  // ---------------------------------------------------------------------------
+  describe("formatter totality (pretty mode never throws at the caller)", () => {
+    const captureStream = () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+      return { stream, rendered: () => chunks.join("") };
+    };
+
+    const streamLogger = (moduleName: string, stream: PassThrough) =>
+      createLogger({
+        moduleName,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+
+    it("logs a deep metadata payload with NO maskMetaKeys instead of throwing RangeError", () => {
+      // Depth 8000 exhausts JSON.stringify itself. Pre-fix, the unguarded
+      // metadata stringify threw RangeError straight out of logger.info.
+      const deep: Record<string, unknown> = {};
+      let cursor = deep;
+      for (let i = 0; i < 8000; i += 1) {
+        const next: Record<string, unknown> = {};
+        cursor.child = next;
+        cursor = next;
+      }
+      const { stream, rendered } = captureStream();
+      const logger = streamLogger("total-deep-nomask", stream);
+
+      expect(() => logger.info("Deep", { payload: deep })).not.toThrow();
+      teardownLogger(logger);
+
+      // The line still renders; only the metadata block degrades.
+      expect(rendered()).toContain("[INFO] (total-deep-nomask)");
+      expect(rendered()).toContain("Deep");
+      expect(rendered()).toContain("[UNSERIALIZABLE]");
+    });
+
+    it("logs a circular message object instead of throwing TypeError", () => {
+      const circular: Record<string, unknown> = { name: "root" };
+      circular.self = circular;
+      const { stream, rendered } = captureStream();
+      const logger = streamLogger("total-circular-msg", stream);
+
+      // `logger.info(obj)` puts the object itself on `info.message`, which the
+      // printf stringifies — pre-fix: "Converting circular structure to JSON".
+      expect(() => logger.info(circular as unknown as string)).not.toThrow();
+      teardownLogger(logger);
+
+      expect(rendered()).toContain("[INFO] (total-circular-msg)");
+      expect(rendered()).toContain("[UNSERIALIZABLE]");
+    });
+
+    it("logs a circular non-string stack instead of throwing TypeError", () => {
+      const circularStack: Record<string, unknown> = { frames: 1 };
+      circularStack.self = circularStack;
+      const { stream, rendered } = captureStream();
+      const logger = streamLogger("total-circular-stack", stream);
+
+      expect(() => logger.info("Boom", { stack: circularStack })).not.toThrow();
+      teardownLogger(logger);
+
+      expect(rendered()).toContain("[INFO] (total-circular-stack)");
+      expect(rendered()).toContain("Boom");
+      expect(rendered()).toContain("[UNSERIALIZABLE]");
+    });
+
+    it("still renders a serializable non-string message and stack unchanged (no false sentinel)", () => {
+      // Pins that the guard only fires on genuine failure — the happy path
+      // must be byte-for-byte what it was before.
+      const { stream, rendered } = captureStream();
+      const logger = streamLogger("total-happy", stream);
+
+      logger.info({ a: 1 } as unknown as string);
+      logger.info("Boom", { stack: { frames: ["a", "b"] } });
+      teardownLogger(logger);
+
+      expect(rendered()).not.toContain("[UNSERIALIZABLE]");
+      expect(rendered()).toContain('"a": 1');
+      expect(rendered()).toContain('"frames"');
     });
   });
 
