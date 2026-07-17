@@ -5463,6 +5463,258 @@ describe("createLogger", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // JSON mode: module label field (Phase 15)
+  //
+  // In `format: "json"` the emitted line previously carried no module/label
+  // field at all, so the shared `all-logs` file mixed every module's lines with
+  // no way to attribute them. `buildModuleFieldInjector` stamps the module label
+  // as a top-level `module` field (the pretty chain already renders `(label)`).
+  // The field is additive, caller-precedence-respecting, and non-mutating.
+  // ---------------------------------------------------------------------------
+  describe("json mode: module label field (Phase 15)", () => {
+    const renderJsonLine = (
+      moduleName: string | undefined,
+      emit: (logger: winston.Logger) => void,
+      maskMetaKeys?: string[],
+    ): string => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        ...(moduleName === undefined ? {} : { moduleName }),
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format: "json",
+        ...(maskMetaKeys ? { maskMetaKeys } : {}),
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      emit(logger);
+      teardownLogger(logger);
+      return chunks.join("").trim();
+    };
+
+    const parseJson = (
+      moduleName: string | undefined,
+      emit: (logger: winston.Logger) => void,
+      maskMetaKeys?: string[],
+    ): Record<string, unknown> =>
+      JSON.parse(renderJsonLine(moduleName, emit, maskMetaKeys)) as Record<string, unknown>;
+
+    it("stamps a named module as the top-level `module` field, alongside caller metadata", () => {
+      const parsed = parseJson("api", (logger) => logger.info("Login", { userId: 42 }));
+      expect(parsed.module).toBe("api");
+      expect(parsed.message).toBe("Login");
+      expect(parsed.level).toBe("info");
+      expect(parsed.userId).toBe(42);
+      expect(typeof parsed.timestamp).toBe("string");
+    });
+
+    it("stamps the default module as `GLOBAL`, matching the pretty pipeline's label", () => {
+      // The default `moduleName: "global"` renders as `(GLOBAL)` in pretty mode
+      // (`label = moduleName === "global" ? "GLOBAL" : moduleName`), so the json
+      // field must carry the same `GLOBAL` token, not the raw `global`.
+      const explicit = parseJson("global", (logger) => logger.info("boot"));
+      expect(explicit.module).toBe("GLOBAL");
+
+      const omitted = parseJson(undefined, (logger) => logger.info("boot"));
+      expect(omitted.module).toBe("GLOBAL");
+    });
+
+    it("does not silently clobber a caller-supplied `module` metadata key (2-arg form)", () => {
+      const parsed = parseJson("api", (logger) => logger.info("m", { module: "caller-owned" }));
+      // Caller precedence: the caller's own value wins; ours is not added.
+      expect(parsed.module).toBe("caller-owned");
+    });
+
+    it("does not silently clobber a caller-supplied `module` key on the single-object form", () => {
+      const parsed = parseJson("api", (logger) =>
+        logger.info({ message: "m", module: "caller-owned" }),
+      );
+      expect(parsed.module).toBe("caller-owned");
+    });
+
+    it("does not mutate the caller's object when stamping the field (single-object form)", () => {
+      // The injector returns a FRESH object, so the caller's own object never
+      // gains a `module` property. (winston/`buildTimestampCapture` still write
+      // `level`/`timestamp` — the documented reserved-slot boundary — but
+      // `module` is package-added metadata and must not land on caller state.)
+      const event: Record<string, unknown> = { message: "m", id: 7 };
+      parseJson("api", (logger) => logger.info(event));
+      expect(Object.prototype.hasOwnProperty.call(event, "module")).toBe(false);
+      expect(event.id).toBe(7);
+    });
+
+    it("stamps the module on an Error line alongside its message and stack", () => {
+      const parsed = parseJson("api", (logger) => logger.error(new Error("boom-module")));
+      expect(parsed.module).toBe("api");
+      expect(parsed.message).toBe("boom-module");
+      expect(typeof parsed.stack).toBe("string");
+      expect(parsed.stack as string).toContain("Error: boom-module");
+    });
+
+    it("stamps the module when maskMetaKeys is configured (survives redaction)", () => {
+      const parsed = parseJson(
+        "api",
+        (logger) => logger.info("Login", { password: "hunter2", userId: 42 }),
+        ["password"],
+      );
+      expect(parsed.module).toBe("api");
+      expect(parsed.password).toBe("[REDACTED]");
+      expect(parsed.userId).toBe(42);
+    });
+
+    it("boundary: a single-object toJSON DTO line carries NO module field (toJSON owns the line)", () => {
+      class UserDto {
+        public message = "user loaded";
+        toJSON(): Record<string, unknown> {
+          return { message: this.message };
+        }
+      }
+      const parsed = parseJson("api", (logger) => logger.info(new UserDto()));
+      expect(parsed).toEqual({ message: "user loaded" });
+      expect(parsed).not.toHaveProperty("module");
+    });
+
+    it("boundary: an array info stays an array (no index-keyed rebuild, no module)", () => {
+      const parsed = JSON.parse(
+        renderJsonLine("api", (logger) => logger.log("info", ["a", "b"] as never)),
+      ) as unknown;
+      expect(parsed).toEqual(["a", "b"]);
+    });
+
+    it("emits the same `module` field on the console as in the file (json)", () => {
+      const captureConsole = (emit: () => void): string => {
+        const written: string[] = [];
+        const target =
+          (console as unknown as { _stdout?: NodeJS.WritableStream })._stdout ?? process.stdout;
+        const original = target.write.bind(target);
+        (target as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
+          written.push(String(chunk));
+          return true;
+        };
+        try {
+          emit();
+        } finally {
+          (target as unknown as { write: unknown }).write = original;
+        }
+        return written.join("");
+      };
+      const consoleOut = captureConsole(() => {
+        const logger = createLogger({
+          moduleName: "api",
+          includeConsole: true,
+          includeFile: false,
+          includeGlobalFile: false,
+          format: "json",
+        });
+        logger.info("Login", { userId: 42 });
+        teardownLogger(logger);
+      });
+      const parsed = JSON.parse(consoleOut.trim()) as Record<string, unknown>;
+      expect(parsed.module).toBe("api");
+      expect(parsed.userId).toBe(42);
+    });
+
+    it("boundary: a single-object toJSON DTO gets NO module on the console either (no file/console divergence)", () => {
+      // The injector lives only on the logger-level chain, so it skips the DTO
+      // (which still carries its `toJSON`) once, upstream. The console never sees
+      // a second injector, so it cannot re-stamp `module` onto the shallow clone
+      // whose prototype (and `toJSON`) was stripped — console and file agree.
+      const captureConsole = (emit: () => void): string => {
+        const written: string[] = [];
+        const target =
+          (console as unknown as { _stdout?: NodeJS.WritableStream })._stdout ?? process.stdout;
+        const original = target.write.bind(target);
+        (target as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
+          written.push(String(chunk));
+          return true;
+        };
+        try {
+          emit();
+        } finally {
+          (target as unknown as { write: unknown }).write = original;
+        }
+        return written.join("");
+      };
+      class UserDto {
+        public message = "user loaded";
+        toJSON(): Record<string, unknown> {
+          return { message: this.message };
+        }
+      }
+      const consoleOut = captureConsole(() => {
+        const logger = createLogger({
+          moduleName: "api",
+          includeConsole: true,
+          includeFile: false,
+          includeGlobalFile: false,
+          format: "json",
+        });
+        logger.info(new UserDto());
+        teardownLogger(logger);
+      });
+      const parsed = JSON.parse(consoleOut.trim()) as Record<string, unknown>;
+      // (The console line may carry level/timestamp that the file's toJSON output
+      // omits — that is the pre-existing console-vs-file toJSON boundary, pinned
+      // elsewhere. The module-specific guarantee is the only thing under test
+      // here: `module` is absent on the console just as it is on the file.)
+      expect(parsed).not.toHaveProperty("module");
+      expect(parsed.message).toBe("user loaded");
+    });
+
+    it("does not add a `module` metadata field in pretty mode (json-only change)", () => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        moduleName: "api",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        format: "pretty",
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      logger.info("Login");
+      teardownLogger(logger);
+      const rendered = chunks.join("");
+      expect(rendered).toContain("(api)");
+      expect(rendered).not.toContain('"module"');
+    });
+
+    it("buildModuleFieldInjector: returns a fresh object with the field, preserving symbols", () => {
+      const injector = __loggerInternals.buildModuleFieldInjector("api");
+      const LEVEL = Symbol.for("level");
+      const input: Record<string | symbol, unknown> = {
+        level: "info",
+        message: "m",
+        [LEVEL]: "info",
+      };
+      const out = injector.transform(input as any) as Record<string | symbol, unknown>;
+      expect(out).not.toBe(input);
+      expect(out[__loggerInternals.MODULE_FIELD]).toBe("api");
+      expect(out[LEVEL]).toBe("info");
+      // The input is left untouched.
+      expect(Object.prototype.hasOwnProperty.call(input, "module")).toBe(false);
+    });
+
+    it("buildModuleFieldInjector: skips FORBIDDEN_KEYS when rebuilding the fresh object", () => {
+      const injector = __loggerInternals.buildModuleFieldInjector("api");
+      // A `__proto__` own data property (as `JSON.parse('{"__proto__":{}}')`
+      // mints) must not be copied onto the fresh object — the same
+      // prototype-pollution guard the rest of the pipeline applies.
+      const input = JSON.parse('{"message":"m","__proto__":{"polluted":true}}') as Record<
+        string,
+        unknown
+      >;
+      const out = injector.transform(input as any) as Record<string, unknown>;
+      expect(out.module).toBe("api");
+      expect(Object.prototype.hasOwnProperty.call(out, "__proto__")).toBe(false);
+      expect((out as { polluted?: unknown }).polluted).toBeUndefined();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // Formatter totality — a log call must never throw at the caller.
   //
   // The pretty printf runs synchronously inside `logger.log()`, so every

@@ -949,6 +949,121 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
     return next as unknown as winston.Logform.TransformableInfo;
   })();
 
+/**
+ * Top-level JSON field name carrying the module identifier. Its value is
+ * `ctx.label` — the module name, or the literal `"GLOBAL"` for the default
+ * `moduleName: "global"`, so the field renders consistently with the pretty
+ * pipeline's `(GLOBAL)` label. NOT re-exported through `src/index.ts`; the
+ * emitted field name is public JSON surface, but this constant is internal.
+ */
+const MODULE_FIELD = "module";
+
+/**
+ * `format: "json"` counterpart to the pretty pipeline's `(label)` rendering:
+ * stamps the module label onto every emitted JSON line as a top-level
+ * `MODULE_FIELD` (`"module"`) field, so the shared `all-logs` file — which
+ * interleaves lines from every module — can attribute each line to the module
+ * that produced it. JSON mode previously carried no module identifier at all,
+ * defeating the shared file for the structured-shipping audience it exists to
+ * serve. Added ONLY to the json branch, and only to the logger-level
+ * `sharedFormat` (the Console transport inherits the field through winston's
+ * shallow clone — see the chain-construction comment); the pretty chain already
+ * renders the label positionally.
+ *
+ * Contract (mirrors `buildMetaRedactor`'s caller-safety discipline):
+ *
+ * - **Caller precedence — never clobber.** If `info` already owns a `module`
+ *   key (a caller passed `{ module: ... }` in metadata, on any log form), it is
+ *   returned untouched so the caller's value wins. Detected with
+ *   `hasOwnProperty`, so an inherited `module` on a prototype does not suppress
+ *   the stamp.
+ * - **Non-mutating.** Returns a FRESH object with the field added; it never
+ *   assigns onto `info`. On winston's single-object log form (`logger.info({
+ *   ... })`, `create-logger.js:78`) and its 2-arg-object form (`logger.log(
+ *   "info", obj)`, `logger.js:246`) the info IS the caller's own object, so an
+ *   in-place `info.module = label` would add a stray `module` property to live
+ *   application state — the same hazard `buildMetaRedactor` and the middleware's
+ *   `ownContext` go out of their way to avoid. Symbol slots (`LEVEL` / `SPLAT`
+ *   / `MESSAGE`) are carried across by reference and `FORBIDDEN_KEYS`
+ *   (`__proto__` / `constructor` / `prototype`) are skipped, matching the
+ *   prototype-pollution guard every fresh rebuild in this pipeline applies.
+ * - **Getter-safe (invokes nothing).** Own string properties are transplanted by
+ *   DESCRIPTOR, not by value, so a metadata getter is never invoked here: a
+ *   throwing getter cannot take the line down (the fail-closed handling stays in
+ *   `buildMetaRedactor`), and a side-effecting getter is not double-fired. A
+ *   throwing `toJSON` getter is caught and treated as a skip.
+ * - **Shape-preserving skips (two documented boundaries, both leaving the line
+ *   with NO module field):**
+ *   - An ARRAY info (`logger.log("info", ["a","b"])` — `logger.js:245` takes
+ *     the object branch, so `info` IS the array) is returned unchanged so it
+ *     still serializes as `["a","b"]`, not the index-keyed object a plain
+ *     rebuild would produce.
+ *   - An info that defines its own `toJSON` (a single-object class DTO) is
+ *     returned unchanged, because `winston.format.json()`'s serializer resolves
+ *     `toJSON` ON THE VALUE and that output owns the ENTIRE serialized line —
+ *     so a `module` key added beside `toJSON` would be ignored anyway, and
+ *     resolving `toJSON` here to graft the field in would diverge from what the
+ *     no-mask line emits (`buildMetaRedactor` only resolves `toJSON` when a mask
+ *     is configured), breaking the mask-on ⊆ mask-off invariant its suite pins.
+ *     This narrow single-object-DTO form is the accepted gap.
+ *
+ * Placed AFTER `winston.format.errors({ stack: true })` so a logged `Error` is
+ * already flattened to a plain object by the time the field is stamped (stamping
+ * a raw `Error` would drop its non-enumerable `message` / `stack`), and BEFORE
+ * `buildMetaRedactor` so the injected field is an ordinary key the redactor
+ * threads through — which also means `maskMetaKeys: ["module"]` would redact it,
+ * an opt-in the operator controls.
+ */
+const buildModuleFieldInjector = (label: string) =>
+  winston.format((info) => {
+    const source = info as unknown as Record<string | symbol, unknown>;
+    if (Array.isArray(source)) {
+      return info;
+    }
+    // Reading `.toJSON` can invoke a caller-defined getter, which is caller code
+    // that may throw. Guard it: a throwing `toJSON` getter is treated exactly
+    // like a present `toJSON` — skip and leave the line for `buildMetaRedactor`
+    // / `json()` to handle with their own fail-closed logic, unchanged from
+    // before this format existed.
+    let definesToJSON: boolean;
+    try {
+      definesToJSON = typeof source.toJSON === "function";
+    } catch {
+      return info;
+    }
+    if (definesToJSON) {
+      return info;
+    }
+    if (Object.prototype.hasOwnProperty.call(source, MODULE_FIELD)) {
+      return info;
+    }
+    // Transplant each own property by its DESCRIPTOR rather than by value
+    // (`next[key] = source[key]`). Reading the value would invoke any getter,
+    // and a metadata getter is caller code: it may throw (which must NOT take
+    // the log line down — see the masked-getter-throws contract in
+    // `buildMetaRedactor`) or carry side effects (invoking it here AND again
+    // when `buildMetaRedactor` / `json()` read downstream would double-fire it).
+    // Copying the descriptor keeps the getter lazy, so this format performs zero
+    // value reads and the exact downstream invocation count is preserved.
+    const next: Record<string | symbol, unknown> = {};
+    for (const key of Object.keys(source)) {
+      if (FORBIDDEN_KEYS.has(key)) {
+        continue;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(source, key);
+      if (descriptor) {
+        Object.defineProperty(next, key, descriptor);
+      }
+    }
+    next[MODULE_FIELD] = label;
+    // The engine's Symbol slots (`LEVEL` / `SPLAT` / `MESSAGE`) are plain data
+    // properties, so a by-reference copy is safe and matches `buildMetaRedactor`.
+    for (const slot of Object.getOwnPropertySymbols(source)) {
+      next[slot] = source[slot];
+    }
+    return next as unknown as winston.Logform.TransformableInfo;
+  })();
+
 /** Substituted for a value the pretty-mode formatter could not serialize. */
 const UNSERIALIZABLE = "[UNSERIALIZABLE]";
 
@@ -1534,9 +1649,14 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     // Datadog, Loki, ELK, Splunk, Vector. The timestamp capture writes the
     // canonical `info.timestamp` first; `errors({ stack: true })` resolves
     // Error instances to `{ message, stack, ...rest }` so the stack survives
-    // the JSON serialization; `buildMetaRedactor` runs the shared deep
-    // redaction over caller-supplied metadata BEFORE `json()` serializes —
-    // so secrets never reach the line.
+    // the JSON serialization; `buildModuleFieldInjector` stamps the module
+    // label as a top-level `module` field so the shared `all-logs` file can
+    // attribute each line to its module (the pretty chain renders `(label)`
+    // instead); `buildMetaRedactor` runs the shared deep redaction over
+    // caller-supplied metadata BEFORE `json()` serializes — so secrets never
+    // reach the line. The injector runs AFTER `errors()` (so a logged Error is
+    // already a plain object) and BEFORE `buildMetaRedactor` (so the field is a
+    // normal key the redactor threads through).
     //
     // KNOWN BOUNDARY: `json()` is winston's own serializer and is not wrapped,
     // so a payload nested deeply enough to exhaust `JSON.stringify` itself
@@ -1556,9 +1676,22 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     // new value — making the console JSON timestamp diverge from the file JSON
     // timestamp. Omitting it here means `json()` serializes the timestamp that
     // was already captured at log-call time, keeping all outputs identical.
+    // The module-field injector lives ONLY on the logger-level `sharedFormat`,
+    // NOT on the Console transport's own chain. Winston runs `sharedFormat`
+    // first and then hands each transport a shallow clone (`Object.assign({},
+    // info)`, `winston-transport/modern.js:91`) of the result — and the injected
+    // `module` is an ordinary own enumerable string key, so the clone carries it
+    // into the console's own serialization for free. Adding a second injector to
+    // the console chain would instead REINTRODUCE a file/console divergence for a
+    // single-object `toJSON` DTO: `sharedFormat`'s injector correctly skips it
+    // (it still carries its `toJSON`), but the clone the console sees has already
+    // lost that `toJSON` (a shallow clone drops the prototype), so a console-side
+    // injector would no longer skip and would stamp a `module` the file line
+    // lacks. Injecting once, upstream, keeps the console and file lines identical.
     sharedFormat = winston.format.combine(
       timestampCapture,
       winston.format.errors({ stack: true }),
+      buildModuleFieldInjector(label),
       buildMetaRedactor(maskMetaKeySet),
       winston.format.json(),
     );
@@ -2437,6 +2570,8 @@ export const __loggerInternals = {
   formatMessage,
   buildTimestampCapture,
   buildMetaRedactor,
+  buildModuleFieldInjector,
+  MODULE_FIELD,
   resolveLogDirectory,
   buildRegistryKey,
   buildOptionsSignature,

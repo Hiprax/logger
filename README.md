@@ -416,6 +416,7 @@ Each call writes a single line such as:
   "level": "info",
   "message": "Login",
   "timestamp": "2026-05-04 14:30:22",
+  "module": "api",
   "userId": 42,
   "email": "u@example.com",
   "password": "[REDACTED]",
@@ -428,6 +429,7 @@ Canonical fields:
 - `level` — winston npm log level (`error`, `warn`, `info`, `http`, `verbose`, `debug`, `silly`).
 - `message` — the rendered message string.
 - `timestamp` — captured at log-call time as a UTC `"YYYY-MM-DD HH:mm:ss"` string (matches the pretty pipeline's `UTC:` line).
+- `module` — the module identifier, so a line in the shared global (`all-logs`) file can be attributed to the module that produced it. It carries the same display label the pretty pipeline renders as `(…)`: your `moduleName`, or the literal `GLOBAL` for the default `moduleName: "global"`. If your metadata already includes a `module` key, your value is kept — the field is never silently overwritten. Two narrow log forms carry no `module` field: a single-object payload that defines its own `toJSON()` (its `toJSON` output owns the whole line) and a top-level array payload (it serializes as an array).
 - `stack` — populated by `winston.format.errors({ stack: true })` whenever the logged value is an `Error`.
 - _Caller metadata_ — every key/value pair passed in the metadata object (e.g. `logger.info("msg", { ... })`) is merged onto the top-level JSON object.
 
