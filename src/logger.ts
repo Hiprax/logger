@@ -516,10 +516,13 @@ interface FormatOptions {
   maskMetaKeys?: ReadonlySet<string>;
   /**
    * When `true`, the printf replaces every `\r` and `\n` byte in a string-typed
-   * `info.message` with the literal escape sequences `"\\r"` / `"\\n"` BEFORE
-   * concatenating the message into the rendered log line. See the
-   * `LoggerOptions.escapeMessageNewlines` JSDoc for the full threat model.
-   * Defaults to `false`.
+   * `info.message` AND a string-typed `info.stack` with the literal escape
+   * sequences `"\\r"` / `"\\n"` BEFORE concatenating them into the rendered log
+   * line. The stack is covered because `errors({ stack: true })` flattens a
+   * logged `Error` into a string message plus a string stack, so escaping only
+   * the message would let `logger.error(new Error(untrusted))` re-inject the
+   * payload raw one line lower. See the `LoggerOptions.escapeMessageNewlines`
+   * JSDoc for the full threat model. Defaults to `false`.
    */
   escapeMessageNewlines?: boolean;
 }
@@ -759,17 +762,33 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
         : typeof info.message === "bigint"
           ? info.message.toString()
           : (safeStringify(info.message, 2) ?? String(info.message));
-    // When `escapeMessageNewlines` is on AND the original message was a string,
-    // rewrite embedded `\r` / `\n` to their visible escape sequences so a
-    // user-supplied payload like `"alice\n[ERROR] (admin)\nfake event"` cannot
-    // forge an extra log line that is byte-for-byte indistinguishable from one
-    // the application itself produced. Non-string messages are already
-    // serialized through `JSON.stringify` (which escapes newlines), so the
-    // option only acts on the string branch.
-    const message =
-      escapeMessageNewlines && typeof info.message === "string"
-        ? rawMessage.replace(/\r/g, "\\r").replace(/\n/g, "\\n")
-        : rawMessage;
+    // When `escapeMessageNewlines` is on, rewrite embedded `\r` / `\n` to their
+    // visible escape sequences so a user-supplied payload like
+    // `"alice\n[ERROR] (admin)\nfake event"` cannot forge an extra log line that
+    // is byte-for-byte indistinguishable from one the application itself
+    // produced.
+    //
+    // This is applied to EVERY string-typed caller value the printf emits
+    // verbatim — currently `info.message` and `info.stack`. Covering the stack
+    // is load-bearing, not symmetry: `winston.format.errors({ stack: true })`
+    // runs ahead of this printf in both chains and flattens a logged `Error`
+    // into a string `message` AND a string `stack` that repeats the message in
+    // its first line. Escaping only the message therefore left
+    // `logger.error(new Error(untrusted))` able to re-inject the payload's raw
+    // newlines through the stack line rendered immediately below — forging a
+    // line byte-identical to this printf's own `${levelToken} (${label})` form
+    // and defeating the option's entire threat model.
+    //
+    // The trade-off is deliberate: with the option ON a genuine multi-line stack
+    // renders as one line with literal `\n` separators. That is inherent to the
+    // guarantee (a forged line and a real stack frame are the same bytes to a
+    // log parser), it keeps every frame present and greppable rather than
+    // dropped, and the option is opt-in (default `false`), so no default
+    // behavior changes. Non-string values on either branch are serialized
+    // through `safeStringify`, whose JSON encoding already escapes newlines.
+    const escapeIfEnabled = (value: string): string =>
+      escapeMessageNewlines ? value.replace(/\r/g, "\\r").replace(/\n/g, "\\n") : value;
+    const message = typeof info.message === "string" ? escapeIfEnabled(rawMessage) : rawMessage;
 
     const { stack, level: _level, message: _msg, timestamp: capturedTimestamp, ...metadata } = info;
     // When the consumer configured `maskMetaKeys`, deep-redact the metadata
@@ -829,7 +848,7 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
     lines.push(`${levelToken} (${label})`, message);
 
     if (stack) {
-      lines.push(typeof stack === "string" ? stack : safeStringify(stack, 2));
+      lines.push(typeof stack === "string" ? escapeIfEnabled(stack) : safeStringify(stack, 2));
     }
 
     if (cleanedMeta) {

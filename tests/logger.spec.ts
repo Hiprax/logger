@@ -4785,6 +4785,91 @@ describe("createLogger", () => {
       expect(output).toContain("alpha\\r\\nbeta");
       expect(output).not.toContain("alpha\r\nbeta");
     });
+
+    /**
+     * Renders `logger.error(new Error(payload))` through the real pipeline —
+     * which is what makes this test meaningful. `errors({ stack: true })` runs
+     * ahead of the printf and flattens the Error into a string `message` PLUS a
+     * string `stack` whose first line repeats that message, so an Error is the
+     * one input that reaches the printf's stack branch with attacker bytes in
+     * it. Rendering the formatter in isolation would not exercise it.
+     */
+    const renderInjectedError = (escape: boolean): string => {
+      const stream = new PassThrough();
+      const chunks: string[] = [];
+      stream.on("data", (chunk) => chunks.push(chunk.toString()));
+      const logger = createLogger({
+        // The printf's `(label)` is the moduleName (`src/logger.ts:1261`).
+        moduleName: `escape-stack-${escape ? "on" : "off"}`,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        escapeMessageNewlines: escape,
+        additionalTransports: [new winston.transports.Stream({ stream })],
+      });
+      logger.error(new Error(FORGERY_PAYLOAD));
+      teardownLogger(logger);
+      return chunks.join("");
+    };
+
+    /**
+     * A username-shaped payload that closes the current line and opens a fake
+     * one in the printf's own `${levelToken} (${label})` format.
+     */
+    const FORGERY_PAYLOAD =
+      "login failed for alice\n[ERROR] (admin)\nfake critical event: account drained";
+    const FORGED_LINE = "[ERROR] (admin)";
+
+    it("escapes the stack of an Error so a payload cannot forge a log line", () => {
+      const rendered = renderInjectedError(true);
+      // The core guarantee: no rendered LINE is the forged entry. Asserting on
+      // whole lines (not `toContain`) is what actually pins the defect — the
+      // forged text still appears, escaped and inline, which is the point.
+      const lines = rendered.split("\n");
+      expect(lines).not.toContain(FORGED_LINE);
+      // Nothing on the payload's behalf survived as a real newline byte...
+      expect(rendered).not.toContain("alice\n[ERROR]");
+      // ...but the payload's contents are still fully readable for debugging,
+      // now as visible literal escape sequences, on BOTH the message line and
+      // the stack line below it.
+      expect(rendered).toContain("alice\\n[ERROR] (admin)\\nfake critical event");
+      // The genuine entry this logger produced is of course still a real line.
+      expect(lines).toContain("[ERROR] (escape-stack-on)");
+    });
+
+    it("leaves an Error stack rendering unchanged when omitted (back-compat)", () => {
+      const rendered = renderInjectedError(false);
+      // Default (`false`) behavior is untouched by the stack fix: the stack
+      // renders verbatim, multi-line, raw newlines intact. This is the
+      // back-compat pin — the forged line IS present here, which is precisely
+      // the exposure the opt-in option exists to close.
+      expect(rendered).toContain("alice\n[ERROR] (admin)\nfake critical event");
+      expect(rendered).not.toContain("alice\\n[ERROR]");
+      // A real multi-line stack still spans multiple lines when the option is
+      // off — the trade-off documented on the option applies only when it is on.
+      expect(rendered).toContain("\n    at ");
+    });
+
+    it("escapes a string stack directly through the printf, and passes through when off", () => {
+      // Direct internals call pinning the stack branch itself, independent of
+      // winston's `errors()` flattening — including that a NON-string stack
+      // still goes through safeStringify (whose JSON encoding escapes newlines
+      // on its own) rather than the escape helper.
+      const render = (escape: boolean, stack: unknown): string => {
+        const formatter = __loggerInternals.formatMessage(
+          { label: "test", timezones: [] },
+          { includeTimestamps: false, escapeMessageNewlines: escape },
+        );
+        const info = formatter.transform({ level: "error", message: "boom", stack } as any);
+        return Reflect.get(info as Record<PropertyKey, unknown>, Symbol.for("message")) as string;
+      };
+
+      expect(render(true, "Error: boom\n    at forged")).toContain("Error: boom\\n    at forged");
+      expect(render(false, "Error: boom\n    at forged")).toContain("Error: boom\n    at forged");
+      // Non-string stack: serialized, not escaped — the sequence below is
+      // JSON.stringify's own escaping, present regardless of the option.
+      expect(render(true, { nested: "a\nb" })).toContain("a\\nb");
+    });
   });
 
   describe("defaultRotation export", () => {

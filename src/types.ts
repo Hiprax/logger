@@ -360,9 +360,11 @@ export interface LoggerOptions {
   format?: "pretty" | "json";
   /**
    * When `true`, replaces every `\r` and `\n` character in a string-typed
-   * `info.message` with the literal escape sequences `"\\r"` and `"\\n"` BEFORE
-   * the printf concatenates the message into the rendered log line. Defaults
-   * to `false` for backward compatibility.
+   * `info.message` — and in a string-typed `info.stack` — with the literal
+   * escape sequences `"\\r"` and `"\\n"` BEFORE the printf concatenates them
+   * into the rendered log line. Defaults to `false` for backward
+   * compatibility. Applies to the `pretty` format only; `json` output escapes
+   * newlines inherently.
    *
    * **Threat model.** Most loggers — including Winston by default — write the
    * caller-supplied `message` verbatim. When the message string is built from
@@ -377,8 +379,26 @@ export interface LoggerOptions {
    * Setting `escapeMessageNewlines: true` flips the default to safe: embedded
    * newlines render as the visible literal sequences `\\n` / `\\r`, preserving
    * the original message contents for debugging while making forged log lines
-   * obvious. Non-string messages (objects, errors) are unaffected — they are
-   * already serialized through `JSON.stringify`, which escapes newlines.
+   * obvious.
+   *
+   * **The escape covers the rendered `stack` line too**, and must: wrapping the
+   * untrusted string in an `Error` (`logger.error(new Error(username))`) is
+   * otherwise a complete bypass. `winston.format.errors({ stack: true })`
+   * flattens the `Error` into a string message plus a string stack whose first
+   * line repeats that same message, so the payload escaped on the message line
+   * was re-injected raw one line below it, forging the same fake `[ERROR]`
+   * entry the option exists to prevent.
+   *
+   * **Trade-off (opt-in only).** With this option ON, a genuine multi-line
+   * stack trace renders as a SINGLE line whose frame separators appear as the
+   * literal `\\n` sequence. Every frame is still present and greppable, nothing
+   * is dropped, and this is inherent to the guarantee — a real stack frame and
+   * a forged log line are the same bytes to a log parser, so newlines from
+   * caller-supplied data cannot be trusted selectively. Consumers whose
+   * pipeline depends on multi-line stack rendering should leave the option at
+   * its `false` default, in which both the message and the stack render exactly
+   * as they always have. Values that are not strings on either branch are
+   * serialized through `JSON.stringify`, which escapes newlines regardless.
    *
    * Mature production loggers (pino, bunyan, application-log shippers) ship
    * the equivalent of this option enabled by default; this package keeps it
