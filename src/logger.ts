@@ -672,6 +672,71 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
     return `${lines.join("\n")}\n`;
   });
 
+/**
+ * Shape of the parts of a `DailyRotateFile` this module reaches past the public
+ * typings for: the `logStream` its `close()` drains, and the `_final` hook it
+ * does not define.
+ */
+interface RotateFileInternals {
+  _final?: (callback: (err?: Error) => void) => void;
+  logStream?: { end: (callback?: () => void) => void };
+}
+
+/**
+ * Gives a `DailyRotateFile` the `Writable._final` hook it omits, so that
+ * `end()` genuinely drains it.
+ *
+ * **This is the fix for a silent, total data-loss bug, and it belongs here
+ * rather than in any one caller.** Node defers a writable's `finish` until
+ * `_final`'s callback runs; a writable with NO `_final` emits `finish` as soon
+ * as its queued `_write` calls return. `DailyRotateFile` defines no `_final`,
+ * yet its real sink is a separate `logStream` that is still buffering at that
+ * moment — so its `finish` was a lie. Everything that trusted it inherited the
+ * lie: `logger.end()` (winston's `Logger._final` awaits each transport's
+ * `finish`) and therefore {@link shutdownLogger}, which resolved with NOTHING on
+ * disk. The documented SIGTERM idiom `await shutdownAllLoggers();
+ * process.exit(0)` lost every buffered line — verified: 2000 lines in, 0 on
+ * disk; with this hook, 2000 of 2000.
+ *
+ * `DailyRotateFile.prototype.close` already proves `logStream.end(cb)` is the
+ * real drain (`logStream.end(() => this.emit("finish"))`); this supplies the
+ * same drain through the contract Node actually consults, so `end()` and
+ * `close()` finally agree. Fixing it at construction — instead of teaching each
+ * caller to prefer `close()` — keeps `awaitTransportFlush`, `settleTransport`
+ * (`crash-capture.ts`) and `endSharedTransport` (`shared-file-transport.ts`) all
+ * correct against one honest transport, and mirrors the precedent the shared
+ * global-file handle already sets by assigning its own `_final`.
+ *
+ * Two details are load-bearing:
+ * - The `typeof !== "function"` guard means a future upstream release that ships
+ *   its own `_final` is never clobbered.
+ * - `() => callback()` DISCARDS the callback's error argument. `logStream.end(cb)`
+ *   on an already-ended stream invokes `cb(ERR_STREAM_ALREADY_FINISHED)`, and
+ *   Node's `callFinal` turns a `_final` error into an `error` event on the
+ *   transport — console noise via `attachTransportErrorHandler` for a
+ *   non-problem. A second drain is reachable in normal use: `winston-transport`
+ *   calls `close()` on `unpipe` (i.e. `logger.close()`).
+ */
+const installRotateFileFinal = (transport: DailyRotateFile): DailyRotateFile => {
+  const internals = transport as unknown as RotateFileInternals;
+  if (typeof internals._final !== "function") {
+    internals._final = (callback: (err?: Error) => void): void => {
+      try {
+        if (internals.logStream) {
+          internals.logStream.end(() => callback());
+          return;
+        }
+        callback();
+      } catch {
+        // A stream already mid-teardown can throw on a second `end()`. The
+        // bytes are someone else's drain to await; never wedge `end()`.
+        callback();
+      }
+    };
+  }
+  return transport;
+};
+
 const buildRotateTransport = (options: {
   filename: string;
   level: LogLevel;
@@ -679,7 +744,7 @@ const buildRotateTransport = (options: {
 }) => {
   const rotation = { ...defaultRotation, ...options.rotation };
 
-  return new DailyRotateFile({
+  const transport = new DailyRotateFile({
     filename: options.filename,
     datePattern: rotation.datePattern,
     maxSize: rotation.maxSize,
@@ -687,6 +752,8 @@ const buildRotateTransport = (options: {
     zippedArchive: rotation.zippedArchive,
     level: options.level,
   });
+
+  return installRotateFileFinal(transport);
 };
 
 const MAX_TRACKED_TRANSPORT_ERRORS = 10;
@@ -1603,6 +1670,14 @@ export interface ShutdownOptions {
  * fires. The returned promise is wired into a `Promise.race` against a timeout
  * by the caller — never used standalone — so it does NOT reject on its own.
  *
+ * `finish` is trustworthy as a drain signal precisely because every transport
+ * this package builds honors the `Writable._final` contract — Node defers
+ * `finish` until `_final`'s callback runs. `winston.transports.File` ships one,
+ * the shared global-file handle assigns one, and `buildRotateTransport` supplies
+ * the one `DailyRotateFile` is missing (see the `_final` it installs there,
+ * without which this awaiter would resolve on a `finish` fired while the
+ * rotating file was still buffering).
+ *
  * Some legacy `winston-transport`-derived transports never emit `finish` (e.g.
  * the bare `Console` transport, some custom in-memory stubs). To keep those
  * from blocking the overall flush, we ALSO listen for `close` and resolve when
@@ -1648,9 +1723,19 @@ const awaitTransportFlush = (
 
 /**
  * Gracefully shuts down a logger by calling `logger.end()` (winston's flush
- * API) and awaiting `finish` on every transport. Resolves once every transport
- * has flushed, or rejects with a clear timeout error after `timeoutMs` ms
+ * API) and then draining every transport. Resolves once every transport's bytes
+ * are actually out, or rejects with a clear timeout error after `timeoutMs` ms
  * (default 5000).
+ *
+ * **The resolve signal is the real drain, not just a `finish`.** Node defers a
+ * writable's `finish` until its `_final` callback runs, so `finish` means "my
+ * bytes are out" only for a transport that implements `_final`. A
+ * `DailyRotateFile` ships none, and its `finish` fires while the underlying
+ * `logStream` is still buffering — awaiting that and then calling
+ * `process.exit(0)` (the documented SIGTERM idiom on
+ * {@link shutdownAllLoggers}) lost every buffered line. The rotating transport
+ * is therefore built with the `_final` it omits, so the `finish` this helper
+ * awaits is honest; see `installRotateFileFinal`.
  *
  * **Idempotent for successful shutdowns:** a second call after the first
  * resolves returns the same cached resolved promise — `logger.end()` is never
@@ -1701,8 +1786,22 @@ export const shutdownLogger = (
   // fallback is required.
   const transports = [...logger.transports];
 
-  // Issue the graceful flush. winston's `Logger.end()` is a no-op on an
-  // already-ended logger (the underlying writable's second `end()` is a
+  // Subscribe BEFORE `end()`. Each per-transport awaiter exposes its own
+  // `cleanup()` so we can detach the `finish`/`close` listeners regardless of
+  // which side of the race wins. Without this the timeout branch would leak one
+  // pair of listeners per transport per timed-out shutdown call — a real
+  // concern for long-lived processes that supervise repeated restarts (test
+  // loops, k8s probes).
+  const awaiters = transports.map((transport) => awaitTransportFlush(transport));
+
+  // Issue the graceful flush. This is what drives winston's own pipeline, and
+  // draining the transports directly instead would NOT do: the Logger's own
+  // buffers hold every info a back-pressuring transport has not accepted yet,
+  // and `Logger._final` is what hands those over (by calling `transport.end()`
+  // on each). Each transport then reaches a truthful `finish` through its
+  // `_final` — the rotating file included, per `installRotateFileFinal`.
+  // winston's `Logger.end()` is a no-op on an already-ended logger (the
+  // underlying writable's second `end()` is a
   // documented no-op), so the idempotent re-shutdown path is safe — but the
   // early `shutdownPromises` cache hit above also short-circuits before we
   // ever reach this line on a repeat call.
@@ -1715,13 +1814,6 @@ export const shutdownLogger = (
   // deregistering a logger that was never registered (e.g. a no-op logger, or
   // one created with `captureUncaught: false`) is a safe no-op.
   deregisterCrashCapture(proxyToBaseLogger.get(logger) ?? logger);
-
-  // Each per-transport awaiter exposes its own `cleanup()` so we can detach
-  // the `finish`/`close` listeners regardless of which side of the race wins.
-  // Without this the timeout branch would leak one pair of `once` listeners
-  // per transport per timed-out shutdown call — a real concern for long-lived
-  // processes that supervise repeated restarts (test loops, k8s probes).
-  const awaiters = transports.map((transport) => awaitTransportFlush(transport));
   const flushAll = Promise.all(awaiters.map((awaiter) => awaiter.promise)).then(() => undefined);
 
   let timeoutHandle: NodeJS.Timeout | undefined;
@@ -1808,6 +1900,7 @@ export const __loggerInternals = {
   buildOptionsSignature,
   diffSignatures,
   isWinstonCompatibleTransport,
+  installRotateFileFinal,
   validateAdditionalTransports,
   resolveColorizeFlags,
   validateLogLevelOption,

@@ -1916,6 +1916,318 @@ describe("createLogger", () => {
       teardownLogger(logger);
     });
 
+    // -------------------------------------------------------------------------
+    // Phase 1 — shutdownLogger must actually flush to disk
+    //
+    // Regression guard for the data-loss defect: `shutdownLogger` used to await
+    // only `finish`, and a `DailyRotateFile` implements no `_final`, so `end()`
+    // emitted `finish` while its `logStream` was still buffering. The helper
+    // resolved with NOTHING on disk, which meant the documented SIGTERM idiom
+    // (`await shutdownAllLoggers(); process.exit(0)`) lost every buffered line.
+    //
+    // These tests are deliberately end-to-end: they read the real rotating log
+    // file back off disk AFTER the await resolves. Asserting on transport
+    // internals or `finish` events would have stayed green throughout the bug.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Concatenates every rotated log file written for `prefix` in `dir`. Reading
+     * the directory rather than reconstructing the `-%DATE%.log` filename keeps
+     * the assertion independent of the rotator's local-vs-UTC date resolution.
+     */
+    const readLogFiles = (dir: string, prefix: string): string => {
+      if (!fs.existsSync(dir)) {
+        return "";
+      }
+      return fs
+        .readdirSync(dir)
+        .filter((name) => name.startsWith(`${prefix}-`) && name.endsWith(".log"))
+        .map((name) => fs.readFileSync(path.join(dir, name), "utf8"))
+        .join("");
+    };
+
+    it("flushes a single line to the module file before resolving (Phase 1)", async () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "flush-single",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      });
+
+      logger.info("SINGLE-LINE-ON-DISK");
+
+      await shutdownLogger(logger);
+
+      // The await has resolved — the bytes MUST already be readable. Before the
+      // fix this file did not even exist at this point.
+      expect(readLogFiles(root, "flush-single")).toContain("SINGLE-LINE-ON-DISK");
+      teardownLogger(logger);
+    });
+
+    it("flushes a bulk write to the module file before resolving (Phase 1)", async () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "flush-bulk",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      });
+
+      const total = 500;
+      for (let i = 0; i < total; i += 1) {
+        logger.info(`bulk-line-${i}`);
+      }
+
+      await shutdownLogger(logger);
+
+      // Every line, not just the first — the original defect lost the entire
+      // buffer, and a partial drain would be just as much a data-loss bug.
+      const contents = readLogFiles(root, "flush-bulk");
+      for (let i = 0; i < total; i += 1) {
+        expect(contents).toContain(`bulk-line-${i}`);
+      }
+      teardownLogger(logger);
+    });
+
+    it("flushes both the module and shared global file under the default config (Phase 1)", async () => {
+      const root = createTempDir();
+      // `includeFile` and `includeGlobalFile` both default to true — this is the
+      // configuration the README's SIGTERM example produces.
+      const logger = createLogger({
+        moduleName: "flush-default",
+        logDirectory: root,
+        includeConsole: false,
+      });
+
+      logger.info("DEFAULT-CONFIG-LINE");
+
+      await shutdownLogger(logger);
+
+      expect(readLogFiles(root, "flush-default")).toContain("DEFAULT-CONFIG-LINE");
+      // The shared global file drains through the refcounted handle's `_final`,
+      // a different code path from the module file's `DailyRotateFile`.
+      expect(readLogFiles(root, "all-logs")).toContain("DEFAULT-CONFIG-LINE");
+      teardownLogger(logger);
+    });
+
+    it("flushes to disk via shutdownAllLoggers before resolving (Phase 1)", async () => {
+      const root = createTempDir();
+      const a = createLogger({
+        moduleName: "flush-all-a",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      });
+      const b = createLogger({
+        moduleName: "flush-all-b",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      });
+      a.info("ALL-LOGGERS-A");
+      b.info("ALL-LOGGERS-B");
+
+      // This is the exact idiom the `shutdownAllLoggers` JSDoc documents for a
+      // SIGTERM handler that then calls `process.exit(0)`.
+      await shutdownAllLoggers({ timeoutMs: 5000 });
+
+      expect(readLogFiles(root, "flush-all-a")).toContain("ALL-LOGGERS-A");
+      expect(readLogFiles(root, "flush-all-b")).toContain("ALL-LOGGERS-B");
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    it("partial shutdown flushes one logger while the shared global file stays usable (Phase 1)", async () => {
+      const root = createTempDir();
+      const a = createLogger({
+        moduleName: "partial-a",
+        logDirectory: root,
+        includeConsole: false,
+      });
+      const b = createLogger({
+        moduleName: "partial-b",
+        logDirectory: root,
+        includeConsole: false,
+      });
+
+      a.info("PARTIAL-FROM-A");
+      b.info("PARTIAL-FROM-B");
+
+      // Shut down ONLY `a`. The shared global transport is refcounted, so `b`
+      // still holds a handle and the file must stay open and writable.
+      await shutdownLogger(a);
+
+      expect(readLogFiles(root, "partial-a")).toContain("PARTIAL-FROM-A");
+
+      // `b` survives `a`'s shutdown and can still write to both its own module
+      // file and the shared global file.
+      b.info("PARTIAL-AFTER-A-SHUTDOWN");
+      await shutdownLogger(b);
+
+      const bContents = readLogFiles(root, "partial-b");
+      expect(bContents).toContain("PARTIAL-FROM-B");
+      expect(bContents).toContain("PARTIAL-AFTER-A-SHUTDOWN");
+
+      // The shared global file must carry every line from BOTH loggers,
+      // including the one written after `a` was already down.
+      const globalContents = readLogFiles(root, "all-logs");
+      expect(globalContents).toContain("PARTIAL-FROM-A");
+      expect(globalContents).toContain("PARTIAL-FROM-B");
+      expect(globalContents).toContain("PARTIAL-AFTER-A-SHUTDOWN");
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    it("flushes an additional transport that brings its own _final (Phase 1)", async () => {
+      // `winston.transports.File` ships a correct `_final` of its own AND a
+      // `close()` that emits `flush`/`closed` but NEVER `finish`/`close`. It is
+      // the reason the drain lives in `buildRotateTransport` rather than in a
+      // "prefer close() over end()" rule inside the flush: such a rule would
+      // hang here until the shutdown timeout.
+      const root = createTempDir();
+      const filename = path.join(root, "final-transport.log");
+      const fileTransport = new winston.transports.File({ filename });
+
+      const logger = createLogger({
+        moduleName: "flush-final-transport",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [fileTransport as unknown as winston.transport],
+      });
+
+      logger.info("FINAL-TRANSPORT-LINE");
+
+      // Must resolve well inside the deadline, not reject.
+      await expect(shutdownLogger(logger, { timeoutMs: 2000 })).resolves.toBeUndefined();
+
+      expect(fs.readFileSync(filename, "utf8")).toContain("FINAL-TRANSPORT-LINE");
+      teardownLogger(logger);
+    });
+
+    it("keeps driving winston's pipeline via logger.end() for a back-pressuring transport (Phase 1)", async () => {
+      // Pins WHY the drain lives in the transport's `_final` rather than in a
+      // "close() each transport instead of calling logger.end()" flush.
+      //
+      // A transport whose `log()` callback is ASYNC back-pressures the winston
+      // pipe: its writable buffer fills, `pipe` pauses the Logger's readable,
+      // and the remaining infos sit in the Logger's OWN buffers. `logger.end()`
+      // is the only thing that hands those over (`Logger._final`). Draining the
+      // transports directly without it strands everything behind the
+      // back-pressure — measured at ONE line of 2000 delivered.
+      class AsyncTransport extends Transport {
+        public name = "async-backpressure";
+        public received: string[] = [];
+        public finalCalled = false;
+        public log = (info: { message?: unknown }, callback?: () => void): void => {
+          setImmediate(() => {
+            this.received.push(String(info.message));
+            callback?.();
+          });
+        };
+        public _final = (callback: (err?: Error) => void): void => {
+          this.finalCalled = true;
+          callback();
+        };
+      }
+      const asyncTransport = new AsyncTransport();
+
+      const logger = createLogger({
+        moduleName: "flush-async-backpressure",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [asyncTransport as unknown as winston.transport],
+      });
+
+      const total = 200;
+      for (let i = 0; i < total; i += 1) {
+        logger.info(`async-line-${i}`);
+      }
+
+      await shutdownLogger(logger, { timeoutMs: 5000 });
+
+      // `_final` only runs because `shutdownLogger` called `logger.end()`, whose
+      // `Logger._final` ends each transport. This is the load-bearing assertion.
+      expect(asyncTransport.finalCalled).toBe(true);
+
+      // ...and the pipeline really did hand over the back-pressured backlog,
+      // far beyond the handful the transport's own writable could hold in
+      // flight (objectMode highWaterMark is 16). Without `logger.end()` this is
+      // 1. NOTE: this is deliberately a lower bound, not `total`. winston's own
+      // `Logger._final` ends each transport while the Logger's readable may
+      // still hold queued chunks, so the tail is lost to a write-after-end that
+      // the base logger's no-op `error` listener swallows. That is an upstream
+      // winston race, reproducible with bare winston and no part of this
+      // package; asserting `total` here would pin a guarantee winston does not
+      // make.
+      expect(asyncTransport.received.length).toBeGreaterThan(100);
+      teardownLogger(logger);
+    });
+
+    it("installRotateFileFinal drains logStream and never clobbers an existing _final (Phase 1)", async () => {
+      // Unit-level coverage for the hook that makes `DailyRotateFile.end()`
+      // truthful. The rotating file defines no `_final`, so Node emits `finish`
+      // the moment its queued writes return — while `logStream` is still
+      // buffering. This installs the missing drain.
+      const ended: string[] = [];
+      const stub = {
+        logStream: {
+          end: (callback?: () => void): void => {
+            ended.push("drained");
+            callback?.();
+          },
+        },
+      } as unknown as DailyRotateFile;
+
+      __loggerInternals.installRotateFileFinal(stub);
+      const withFinal = stub as unknown as {
+        _final: (callback: (err?: Error) => void) => void;
+      };
+      expect(typeof withFinal._final).toBe("function");
+
+      // `_final` must not call back until `logStream.end()` has drained.
+      await new Promise<void>((resolve) => withFinal._final(() => resolve()));
+      expect(ended).toEqual(["drained"]);
+
+      // A transport that already has a `_final` (a future upstream release, or
+      // `winston.transports.File`) must be left exactly as it was.
+      const existing = jest.fn((callback: (err?: Error) => void) => callback());
+      const preEquipped = { _final: existing } as unknown as DailyRotateFile;
+      __loggerInternals.installRotateFileFinal(preEquipped);
+      expect((preEquipped as unknown as { _final: unknown })._final).toBe(existing);
+    });
+
+    it("installRotateFileFinal settles when logStream is absent or throws (Phase 1)", async () => {
+      // No `logStream` yet: `_final` must still call back rather than wedge
+      // `end()` forever.
+      const noStream = {} as unknown as DailyRotateFile;
+      __loggerInternals.installRotateFileFinal(noStream);
+      await expect(
+        new Promise<void>((resolve) =>
+          (noStream as unknown as { _final: (cb: () => void) => void })._final(() => resolve()),
+        ),
+      ).resolves.toBeUndefined();
+
+      // A stream already mid-teardown can throw on a second `end()`. That must
+      // degrade to "settle", never to a hang.
+      const throwing = {
+        logStream: {
+          end: (): void => {
+            throw new Error("end boom");
+          },
+        },
+      } as unknown as DailyRotateFile;
+      __loggerInternals.installRotateFileFinal(throwing);
+      await expect(
+        new Promise<void>((resolve) =>
+          (throwing as unknown as { _final: (cb: () => void) => void })._final(() => resolve()),
+        ),
+      ).resolves.toBeUndefined();
+    });
+
     it("awaitTransportFlush exposes a cleanup() that detaches both listeners", () => {
       // Direct unit-level coverage for the listener-cleanup helper. After
       // calling cleanup() neither `finish` nor `close` should retain the

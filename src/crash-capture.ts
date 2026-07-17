@@ -146,14 +146,19 @@ const getPrimaryEntry = (): [winston.Logger, CrashCapturePolicy] | undefined => 
  * only on the terminal exit path, so the listeners it attaches are never
  * cleaned up — the process is about to end.
  *
- * **Prefers `close()` over `end()`, and that is load-bearing.** A
- * `DailyRotateFile` defines no `_final`, so `end()` emits `finish` on the next
- * tick while its `logStream` is still buffering — awaiting that and then
- * calling `process.exit(1)` races the write and loses the crash record.
- * `close()` is the real drain (`logStream.end(() => this.emit("finish"))`), and
- * the shared-global-file handle mirrors that same contract. Transports with no
- * `close()` (winston's `Console`, most custom ones) buffer nothing that
- * survives the tick and do emit `finish` from `end()`.
+ * **Prefers `close()` over `end()`, and that is deliberate.** `close()` is a
+ * `DailyRotateFile`'s direct drain (`logStream.end(() => this.emit("finish"))`),
+ * so it holds without the transport honoring the `Writable._final` contract.
+ * The rotating transports `logger.ts` builds are given the `_final` the class
+ * omits (see `installRotateFileFinal`), so `end()` drains those as well; a
+ * transport that arrives here from anywhere else carries no such guarantee, and
+ * a stock `DailyRotateFile` would emit `finish` on the next tick while its
+ * `logStream` was still buffering — awaiting that and then calling
+ * `process.exit(1)` races the write and loses the crash record. `close()` is
+ * correct for both, and the shared-global-file handle mirrors the same
+ * contract. Transports with no `close()` (winston's `Console`, most custom
+ * ones) buffer nothing that survives the tick and do emit `finish` from
+ * `end()`.
  */
 const settleTransport = (transport: winston.transport): Promise<void> =>
   new Promise<void>((resolve) => {

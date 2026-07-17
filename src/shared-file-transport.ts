@@ -88,17 +88,20 @@ const sharedFileRegistry = new Map<string, SharedFileEntry>();
  * Tears the shared transport down and resolves once its bytes are actually on
  * disk. The transport's own `finish`/`close` is the signal.
  *
- * **`close()`, not `end()` — this distinction is load-bearing.**
- * `DailyRotateFile` defines no `_final`, so `end()` runs straight through
- * readable-stream's prefinish and emits `finish` on the next tick **while the
- * underlying `logStream` is still buffering** — verified: `end()` reports
- * `finish` with 0 bytes written, `close()` reports it with the bytes on disk.
- * The only real drain is `close()`, which does
- * `logStream.end(() => this.emit("finish"))` (`daily-rotate-file.js`). Awaiting
- * `end()`'s `finish` would make the crash-exit path (which calls
- * `process.exit(1)` the moment this resolves) race the write and lose the
- * record. `logStream` is created eagerly in the constructor, so `close()`
- * emits `finish` even on a transport that never wrote.
+ * **`close()`, not `end()` — and that is deliberate.** `close()` is
+ * `DailyRotateFile`'s direct drain (`logStream.end(() => this.emit("finish"))`,
+ * `daily-rotate-file.js`), so it does not depend on the transport honoring the
+ * `Writable._final` contract at all. That independence is the point: the
+ * transports `logger.ts` builds are handed the `_final` the class itself omits
+ * (see `installRotateFileFinal`), so `end()` would drain those too — but a
+ * transport reaching this teardown from anywhere else has no such guarantee,
+ * and `close()` covers both. Left as `end()` against a stock `DailyRotateFile`
+ * this would emit `finish` on the next tick **while the underlying `logStream`
+ * was still buffering** — verified: `end()` reports `finish` with 0 bytes
+ * written, `close()` reports it with the bytes on disk — and the crash-exit path
+ * (which calls `process.exit(1)` the moment this resolves) would race the write
+ * and lose the record. `logStream` is created eagerly in the constructor, so
+ * `close()` emits `finish` even on a transport that never wrote.
  */
 const endSharedTransport = (entry: SharedFileEntry): Promise<void> => {
   if (entry.closePromise) {
