@@ -232,6 +232,70 @@ const loggerRegistry = new Map<string, RegistryEntry>();
 const proxyToBaseLogger = new WeakMap<winston.Logger, winston.Logger>();
 
 /**
+ * Maps each public logger Proxy back to the `loggerRegistry` key it was cached
+ * under, so {@link shutdownLogger} can evict the entry in O(1) instead of
+ * scanning the whole registry for a matching value.
+ *
+ * Keyed by the **Proxy**, matching `loggerRegistry`'s stored `logger` and
+ * `shutdownPromises` — `shutdownLogger()` receives the Proxy, so this is the
+ * identity available at eviction time. (The crash-capture `registered` map is
+ * the odd one out: it stores base loggers, which is what `proxyToBaseLogger`
+ * exists to translate.)
+ *
+ * A `WeakMap` so a logger that is garbage-collected drops its entry
+ * automatically. Entries here can outlive the registry slot they name (after a
+ * `resetLoggerRegistry()`, or once a different logger has claimed the same
+ * key) — which is exactly why eviction re-checks that the entry still points at
+ * this logger before deleting it.
+ */
+const proxyToRegistryKey = new WeakMap<winston.Logger, string>();
+
+/**
+ * Drops a logger's `loggerRegistry` slot the moment it becomes unfit to be
+ * handed out again, so the next `createLogger()` for the same `moduleName` +
+ * `logDirectory` builds a fresh instance with live transports.
+ *
+ * Without this, a torn-down logger stayed cached forever and every later
+ * `createLogger()` on that key cache-hit and returned the ENDED instance: a
+ * logger whose `transports` is empty (winston derives it from the readable's
+ * pipe targets, and Node auto-unpipes each transport as it finishes), which
+ * throws nothing and warns nothing — winston's own "Attempt to write logs with
+ * no transports" guard tests `!this._readableState.pipes`, and `pipes` is an
+ * empty ARRAY, which is truthy — while the write-after-end error it raises is
+ * swallowed by the base logger's no-op `error` listener. Every line written to
+ * it vanished in total silence. Worker recycles, dev hot-reloads and
+ * shutdown-then-recreate loops all hit that path. A cache hit also returns
+ * before `registerCrashCapture`, so the stale entry left process-wide crash
+ * capture permanently dead after the first shutdown.
+ *
+ * **Only evicts when the slot still points at this exact logger.** The key is
+ * read from a `WeakMap` that can outlive the slot it names: after a
+ * `resetLoggerRegistry()` followed by a `createLogger()` on the same key, the
+ * slot holds a DIFFERENT, live logger, and tearing down the old detached
+ * instance must not evict its replacement. The identity check makes the
+ * eviction a no-op in that case, preserving the "detached loggers remain valid"
+ * contract — the same precedent `shared-file-transport.ts`'s `release()` sets
+ * for its own registry slot.
+ *
+ * A logger with no `WeakMap` entry (a `createNoopLogger()` result, or any
+ * winston logger the caller built themselves and passed to `shutdownLogger`)
+ * was never registered, so there is nothing to evict.
+ *
+ * Deliberately side-effect free beyond the `Map` delete: it runs inside the
+ * `close`/`end` proxy traps and on `shutdownLogger`'s synchronous path, where a
+ * throw would surface as an unrelated failure.
+ */
+const evictRegistryEntry = (logger: winston.Logger): void => {
+  const registryKey = proxyToRegistryKey.get(logger);
+  if (registryKey === undefined) {
+    return;
+  }
+  if (loggerRegistry.get(registryKey)?.logger === logger) {
+    loggerRegistry.delete(registryKey);
+  }
+};
+
+/**
  * Resolves a `logDirectory` to a stable absolute form suitable for cache key
  * comparisons. The resolved path:
  * - Is absolute (`path.resolve`).
@@ -1352,10 +1416,37 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
       //    swallows the failure. The crash would vanish silently. Deregistering
       //    here preserves the pre-v1.0.0 semantics and hands the primary role to
       //    a logger that can still write.
+      //    It must ALSO leave the logger registry. Winston's `close()` runs
+      //    `clear()` -> `unpipe()`, so the logger is left with zero transports
+      //    and silently discards every subsequent write — and a cached entry
+      //    would keep handing that corpse to the next `createLogger()` for this
+      //    key. `close()` is a documented teardown path (`resetLoggerRegistry`'s
+      //    own JSDoc treats it as co-equal to `shutdownLogger()` for releasing
+      //    a shared-file handle), so it needs the same eviction.
       if (prop === "close") {
         return (...args: unknown[]): unknown => {
           deregisterCrashCapture(target);
+          evictRegistryEntry(proxied);
           return (target.close as (...inner: unknown[]) => unknown).apply(target, args);
+        };
+      }
+
+      // 2b. `end()` is the third door to the same dead-logger-in-the-cache
+      //     state: it is terminal for the underlying stream, and winston's
+      //     `Logger._final` ends every transport, each of which Node then
+      //     auto-unpipes — leaving `transports` empty exactly as `close()`
+      //     does. A caller draining a logger by hand (rather than through
+      //     `shutdownLogger`) must not poison this cache key either. Eviction
+      //     is idempotent, so `shutdownLogger`'s own `end()` passing through
+      //     here costs nothing. Crash-capture deregistration is deliberately
+      //     NOT duplicated here: `close()` inherits it from winston's own
+      //     `unhandle()` semantics and `shutdownLogger` does it explicitly,
+      //     whereas a bare `end()` never carried it before and changing that
+      //     would alter crash-capture election beyond this cache fix.
+      if (prop === "end") {
+        return (...args: unknown[]): unknown => {
+          evictRegistryEntry(proxied);
+          return (target.end as (...inner: unknown[]) => unknown).apply(target, args);
         };
       }
 
@@ -1420,6 +1511,11 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
   // (not the Proxy) and remember the Proxy→base mapping so `shutdownLogger()`
   // can deregister it later.
   proxyToBaseLogger.set(proxied, baseLogger);
+  // Remember which registry slot this Proxy occupies so the teardown paths
+  // (`shutdownLogger()`, `close()`, `end()`) can evict it in O(1), synchronously
+  // as soon as the logger is ended — a torn-down logger must never be handed
+  // back out by a later `createLogger()` cache hit.
+  proxyToRegistryKey.set(proxied, registryKey);
   if (captureUncaught) {
     registerCrashCapture(baseLogger, {
       exitOnUncaught,
@@ -1752,6 +1848,24 @@ const awaitTransportFlush = (
  * `logger.info(...)` calls may silently no-op or throw depending on the
  * underlying transport state.
  *
+ * **Shutting down evicts the logger from the internal registry**, synchronously,
+ * as soon as `end()` is issued — on the timeout path as well as the success
+ * path. The cache entry for its `moduleName` + `logDirectory` is dropped, so the
+ * next {@link createLogger} call for that combination builds a brand-new
+ * instance with live transports rather than returning this ended one. (Before
+ * this, a post-shutdown `createLogger()` cache-hit returned the ended logger —
+ * zero transports, no error, no warning, every line silently discarded, and
+ * crash capture permanently dead because the cache hit returns before it can
+ * re-register.)
+ *
+ * Two consequences worth knowing:
+ * - Only the CACHE is cleared. A reference you already hold stays ended; this
+ *   does not heal a logger somebody already captured (an
+ *   auto-created `createRequestLogger` middleware logger, for instance).
+ * - A timed-out shutdown is still retryable through the reference you hold (see
+ *   above), but {@link shutdownAllLoggers} — which iterates the registry — will
+ *   not pick it up a second time, because it is no longer in the registry.
+ *
  * @example
  * ```ts
  * import { createLogger, shutdownLogger } from "@hiprax/logger";
@@ -1814,6 +1928,29 @@ export const shutdownLogger = (
   // deregistering a logger that was never registered (e.g. a no-op logger, or
   // one created with `captureUncaught: false`) is a safe no-op.
   deregisterCrashCapture(proxyToBaseLogger.get(logger) ?? logger);
+
+  // Evict the registry slot NOW — synchronously, in the same tick as `end()`,
+  // and regardless of how the flush below turns out.
+  //
+  // WHY HERE, and not on the success branch of the race:
+  // - `end()` above is unconditional and irreversible. The instant it runs the
+  //   logger is unfit to hand out, so that is the instant the cache must stop
+  //   offering it. Evicting only when the race settles would leave a window as
+  //   wide as `timeoutMs` (5000ms by default) in which a concurrent
+  //   `createLogger()` on this key still cache-hits and receives the ended
+  //   logger — the exact defect this eviction exists to close, merely narrowed.
+  // - A TIMED-OUT flush is not a reason to keep the entry. The timeout does not
+  //   mean "not ended yet"; it means "ended, and still not drained" — strictly
+  //   MORE broken, not less. Leaving it cached would trade a guaranteed,
+  //   unbounded, silent loss for a bounded one. Retryability is unaffected:
+  //   `shutdownLogger` reads only its argument, `shutdownPromises` and
+  //   `proxyToBaseLogger` — never the registry — so the documented
+  //   escalate-with-a-longer-timeout idiom works exactly as before.
+  //   (`shutdownAllLoggers` is the one caller that iterates the registry, so a
+  //   second bulk call will not re-attempt a timed-out logger; retry it through
+  //   the reference you hold.)
+  evictRegistryEntry(logger);
+
   const flushAll = Promise.all(awaiters.map((awaiter) => awaiter.promise)).then(() => undefined);
 
   let timeoutHandle: NodeJS.Timeout | undefined;
@@ -1867,6 +2004,14 @@ export const shutdownLogger = (
  * SIGTERM/SIGINT handler when the consumer has created several module-scoped
  * loggers and wants to flush them all before exiting. Same options as
  * {@link shutdownLogger}; the timeout applies INDEPENDENTLY to each logger.
+ *
+ * Every logger reached here is evicted from the registry (see
+ * {@link shutdownLogger}), so a subsequent `createLogger()` builds a fresh
+ * instance instead of receiving an ended one. The registry is snapshotted into
+ * an array before any shutdown starts, so the evictions cannot disturb the
+ * iteration. A logger that times out is evicted too and will therefore NOT be
+ * retried by a second `shutdownAllLoggers()` call — retry those through the
+ * references you hold.
  *
  * @example
  * ```ts

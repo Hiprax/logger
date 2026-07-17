@@ -2228,6 +2228,265 @@ describe("createLogger", () => {
       ).resolves.toBeUndefined();
     });
 
+    // -------------------------------------------------------------------------
+    // Phase 2 — a shut-down logger must not stay in the registry.
+    //
+    // `shutdownLogger` deregistered crash capture and released the shared-file
+    // handle but never evicted `loggerRegistry`, so a later `createLogger()` on
+    // the same `moduleName` + `logDirectory` cache-hit and returned the ENDED
+    // logger: `b === a`, `b.transports.length === 0`, and every subsequent write
+    // was silently discarded — no throw, no warning, nothing on disk. Worker
+    // recycles, dev hot-reload and shutdown-then-recreate loops all hit it.
+    //
+    // These tests assert the REPLACEMENT logger actually works end-to-end
+    // (bytes on disk), not merely that the identity differs — a fresh-but-broken
+    // instance would satisfy an identity check while still losing every line.
+    // -------------------------------------------------------------------------
+
+    it("evicts the registry entry so a later createLogger builds a fresh working logger (Phase 2)", async () => {
+      const root = createTempDir();
+      const options = {
+        moduleName: "evict-single",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      };
+
+      const a = createLogger(options);
+      a.info("BEFORE-SHUTDOWN");
+      await shutdownLogger(a);
+
+      const b = createLogger(options);
+
+      // The cache must NOT hand back the ended instance.
+      expect(b).not.toBe(a);
+      expect(b.transports.length).toBeGreaterThan(0);
+
+      b.info("AFTER-SHUTDOWN-WRITE");
+      await shutdownLogger(b);
+
+      // The load-bearing assertion: the post-shutdown line is really on disk.
+      // Before the fix this write vanished silently.
+      const contents = readLogFiles(root, "evict-single");
+      expect(contents).toContain("BEFORE-SHUTDOWN");
+      expect(contents).toContain("AFTER-SHUTDOWN-WRITE");
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    it("evicts every logger shut down via shutdownAllLoggers (Phase 2)", async () => {
+      const root = createTempDir();
+      const optionsA = {
+        moduleName: "evict-all-a",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      };
+      const optionsB = {
+        moduleName: "evict-all-b",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      };
+
+      const a1 = createLogger(optionsA);
+      const b1 = createLogger(optionsB);
+      a1.info("ALL-BEFORE-A");
+      b1.info("ALL-BEFORE-B");
+
+      await shutdownAllLoggers();
+
+      const a2 = createLogger(optionsA);
+      const b2 = createLogger(optionsB);
+      expect(a2).not.toBe(a1);
+      expect(b2).not.toBe(b1);
+
+      a2.info("ALL-AFTER-A");
+      b2.info("ALL-AFTER-B");
+      await shutdownAllLoggers();
+
+      expect(readLogFiles(root, "evict-all-a")).toContain("ALL-AFTER-A");
+      expect(readLogFiles(root, "evict-all-b")).toContain("ALL-AFTER-B");
+      teardownLogger(a1);
+      teardownLogger(b1);
+      teardownLogger(a2);
+      teardownLogger(b2);
+    });
+
+    it("re-registers crash capture for a logger created after a shutdown (Phase 2)", async () => {
+      const root = createTempDir();
+      const options = {
+        moduleName: "evict-crash",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+        captureUncaught: true,
+      };
+
+      const a = createLogger(options);
+      expect(__crashCaptureInternals.isInstalled()).toBe(true);
+
+      // Last logger down -> the coordinator's single listener pair is uninstalled.
+      await shutdownLogger(a);
+      expect(__crashCaptureInternals.isInstalled()).toBe(false);
+      expect(__crashCaptureInternals.registered.size).toBe(0);
+
+      // The replacement must be a real, registered participant again — an
+      // eviction that returned a fresh logger which never re-registered would
+      // leave the process with no crash capture at all.
+      const b = createLogger(options);
+      expect(b).not.toBe(a);
+      expect(__crashCaptureInternals.isInstalled()).toBe(true);
+      expect(__crashCaptureInternals.registered.size).toBe(1);
+
+      await shutdownLogger(b);
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    it("evicts on a TIMED-OUT shutdown too, and stays retryable by reference (Phase 2)", async () => {
+      // A timed-out shutdown evicts as well. `end()` is issued unconditionally
+      // before the flush race even starts, so a timed-out logger is not
+      // "maybe still usable" — it is ended AND still undrained, i.e. strictly
+      // more broken than a successful one. Keeping it cached would preserve the
+      // silent-loss defect on precisely the unhealthy path.
+      const root = createTempDir();
+      let releaseFinal: (() => void) | undefined;
+      class StallingTransport extends Transport {
+        public name = "stalling";
+        public log = jest.fn((_info: unknown, callback?: () => void) => callback?.());
+        public _final = (callback: (err?: Error) => void): void => {
+          releaseFinal = () => callback();
+        };
+      }
+
+      const options = {
+        moduleName: "evict-timeout",
+        logDirectory: root,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [new StallingTransport() as unknown as winston.transport],
+      };
+      const a = createLogger(options);
+
+      await expect(shutdownLogger(a, { timeoutMs: 20 })).rejects.toThrow(/timed out/);
+
+      // Evicted despite the rejection: the cache must not keep serving an ended
+      // logger just because its drain overran the deadline.
+      const b = createLogger(options);
+      expect(b).not.toBe(a);
+      expect(b.transports.length).toBeGreaterThan(0);
+
+      // Retry by reference still works — `shutdownLogger` never reads the
+      // registry, so eviction cannot break the documented escalate-with-a-
+      // longer-timeout idiom.
+      releaseFinal?.();
+      await expect(shutdownLogger(a, { timeoutMs: 2000 })).resolves.toBeUndefined();
+
+      await shutdownLogger(b);
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    it("evicts when a logger is torn down via close() or end() directly (Phase 2)", async () => {
+      // `shutdownLogger` is not the only door to a dead logger. Winston's
+      // `close()` runs `clear()` -> `unpipe()`, and `end()` drives
+      // `Logger._final` which ends every transport (Node then auto-unpipes
+      // each) — both leave `transports` empty and silently discard writes. A
+      // cached entry would keep serving that corpse.
+      const root = createTempDir();
+      const closeOptions = {
+        moduleName: "evict-close",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      };
+      const a = createLogger(closeOptions);
+      a.close();
+      const a2 = createLogger(closeOptions);
+      expect(a2).not.toBe(a);
+      expect(a2.transports.length).toBeGreaterThan(0);
+
+      const endOptions = {
+        moduleName: "evict-end",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      };
+      const b = createLogger(endOptions);
+      b.end();
+      const b2 = createLogger(endOptions);
+      expect(b2).not.toBe(b);
+
+      // The replacement is genuinely functional, not merely a new object.
+      b2.info("REPLACED-AFTER-END");
+      await shutdownLogger(b2);
+      expect(readLogFiles(root, "evict-end")).toContain("REPLACED-AFTER-END");
+
+      await shutdownLogger(a2);
+      teardownLogger(a);
+      teardownLogger(a2);
+      teardownLogger(b);
+      teardownLogger(b2);
+    });
+
+    it("only evicts when the registry slot still points at the shut-down logger (Phase 2)", async () => {
+      // `proxyToRegistryKey` can outlive the slot it names. After a
+      // `resetLoggerRegistry()` the same key is re-claimed by a DIFFERENT, live
+      // logger; shutting the old detached instance down must not evict its
+      // replacement out of the cache.
+      const root = createTempDir();
+      const options = {
+        moduleName: "evict-identity",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      };
+
+      const a = createLogger(options);
+      resetLoggerRegistry();
+      const b = createLogger(options);
+      expect(b).not.toBe(a);
+
+      // Shutting down the detached `a` must leave `b`'s slot alone.
+      await shutdownLogger(a);
+      expect(createLogger(options)).toBe(b);
+
+      b.info("IDENTITY-GUARD-LINE");
+      await shutdownLogger(b);
+      expect(readLogFiles(root, "evict-identity")).toContain("IDENTITY-GUARD-LINE");
+      teardownLogger(a);
+      teardownLogger(b);
+    });
+
+    it("shutting down a never-registered logger evicts nothing and does not throw (Phase 2)", async () => {
+      // A `createNoopLogger()` result (and any winston logger the caller built
+      // themselves) has no `proxyToRegistryKey` entry — the eviction must be a
+      // clean no-op rather than an error or a stray registry delete.
+      const root = createTempDir();
+      const cached = createLogger({
+        moduleName: "evict-noop-bystander",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      });
+
+      await expect(shutdownLogger(createNoopLogger())).resolves.toBeUndefined();
+
+      // The unrelated cached logger is untouched.
+      expect(
+        createLogger({
+          moduleName: "evict-noop-bystander",
+          logDirectory: root,
+          includeConsole: false,
+          includeGlobalFile: false,
+        }),
+      ).toBe(cached);
+      await shutdownLogger(cached);
+      teardownLogger(cached);
+    });
+
     it("awaitTransportFlush exposes a cleanup() that detaches both listeners", () => {
       // Direct unit-level coverage for the listener-cleanup helper. After
       // calling cleanup() neither `finish` nor `close` should retain the

@@ -224,6 +224,20 @@ process.once("SIGINT", handleSignal);
 
 `shutdownAllLoggers(options?)` is a convenience that walks the internal registry and calls `shutdownLogger()` on every cached logger in parallel. Both helpers `unref()` the timeout's `setTimeout` handle so a pending shutdown does not keep the event loop alive on its own.
 
+**Shutting a logger down also evicts it from the internal registry**, so a later `createLogger()` for the same `moduleName` + `logDirectory` builds a brand-new instance with live transports instead of returning the ended one. This matters for worker recycles, dev hot-reloads, and any shutdown-then-recreate loop:
+
+```ts
+const a = createLogger({ moduleName: "auth" });
+await shutdownLogger(a);
+
+const b = createLogger({ moduleName: "auth" }); // fresh instance, NOT `a`
+b.info("still logged"); // reaches disk
+```
+
+The eviction happens synchronously as soon as `end()` is issued, on the **timeout path as well as the success path** — a timed-out logger has already been ended, so it is no more usable than a successfully flushed one. Tearing a logger down with `logger.close()` or `logger.end()` directly evicts it too.
+
+Two things to know: only the *cache* is cleared, so a reference you already hold (or one captured by a `createRequestLogger` middleware) stays ended; and while a timed-out shutdown is still retryable through the reference you hold, `shutdownAllLoggers()` iterates the registry and so will not pick it up a second time.
+
 ---
 
 ### HTTP Request Logging Middleware (framework-agnostic)
