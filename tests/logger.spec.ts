@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +19,12 @@ import {
   __loggerInternals,
 } from "../src/logger";
 import type { ShutdownOptions } from "../src/logger";
+import { __crashCaptureInternals } from "../src/crash-capture";
+import {
+  __sharedFileInternals,
+  acquireSharedGlobalFile,
+  flushSharedFileTransportsForExit,
+} from "../src/shared-file-transport";
 import { InvalidTimezoneError, LoggerOptionError } from "../src/errors";
 import { createTempDir, teardownLogger } from "./_helpers";
 
@@ -31,6 +38,24 @@ class StubTransport extends Transport {
   public name = "stub-transport";
   public log = jest.fn((_info: unknown, callback?: () => void) => callback?.());
 }
+
+/**
+ * Returns the live shared global-file transports. Since v1.0.0 the global
+ * (`all-logs`) rotating-file transport is shared + reference-counted across
+ * loggers, so it is NOT present in `logger.transports` — the logger holds a
+ * cheap forwarding handle instead. Tests that need to assert on the real
+ * rotating-file options reach for it here.
+ */
+const sharedGlobalTransports = (): DailyRotateFile[] =>
+  Array.from(__sharedFileInternals.sharedFileRegistry.values()).map(
+    (entry) => entry.transport as unknown as DailyRotateFile,
+  );
+
+/** The module-scoped rotating file transports piped directly into a logger. */
+const moduleRotatingTransports = (logger: winston.Logger): DailyRotateFile[] =>
+  logger.transports.filter(
+    (transport): transport is DailyRotateFile => transport instanceof DailyRotateFile,
+  );
 
 const createNoopTransportLogger = () => {
   const stream = new PassThrough();
@@ -94,13 +119,15 @@ describe("createLogger", () => {
       globalRotation: { maxFiles: "30d" },
     });
 
-    const rotating = logger.transports.filter(
-      (transport): transport is DailyRotateFile => transport instanceof DailyRotateFile,
-    );
-
-    expect(rotating).toHaveLength(2);
+    // The module-scoped file is owned by this logger; the global file is the
+    // shared, reference-counted transport reached via the shared registry.
+    const rotating = moduleRotatingTransports(logger);
+    expect(rotating).toHaveLength(1);
     expect(rotating[0].options.maxFiles).toBe("2d");
-    expect(rotating[1].options.maxFiles).toBe("30d");
+
+    const shared = sharedGlobalTransports();
+    expect(shared).toHaveLength(1);
+    expect(shared[0].options.maxFiles).toBe("30d");
     teardownLogger(logger);
   });
 
@@ -120,13 +147,13 @@ describe("createLogger", () => {
       globalRotation: { maxFiles: "30D" },
     });
 
-    const rotating = logger.transports.filter(
-      (transport): transport is DailyRotateFile => transport instanceof DailyRotateFile,
-    );
-
-    expect(rotating).toHaveLength(2);
+    const rotating = moduleRotatingTransports(logger);
+    expect(rotating).toHaveLength(1);
     expect(rotating[0].options.maxFiles).toBe("14d");
-    expect(rotating[1].options.maxFiles).toBe("30d");
+
+    const shared = sharedGlobalTransports();
+    expect(shared).toHaveLength(1);
+    expect(shared[0].options.maxFiles).toBe("30d");
     teardownLogger(logger);
   });
 
@@ -287,13 +314,13 @@ describe("createLogger", () => {
       rotation: { maxFiles: "5d" },
     });
 
-    const rotating = logger.transports.filter(
-      (transport): transport is DailyRotateFile => transport instanceof DailyRotateFile,
-    );
-
-    expect(rotating).toHaveLength(2);
+    const rotating = moduleRotatingTransports(logger);
+    expect(rotating).toHaveLength(1);
     expect(rotating[0].options.maxFiles).toBe("5d");
-    expect(rotating[1].options.maxFiles).toBe("5d");
+
+    const shared = sharedGlobalTransports();
+    expect(shared).toHaveLength(1);
+    expect(shared[0].options.maxFiles).toBe("5d");
     teardownLogger(logger);
   });
 
@@ -1533,6 +1560,7 @@ describe("createLogger", () => {
         maskMetaKeys: [] as string[],
         colorize: { level: true, message: true },
         captureUncaught: true,
+        exitOnUncaught: true,
       };
       const a = __loggerInternals.buildOptionsSignature({
         ...base,
@@ -1560,6 +1588,7 @@ describe("createLogger", () => {
         format: "pretty" as const,
         colorize: { level: true, message: true },
         captureUncaught: true,
+        exitOnUncaught: true,
       };
       const a = __loggerInternals.buildOptionsSignature({
         ...base,
@@ -2092,82 +2121,39 @@ describe("createLogger", () => {
   });
 
   describe("captureUncaught", () => {
-    it("attaches handleExceptions/handleRejections to file transports when console is off", () => {
+    // Winston installs one `uncaughtException` + one `unhandledRejection`
+    // process listener per logger whose transports carry
+    // `handleExceptions`/`handleRejections`. As of v1.0.0 this package sets
+    // NEITHER flag on any transport and instead registers with a process-wide
+    // coordinator that owns a single listener pair. These tests pin that
+    // contract: no transport carries the flags, winston installs no per-logger
+    // catcher, and N loggers still cost exactly one listener pair.
+
+    const noFlags = (transport: winston.transport): void => {
+      const t = transport as unknown as { handleExceptions?: boolean; handleRejections?: boolean };
+      expect(t.handleExceptions === true).toBe(false);
+      expect(t.handleRejections === true).toBe(false);
+    };
+
+    it("sets no handleExceptions/handleRejections flag on any transport (file/console/global)", () => {
       const root = createTempDir();
       const logger = createLogger({
         moduleName: "uncaught-file-only",
         logDirectory: root,
-        includeConsole: false,
+        includeConsole: true,
         includeFile: true,
         includeGlobalFile: true,
         captureUncaught: true,
       });
 
-      const rotating = logger.transports.filter(
-        (transport): transport is DailyRotateFile => transport instanceof DailyRotateFile,
-      );
-      expect(rotating).toHaveLength(2);
-      rotating.forEach((transport) => {
-        // The flags are exposed as winston-transport-level properties; both
-        // must be `true` so the file transports persist any uncaught
-        // exception/rejection trace.
-        expect((transport as unknown as { handleExceptions: boolean }).handleExceptions).toBe(true);
-        expect((transport as unknown as { handleRejections: boolean }).handleRejections).toBe(true);
-      });
+      expect(logger.transports.length).toBeGreaterThan(0);
+      logger.transports.forEach(noFlags);
 
       teardownLogger(logger);
     });
 
-    it("falls back to the console transport when no file transports are enabled", () => {
-      const logger = createLogger({
-        moduleName: "uncaught-console-only",
-        includeConsole: true,
-        includeFile: false,
-        includeGlobalFile: false,
-        captureUncaught: true,
-      });
-
-      const consoleTransport = logger.transports.find(
-        (transport) => transport instanceof winston.transports.Console,
-      );
-      expect(consoleTransport).toBeDefined();
-      expect((consoleTransport as unknown as { handleExceptions: boolean }).handleExceptions).toBe(
-        true,
-      );
-      expect((consoleTransport as unknown as { handleRejections: boolean }).handleRejections).toBe(
-        true,
-      );
-
-      teardownLogger(logger);
-    });
-
-    it("does not attach exception/rejection handlers to any transport when captureUncaught is false", () => {
-      const root = createTempDir();
-      const logger = createLogger({
-        moduleName: "uncaught-disabled",
-        logDirectory: root,
-        includeConsole: true,
-        includeFile: true,
-        includeGlobalFile: true,
-        captureUncaught: false,
-      });
-
-      logger.transports.forEach((transport) => {
-        const t = transport as unknown as {
-          handleExceptions?: boolean;
-          handleRejections?: boolean;
-        };
-        // Either explicitly false or undefined — never `true`.
-        expect(t.handleExceptions === true).toBe(false);
-        expect(t.handleRejections === true).toBe(false);
-      });
-
-      teardownLogger(logger);
-    });
-
-    it("attaches handlers to additionalTransports when no built-in transports are enabled", () => {
+    it("sets no flag on additionalTransports either", () => {
       const stub = new StubTransport();
-
       const logger = createLogger({
         moduleName: "uncaught-additional-only",
         includeConsole: false,
@@ -2177,10 +2163,976 @@ describe("createLogger", () => {
         captureUncaught: true,
       });
 
-      expect((stub as unknown as { handleExceptions?: boolean }).handleExceptions).toBe(true);
-      expect((stub as unknown as { handleRejections?: boolean }).handleRejections).toBe(true);
+      noFlags(stub as unknown as winston.transport);
 
       teardownLogger(logger);
+    });
+
+    it("winston canary: a capture-enabled logger installs NO per-logger process catcher", () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "uncaught-canary",
+        logDirectory: root,
+        captureUncaught: true,
+      });
+
+      // `logger.exceptions` / `logger.rejections` pass through the Proxy to the
+      // real winston handler objects. Because no transport carries the flags,
+      // winston's `add()` never calls `exceptions.handle()`, so its `catcher`
+      // slot stays `false` and its `handlers` map stays empty — proving the
+      // per-logger process listener was NOT installed by winston.
+      const exc = (
+        logger as unknown as { exceptions: { catcher: unknown; handlers: Map<unknown, unknown> } }
+      ).exceptions;
+      const rej = (
+        logger as unknown as { rejections: { catcher: unknown; handlers: Map<unknown, unknown> } }
+      ).rejections;
+      expect(exc.catcher).toBeFalsy();
+      expect(rej.catcher).toBeFalsy();
+      expect(exc.handlers.size).toBe(0);
+      expect(rej.handlers.size).toBe(0);
+
+      teardownLogger(logger);
+    });
+
+    it("N distinct-module loggers add exactly ONE process-listener pair (the core fix)", () => {
+      const beforeUncaught = process.listenerCount("uncaughtException");
+      const beforeUnhandled = process.listenerCount("unhandledRejection");
+
+      const loggers = Array.from({ length: 11 }, (_unused, i) =>
+        createLogger({
+          moduleName: `leak-mod-${i}`,
+          includeConsole: false,
+          includeFile: false,
+          includeGlobalFile: false,
+          additionalTransports: [new StubTransport() as unknown as winston.transport],
+          captureUncaught: true,
+        }),
+      );
+
+      // The pre-v1.0.0 behavior added 11 + 11 here; the coordinator adds 1 + 1.
+      expect(process.listenerCount("uncaughtException") - beforeUncaught).toBe(1);
+      expect(process.listenerCount("unhandledRejection") - beforeUnhandled).toBe(1);
+
+      loggers.forEach((logger) => teardownLogger(logger));
+    });
+
+    it("captureUncaught:false registers nothing and adds no process listener", () => {
+      const beforeUncaught = process.listenerCount("uncaughtException");
+      const beforeUnhandled = process.listenerCount("unhandledRejection");
+
+      const logger = createLogger({
+        moduleName: "uncaught-disabled",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [new StubTransport() as unknown as winston.transport],
+        captureUncaught: false,
+      });
+
+      expect(process.listenerCount("uncaughtException") - beforeUncaught).toBe(0);
+      expect(process.listenerCount("unhandledRejection") - beforeUnhandled).toBe(0);
+      expect(__crashCaptureInternals.isInstalled()).toBe(false);
+      logger.transports.forEach(noFlags);
+
+      teardownLogger(logger);
+    });
+
+    it("strips crash flags from a caller-supplied transport that arrives pre-flagged", () => {
+      // A pre-flagged additionalTransport would make winston's add() install a
+      // process listener for THIS logger — silently re-creating the exact
+      // per-logger leak this release removes — and double-log every crash.
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+      const beforeUncaught = process.listenerCount("uncaughtException");
+      const beforeUnhandled = process.listenerCount("unhandledRejection");
+
+      const flagged = new StubTransport();
+      (flagged as unknown as { handleExceptions: boolean }).handleExceptions = true;
+      (flagged as unknown as { handleRejections: boolean }).handleRejections = true;
+
+      const a = createLogger({
+        moduleName: "preflagged-a",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [flagged as unknown as winston.transport],
+      });
+
+      const flagged2 = new StubTransport();
+      (flagged2 as unknown as { handleExceptions: boolean }).handleExceptions = true;
+      const b = createLogger({
+        moduleName: "preflagged-b",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [flagged2 as unknown as winston.transport],
+      });
+
+      noFlags(flagged as unknown as winston.transport);
+      noFlags(flagged2 as unknown as winston.transport);
+      // Still exactly ONE pair total — not one per logger.
+      expect(process.listenerCount("uncaughtException") - beforeUncaught).toBe(1);
+      expect(process.listenerCount("unhandledRejection") - beforeUnhandled).toBe(1);
+
+      // Explained once per process, not once per logger.
+      const stripWarnings = warn.mock.calls.filter((call) =>
+        String(call[0]).includes("handleExceptions"),
+      );
+      expect(stripWarnings).toHaveLength(1);
+
+      [a, b].forEach((logger) => teardownLogger(logger));
+    });
+
+    it("removes the process-listener pair once every logger is shut down", async () => {
+      const beforeUncaught = process.listenerCount("uncaughtException");
+      const beforeUnhandled = process.listenerCount("unhandledRejection");
+
+      const a = createLogger({
+        moduleName: "hygiene-a",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [new StubTransport() as unknown as winston.transport],
+      });
+      const b = createLogger({
+        moduleName: "hygiene-b",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [new StubTransport() as unknown as winston.transport],
+      });
+
+      expect(process.listenerCount("uncaughtException") - beforeUncaught).toBe(1);
+
+      await shutdownLogger(a);
+      // One logger still registered → listener stays installed.
+      expect(process.listenerCount("uncaughtException") - beforeUncaught).toBe(1);
+      expect(__crashCaptureInternals.isInstalled()).toBe(true);
+
+      await shutdownLogger(b);
+      // Last logger gone → coordinator uninstalls its pair.
+      expect(process.listenerCount("uncaughtException") - beforeUncaught).toBe(0);
+      expect(process.listenerCount("unhandledRejection") - beforeUnhandled).toBe(0);
+      expect(__crashCaptureInternals.isInstalled()).toBe(false);
+    });
+  });
+
+  describe("shared global-file transport", () => {
+    const sharedEntry = (): {
+      transport: winston.transport;
+      refCount: number;
+      handles: Set<winston.transport>;
+    } => {
+      const entries = Array.from(__sharedFileInternals.sharedFileRegistry.values());
+      expect(entries).toHaveLength(1);
+      return entries[0];
+    };
+
+    it("gives every logger on the same global path ONE underlying transport", () => {
+      const root = createTempDir();
+      const a = createLogger({ moduleName: "share-a", logDirectory: root, includeConsole: false });
+      const b = createLogger({ moduleName: "share-b", logDirectory: root, includeConsole: false });
+      const c = createLogger({ moduleName: "share-c", logDirectory: root, includeConsole: false });
+
+      // One real rotating-file transport (one file handle, one rotation state
+      // machine) backing all three loggers — the pre-v1.0.0 behavior built one
+      // DailyRotateFile per logger against the same path.
+      expect(__sharedFileInternals.sharedFileRegistry.size).toBe(1);
+      expect(sharedEntry().refCount).toBe(3);
+
+      // Each logger still holds its own module file, plus a forwarding handle.
+      expect(moduleRotatingTransports(a)).toHaveLength(1);
+      expect(moduleRotatingTransports(b)).toHaveLength(1);
+
+      [a, b, c].forEach((logger) => teardownLogger(logger));
+    });
+
+    it("a repeat createLogger() cache hit does not double-count the refcount", () => {
+      const root = createTempDir();
+      const first = createLogger({
+        moduleName: "share-cache",
+        logDirectory: root,
+        includeConsole: false,
+      });
+      const second = createLogger({
+        moduleName: "share-cache",
+        logDirectory: root,
+        includeConsole: false,
+      });
+
+      expect(second).toBe(first);
+      expect(sharedEntry().refCount).toBe(1);
+
+      teardownLogger(first);
+    });
+
+    it("writes from every sharing logger reach the shared file with their own labels", async () => {
+      const root = createTempDir();
+      const a = createLogger({ moduleName: "label-a", logDirectory: root, includeConsole: false });
+      const b = createLogger({ moduleName: "label-b", logDirectory: root, includeConsole: false });
+
+      const written: string[] = [];
+      const shared = sharedEntry().transport as unknown as {
+        log: (i: unknown, cb: () => void) => void;
+      };
+      const original = shared.log.bind(shared);
+      shared.log = (info: unknown, cb: () => void): void => {
+        written.push(String((info as Record<symbol, unknown>)[Symbol.for("message")]));
+        original(info, cb);
+      };
+
+      a.info("from-a");
+      b.info("from-b");
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      expect(written.some((line) => line.includes("(label-a)") && line.includes("from-a"))).toBe(
+        true,
+      );
+      expect(written.some((line) => line.includes("(label-b)") && line.includes("from-b"))).toBe(
+        true,
+      );
+
+      [a, b].forEach((logger) => teardownLogger(logger));
+    });
+
+    it("keeps per-logger level gating despite sharing one transport", async () => {
+      const root = createTempDir();
+      const quiet = createLogger({
+        moduleName: "gate-quiet",
+        logDirectory: root,
+        includeConsole: false,
+        level: "info",
+      });
+      const chatty = createLogger({
+        moduleName: "gate-chatty",
+        logDirectory: root,
+        includeConsole: false,
+        level: "debug",
+      });
+
+      const written: string[] = [];
+      const shared = sharedEntry().transport as unknown as {
+        log: (i: unknown, cb: () => void) => void;
+      };
+      const original = shared.log.bind(shared);
+      shared.log = (info: unknown, cb: () => void): void => {
+        written.push(String((info as { message?: unknown }).message));
+        original(info, cb);
+      };
+
+      quiet.debug("dropped-by-level");
+      chatty.debug("kept-by-level");
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      expect(written).toContain("kept-by-level");
+      expect(written).not.toContain("dropped-by-level");
+
+      [quiet, chatty].forEach((logger) => teardownLogger(logger));
+    });
+
+    it("shutting one logger down leaves the shared file open for the others", async () => {
+      const root = createTempDir();
+      const a = createLogger({ moduleName: "live-a", logDirectory: root, includeConsole: false });
+      const b = createLogger({ moduleName: "live-b", logDirectory: root, includeConsole: false });
+
+      const entry = sharedEntry();
+      const shared = entry.transport as unknown as { log: (i: unknown, cb: () => void) => void };
+      const written: string[] = [];
+      const original = shared.log.bind(shared);
+      shared.log = (info: unknown, cb: () => void): void => {
+        written.push(String((info as { message?: unknown }).message));
+        original(info, cb);
+      };
+
+      await shutdownLogger(a);
+
+      // The naive "share the DailyRotateFile itself" approach fails here:
+      // winston's _final would have ended the shared transport during a's
+      // shutdown and b's write would be dropped.
+      expect(entry.refCount).toBe(1);
+      b.info("still-writing");
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(written).toContain("still-writing");
+
+      await shutdownLogger(b);
+    });
+
+    it("releases and closes the underlying transport only on the last release", async () => {
+      const root = createTempDir();
+      const a = createLogger({ moduleName: "rel-a", logDirectory: root, includeConsole: false });
+      const b = createLogger({ moduleName: "rel-b", logDirectory: root, includeConsole: false });
+
+      const entry = sharedEntry();
+      expect(entry.refCount).toBe(2);
+
+      await shutdownLogger(a);
+      expect(entry.refCount).toBe(1);
+      expect(__sharedFileInternals.sharedFileRegistry.size).toBe(1);
+
+      await shutdownLogger(b);
+      expect(entry.refCount).toBe(0);
+      // Last handle gone → the entry is dropped and the real transport closed.
+      expect(__sharedFileInternals.sharedFileRegistry.size).toBe(0);
+      expect(entry.handles.size).toBe(0);
+    });
+
+    it("warns once when a second logger requests a conflicting global rotation", () => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+      const root = createTempDir();
+
+      const a = createLogger({
+        moduleName: "rot-a",
+        logDirectory: root,
+        includeConsole: false,
+        globalRotation: { maxFiles: "7d" },
+      });
+      const b = createLogger({
+        moduleName: "rot-b",
+        logDirectory: root,
+        includeConsole: false,
+        globalRotation: { maxFiles: "30d" },
+      });
+      const c = createLogger({
+        moduleName: "rot-c",
+        logDirectory: root,
+        includeConsole: false,
+        globalRotation: { maxFiles: "90d" },
+      });
+
+      const conflictWarnings = warn.mock.calls.filter((call) =>
+        String(call[0]).includes("Conflicting global-file rotation config"),
+      );
+      // Latched: one warning for the path, no matter how many conflict.
+      expect(conflictWarnings).toHaveLength(1);
+      // The creator's config wins.
+      expect(sharedGlobalTransports()[0].options.maxFiles).toBe("7d");
+
+      [a, b, c].forEach((logger) => teardownLogger(logger));
+    });
+
+    it("fans the shared transport's error events out to every sharing logger", () => {
+      const root = createTempDir();
+      const errorsA: Error[] = [];
+      const errorsB: Error[] = [];
+      const a = createLogger({
+        moduleName: "err-a",
+        logDirectory: root,
+        includeConsole: false,
+        onTransportError: (err) => errorsA.push(err),
+      });
+      const b = createLogger({
+        moduleName: "err-b",
+        logDirectory: root,
+        includeConsole: false,
+        onTransportError: (err) => errorsB.push(err),
+      });
+
+      const entry = sharedEntry();
+      // Exactly ONE error listener on the shared transport regardless of how
+      // many loggers share it — attaching one per logger would recreate a
+      // MaxListenersExceededWarning on the transport itself.
+      expect(entry.transport.listenerCount("error")).toBe(1);
+
+      entry.transport.emit("error", new Error("disk-on-fire"));
+
+      expect(errorsA.map((e) => e.message)).toContain("disk-on-fire");
+      expect(errorsB.map((e) => e.message)).toContain("disk-on-fire");
+
+      [a, b].forEach((logger) => teardownLogger(logger));
+    });
+
+    describe("release semantics for non-DailyRotateFile sinks", () => {
+      // `acquireSharedGlobalFile` takes an injected transport factory, so these
+      // drive the release path directly against stub sinks to pin its contract
+      // for transports that do not behave like a DailyRotateFile.
+      const acquireWithSink = (sink: unknown, key: string): winston.transport =>
+        acquireSharedGlobalFile({
+          key,
+          level: "info",
+          rotationSignature: "{}",
+          createTransport: () => sink as winston.transport,
+        });
+
+      const endHandle = (handle: winston.transport): Promise<void> =>
+        new Promise<void>((resolve) => {
+          handle.once("finish", () => resolve());
+          (handle as unknown as { end: () => void }).end();
+        });
+
+      it("releases when the sink exposes no end() method", async () => {
+        const sink = new EventEmitter();
+        const handle = acquireWithSink(sink, "sink-without-end");
+
+        // Must not hang: with no end() to await, the release settles at once.
+        await expect(endHandle(handle)).resolves.toBeUndefined();
+        expect(__sharedFileInternals.sharedFileRegistry.has("sink-without-end")).toBe(false);
+      });
+
+      it("releases even when the sink's end() throws", async () => {
+        const sink = Object.assign(new EventEmitter(), {
+          end: (): never => {
+            throw new Error("already torn down");
+          },
+        });
+        const handle = acquireWithSink(sink, "sink-end-throws");
+
+        await expect(endHandle(handle)).resolves.toBeUndefined();
+        expect(__sharedFileInternals.sharedFileRegistry.has("sink-end-throws")).toBe(false);
+      });
+
+      it("reports (not throws) a sink error that arrives after the last release", async () => {
+        // The shared transport is never piped into a logger, so the fan-out
+        // listener is its ONLY `error` listener. DailyRotateFile keeps emitting
+        // asynchronously after release (pruning, gzip). Detaching would leave an
+        // EventEmitter with zero error listeners, turning the next such error
+        // into an ERR_UNHANDLED_ERROR that kills the process.
+        const err = jest.spyOn(console, "error").mockImplementation(() => undefined);
+        const sink: EventEmitter & { close?: () => void } = new EventEmitter();
+        sink.close = (): void => {
+          sink.emit("finish");
+        };
+        const handle = acquireWithSink(sink, "sink-late-error");
+        await endHandle(handle);
+
+        expect(sink.listenerCount("error")).toBeGreaterThan(0);
+        expect(() => sink.emit("error", new Error("gzip failed after release"))).not.toThrow();
+        expect(
+          err.mock.calls.some((call) => String(call[0]).includes("gzip failed after release")),
+        ).toBe(true);
+
+        // A non-Error payload must stringify rather than read `.message` off it.
+        expect(() => sink.emit("error", "raw-string-failure")).not.toThrow();
+        expect(err.mock.calls.some((call) => String(call[0]).includes("raw-string-failure"))).toBe(
+          true,
+        );
+      });
+
+      it("closes the underlying sink at most once across release and exit-flush", async () => {
+        let closeCount = 0;
+        const sink: EventEmitter & { close?: () => void } = new EventEmitter();
+        sink.close = (): void => {
+          closeCount += 1;
+          sink.emit("finish");
+        };
+        const handle = acquireWithSink(sink, "sink-close-once");
+
+        // The exit flush and the last release both ask for teardown; the
+        // memoised closePromise means one real close(), one shared drain.
+        await Promise.all([flushSharedFileTransportsForExit(), endHandle(handle)]);
+        await flushSharedFileTransportsForExit();
+
+        expect(closeCount).toBe(1);
+      });
+
+      it("settles exactly once when the sink emits both finish and close", async () => {
+        const sink: EventEmitter & { end?: () => void } = new EventEmitter();
+        sink.end = (): void => {
+          // A sink that announces teardown twice must not double-invoke the
+          // stream _final callback (Node throws on a repeat callback).
+          sink.emit("finish");
+          sink.emit("close");
+        };
+        const handle = acquireWithSink(sink, "sink-double-signal");
+
+        let finishCount = 0;
+        handle.on("finish", () => {
+          finishCount += 1;
+        });
+        await endHandle(handle);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(finishCount).toBe(1);
+      });
+    });
+
+    it("does not create a shared transport when includeGlobalFile is false", () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "no-global",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+      });
+
+      expect(__sharedFileInternals.sharedFileRegistry.size).toBe(0);
+      teardownLogger(logger);
+    });
+  });
+
+  describe("crash-capture coordinator", () => {
+    let exitFn: jest.Mock;
+
+    beforeEach(() => {
+      exitFn = jest.fn();
+      __crashCaptureInternals.setExitFn(exitFn);
+    });
+
+    afterEach(() => {
+      __crashCaptureInternals.restoreExitFn();
+    });
+
+    const makeCaptureLogger = (
+      moduleName: string,
+      overrides: Record<string, unknown> = {},
+    ): { logger: winston.Logger; stub: StubTransport } => {
+      const stub = new StubTransport();
+      const logger = createLogger({
+        moduleName,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        additionalTransports: [stub as unknown as winston.transport],
+        captureUncaught: true,
+        ...overrides,
+      });
+      return { logger, stub };
+    };
+
+    const flushMicrotasks = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+    it("logs an uncaughtException exactly once through the primary logger", async () => {
+      const { stub } = makeCaptureLogger("crash-primary", { exitOnUncaught: false });
+
+      __crashCaptureInternals.invokeUncaught(new Error("boom-uncaught"));
+      await flushMicrotasks();
+
+      expect(stub.log).toHaveBeenCalledTimes(1);
+      const info = stub.log.mock.calls[0][0] as {
+        crash?: string;
+        exception?: boolean;
+        message?: string;
+        stack?: string;
+        process?: unknown;
+        trace?: unknown;
+      };
+      // The crash is surfaced under the non-filtered `crash` key. Winston's
+      // reserved `exception` marker is deliberately stripped: `winston-transport`
+      // drops `{ exception: true }` from every transport that lacks
+      // `handleExceptions`, and this package sets that flag on no transport.
+      expect(info.crash).toBe("uncaughtException");
+      expect(info.exception).toBeUndefined();
+      expect(String(info.message)).toContain("uncaughtException: boom-uncaught");
+      // The full winston diagnostic payload still rides along.
+      expect(info.stack).toContain("boom-uncaught");
+      expect(info.process).toBeDefined();
+      expect(Array.isArray(info.trace)).toBe(true);
+    });
+
+    it("logs an unhandledRejection through the primary with the rejection marker", async () => {
+      const { stub } = makeCaptureLogger("crash-rejection", { exitOnUncaught: false });
+
+      __crashCaptureInternals.invokeUnhandled(new Error("boom-rejection"));
+      await flushMicrotasks();
+
+      expect(stub.log).toHaveBeenCalledTimes(1);
+      const info = stub.log.mock.calls[0][0] as {
+        crash?: string;
+        rejection?: boolean;
+        message?: string;
+      };
+      expect(info.crash).toBe("unhandledRejection");
+      expect(info.rejection).toBeUndefined();
+      expect(String(info.message)).toContain("unhandledRejection: boom-rejection");
+    });
+
+    it("de-duplicates: only the primary logs the crash when multiple loggers are registered", async () => {
+      const { stub: stubA } = makeCaptureLogger("crash-dedup-a", { exitOnUncaught: false });
+      const { stub: stubB } = makeCaptureLogger("crash-dedup-b", { exitOnUncaught: false });
+
+      __crashCaptureInternals.invokeUncaught(new Error("boom-dedup"));
+      await flushMicrotasks();
+
+      expect(stubA.log).toHaveBeenCalledTimes(1);
+      expect(stubB.log).not.toHaveBeenCalled();
+    });
+
+    it("exits the process with code 1 by default after logging", async () => {
+      makeCaptureLogger("crash-exit-default");
+
+      __crashCaptureInternals.invokeUncaught(new Error("fatal"));
+      // Allow the flush-then-exit race to settle.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(exitFn).toHaveBeenCalledTimes(1);
+      expect(exitFn).toHaveBeenCalledWith(1);
+    });
+
+    it("does not exit when exitOnUncaught is false", async () => {
+      const { stub } = makeCaptureLogger("crash-no-exit", { exitOnUncaught: false });
+
+      __crashCaptureInternals.invokeUncaught(new Error("survivable"));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(stub.log).toHaveBeenCalledTimes(1);
+      expect(exitFn).not.toHaveBeenCalled();
+    });
+
+    it("re-elects a new primary after the current primary is shut down", async () => {
+      const { logger: loggerA, stub: stubA } = makeCaptureLogger("crash-reelect-a", {
+        exitOnUncaught: false,
+      });
+      const { stub: stubB } = makeCaptureLogger("crash-reelect-b", { exitOnUncaught: false });
+
+      // A is the primary; shutting it down deregisters it and promotes B.
+      await shutdownLogger(loggerA);
+
+      __crashCaptureInternals.invokeUncaught(new Error("after-reelect"));
+      await flushMicrotasks();
+
+      expect(stubB.log).toHaveBeenCalledTimes(1);
+      // A was shut down before the crash, so it must not receive it.
+      const aCrashCalls = stubA.log.mock.calls.filter((call) =>
+        String((call[0] as { message?: unknown }).message).includes("after-reelect"),
+      );
+      expect(aCrashCalls).toHaveLength(0);
+    });
+
+    it("logger.close() leaves crash capture so a closed logger cannot swallow the crash", async () => {
+      // Winston's own close() calls exceptions.unhandle(), so before v1.0.0
+      // closing a logger inherently stopped its capture. Without deregistering
+      // here, a closed-but-registered logger stays the elected primary and the
+      // next crash is routed into its ended stream — winston drops the write and
+      // the no-op error listener swallows the failure, losing the crash entirely.
+      const { logger: closed, stub: closedStub } = makeCaptureLogger("crash-closed", {
+        exitOnUncaught: false,
+      });
+      const { stub: liveStub } = makeCaptureLogger("crash-live", { exitOnUncaught: false });
+
+      closed.close();
+
+      __crashCaptureInternals.invokeUncaught(new Error("after-close"));
+      await flushMicrotasks();
+
+      // The live logger is promoted and records the crash; the closed one does not.
+      expect(liveStub.log).toHaveBeenCalledTimes(1);
+      expect((liveStub.log.mock.calls[0][0] as { crash?: string }).crash).toBe("uncaughtException");
+      expect(closedStub.log).not.toHaveBeenCalled();
+    });
+
+    it("is a no-op when no logger is registered", async () => {
+      // No capture logger created in this test → there is no primary entry.
+      __crashCaptureInternals.invokeUncaught(new Error("orphan"));
+      await flushMicrotasks();
+
+      expect(exitFn).not.toHaveBeenCalled();
+    });
+
+    it("the listeners actually installed on process route into the coordinator", async () => {
+      // Everything else in this suite drives `onFatal` directly. This test
+      // instead grabs the real functions the coordinator handed to
+      // `process.on(...)` and invokes those, proving the process wiring itself
+      // is correct end-to-end (rather than only the handler behind it).
+      const beforeUncaught = new Set(process.listeners("uncaughtException"));
+      const beforeUnhandled = new Set(process.listeners("unhandledRejection"));
+
+      const { stub } = makeCaptureLogger("crash-wiring", { exitOnUncaught: false });
+
+      const uncaughtListener = process
+        .listeners("uncaughtException")
+        .find((listener) => !beforeUncaught.has(listener));
+      const unhandledListener = process
+        .listeners("unhandledRejection")
+        .find((listener) => !beforeUnhandled.has(listener));
+
+      expect(uncaughtListener).toBeDefined();
+      expect(unhandledListener).toBeDefined();
+
+      (uncaughtListener as (err: Error) => void)(new Error("via-real-listener"));
+      (unhandledListener as (reason: unknown) => void)(new Error("via-real-rejection"));
+      await flushMicrotasks();
+
+      expect(stub.log).toHaveBeenCalledTimes(2);
+      expect((stub.log.mock.calls[0][0] as { crash?: string }).crash).toBe("uncaughtException");
+      expect((stub.log.mock.calls[1][0] as { crash?: string }).crash).toBe("unhandledRejection");
+    });
+
+    it("latches so a second fatal during the exit window cannot race a second exit", async () => {
+      makeCaptureLogger("crash-latch");
+
+      __crashCaptureInternals.invokeUncaught(new Error("first"));
+      __crashCaptureInternals.invokeUncaught(new Error("second"));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(exitFn).toHaveBeenCalledTimes(1);
+    });
+
+    it("shutdownLogger on a logger it never created is a safe no-op", async () => {
+      // Exercises the Proxy→base fallback: a logger that was never minted by
+      // createLogger has no entry in the Proxy→base map, so the raw logger is
+      // passed straight to deregisterCrashCapture (which ignores unknowns).
+      await expect(shutdownLogger(createNoopLogger())).resolves.toBeUndefined();
+    });
+
+    describe("defensive paths", () => {
+      /**
+       * Builds a minimal winston-Logger-shaped stub exposing exactly the
+       * surface the coordinator touches (`exceptions`/`rejections.getAllInfo`,
+       * `log`, `transports`, `end`) so each failure mode can be driven
+       * deterministically without a real transport stack.
+       */
+      const fakeLogger = (opts: {
+        getAllInfoThrows?: boolean;
+        logThrows?: boolean;
+        endThrows?: boolean;
+        transports?: unknown[];
+      }): winston.Logger => {
+        const handler = {
+          getAllInfo: opts.getAllInfoThrows
+            ? (): never => {
+                throw new Error("getAllInfo exploded");
+              }
+            : (): Record<string, unknown> => ({
+                level: "error",
+                message: "synthetic",
+                exception: true,
+              }),
+        };
+        return {
+          exceptions: handler,
+          rejections: handler,
+          transports: opts.transports ?? [],
+          log: opts.logThrows
+            ? (): never => {
+                throw new Error("transport exploded");
+              }
+            : jest.fn(),
+          end: opts.endThrows
+            ? (): never => {
+                throw new Error("end exploded");
+              }
+            : jest.fn(),
+        } as unknown as winston.Logger;
+      };
+
+      it("falls back to a synthetic payload when getAllInfo throws (Error input)", async () => {
+        const fake = fakeLogger({ getAllInfoThrows: true });
+        __crashCaptureInternals.registerCrashCapture(fake, {
+          exitOnUncaught: false,
+          hasFileTransport: false,
+        });
+
+        __crashCaptureInternals.invokeUncaught(new Error("boom-fallback"));
+        await flushMicrotasks();
+
+        const log = fake.log as unknown as jest.Mock;
+        expect(log).toHaveBeenCalledTimes(1);
+        expect(String((log.mock.calls[0][0] as { message: unknown }).message)).toBe(
+          "uncaughtException: boom-fallback",
+        );
+      });
+
+      it("falls back to a synthetic payload when getAllInfo throws (non-Error input)", async () => {
+        const fake = fakeLogger({ getAllInfoThrows: true });
+        __crashCaptureInternals.registerCrashCapture(fake, {
+          exitOnUncaught: false,
+          hasFileTransport: false,
+        });
+
+        __crashCaptureInternals.invokeUnhandled("just-a-string");
+        await flushMicrotasks();
+
+        const log = fake.log as unknown as jest.Mock;
+        expect(String((log.mock.calls[0][0] as { message: unknown }).message)).toBe(
+          "unhandledRejection: just-a-string",
+        );
+      });
+
+      it("does not rethrow when the primary logger's log() throws", () => {
+        const fake = fakeLogger({ logThrows: true });
+        __crashCaptureInternals.registerCrashCapture(fake, {
+          exitOnUncaught: false,
+          hasFileTransport: false,
+        });
+
+        // A throwing transport must never escalate out of the process listener.
+        expect(() => __crashCaptureInternals.invokeUncaught(new Error("boom"))).not.toThrow();
+      });
+
+      it("still exits when the primary logger's end() throws during the flush", async () => {
+        const fake = fakeLogger({ endThrows: true });
+        __crashCaptureInternals.registerCrashCapture(fake, {
+          exitOnUncaught: true,
+          hasFileTransport: false,
+        });
+
+        __crashCaptureInternals.invokeUncaught(new Error("boom"));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        expect(exitFn).toHaveBeenCalledWith(1);
+      });
+
+      it("drains via close(), NOT end(), for a close()-capable transport", async () => {
+        // A DailyRotateFile defines no _final: end() emits `finish` on the next
+        // tick while its logStream is still buffering (verified: 0 bytes on
+        // disk). Only close() truly drains. Since the exit path calls
+        // process.exit(1) the instant the flush resolves, using end() here would
+        // race the write and lose the crash record.
+        const events: string[] = [];
+        const sink = new EventEmitter() as EventEmitter & {
+          close?: () => void;
+          end?: () => void;
+        };
+        sink.close = (): void => {
+          events.push("close");
+          sink.emit("finish");
+        };
+        sink.end = (): void => {
+          events.push("end");
+        };
+
+        const fake = fakeLogger({ transports: [sink] });
+        __crashCaptureInternals.registerCrashCapture(fake, {
+          exitOnUncaught: true,
+          hasFileTransport: false,
+        });
+
+        __crashCaptureInternals.invokeUncaught(new Error("fatal"));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        expect(events).toEqual(["close"]);
+        expect(exitFn).toHaveBeenCalledWith(1);
+      });
+
+      it("falls back to end() for a transport that exposes no close()", async () => {
+        const events: string[] = [];
+        const sink = new EventEmitter() as EventEmitter & { end?: () => void };
+        sink.end = (): void => {
+          events.push("end");
+          sink.emit("finish");
+        };
+
+        const fake = fakeLogger({ transports: [sink] });
+        __crashCaptureInternals.registerCrashCapture(fake, {
+          exitOnUncaught: true,
+          hasFileTransport: false,
+        });
+
+        __crashCaptureInternals.invokeUncaught(new Error("fatal"));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        expect(events).toEqual(["end"]);
+        expect(exitFn).toHaveBeenCalledWith(1);
+      });
+
+      it("settles a transport exposing neither close() nor end() instead of stalling the exit", async () => {
+        const sink = new EventEmitter();
+        const fake = fakeLogger({ transports: [sink] });
+        __crashCaptureInternals.registerCrashCapture(fake, {
+          exitOnUncaught: true,
+          hasFileTransport: false,
+        });
+
+        __crashCaptureInternals.invokeUncaught(new Error("fatal"));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        // Must not wait out EXIT_FLUSH_TIMEOUT_MS.
+        expect(exitFn).toHaveBeenCalledWith(1);
+      });
+
+      it("still exits when a transport's close() throws", async () => {
+        const sink = new EventEmitter() as EventEmitter & { close?: () => void };
+        sink.close = (): never => {
+          throw new Error("close exploded");
+        };
+        const fake = fakeLogger({ transports: [sink] });
+        __crashCaptureInternals.registerCrashCapture(fake, {
+          exitOnUncaught: true,
+          hasFileTransport: false,
+        });
+
+        __crashCaptureInternals.invokeUncaught(new Error("fatal"));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        expect(exitFn).toHaveBeenCalledWith(1);
+      });
+
+      it("prefers a file-backed logger as primary so the crash reaches disk", async () => {
+        // Only the elected logger records the crash. If a console-only logger
+        // won purely by registering first, the trace would never reach disk —
+        // breaking the package's long-standing "persisted across restarts"
+        // promise, which pre-v1.0.0 was kept by routing winston's exception
+        // flags to file transports ahead of the console.
+        const root = createTempDir();
+        const consoleOnly = createLogger({
+          moduleName: "elect-console-first",
+          includeConsole: true,
+          includeFile: false,
+          includeGlobalFile: false,
+          exitOnUncaught: false,
+        });
+        const fileBacked = createLogger({
+          moduleName: "elect-file-second",
+          logDirectory: root,
+          includeConsole: false,
+          includeFile: true,
+          exitOnUncaught: false,
+        });
+
+        // Registered second, but elected: it is the one that can persist.
+        const primary = __crashCaptureInternals.getPrimaryEntry();
+        expect(primary).toBeDefined();
+        const [primaryLogger, primaryPolicy] = primary as [
+          winston.Logger,
+          { hasFileTransport: boolean },
+        ];
+        expect(primaryPolicy.hasFileTransport).toBe(true);
+        // Identity: the elected logger owns the module rotating file, which only
+        // the file-backed logger has.
+        expect(primaryLogger.transports.some((t) => t instanceof DailyRotateFile)).toBe(true);
+
+        [consoleOnly, fileBacked].forEach((logger) => teardownLogger(logger));
+      });
+
+      it("skips a transport-less logger when electing the primary", async () => {
+        // A logger with zero transports can record nothing — winston just warns
+        // "Attempt to write logs with no transports". Electing it would lose the
+        // crash outright, so registration order yields to "can actually write".
+        const empty = fakeLogger({ transports: [] });
+        __crashCaptureInternals.registerCrashCapture(empty, {
+          exitOnUncaught: false,
+          hasFileTransport: false,
+        });
+
+        const { stub } = makeCaptureLogger("crash-elect-writable", { exitOnUncaught: false });
+
+        __crashCaptureInternals.invokeUncaught(new Error("boom-elect"));
+        await flushMicrotasks();
+
+        expect(stub.log).toHaveBeenCalledTimes(1);
+        expect(empty.log as unknown as jest.Mock).not.toHaveBeenCalled();
+      });
+
+      it("falls back to the first logger when every registered logger is transport-less", async () => {
+        const empty = fakeLogger({ transports: [] });
+        __crashCaptureInternals.registerCrashCapture(empty, {
+          exitOnUncaught: false,
+          hasFileTransport: false,
+        });
+
+        __crashCaptureInternals.invokeUncaught(new Error("boom-all-empty"));
+        await flushMicrotasks();
+
+        // Nothing better exists, so the exit policy is still honored via it.
+        expect(empty.log as unknown as jest.Mock).toHaveBeenCalledTimes(1);
+      });
+
+      it("routes through the real process.exit when no exit fn is injected", async () => {
+        const exitSpy = jest
+          .spyOn(process, "exit")
+          .mockImplementation((() => undefined) as unknown as typeof process.exit);
+        __crashCaptureInternals.restoreExitFn();
+
+        const fake = fakeLogger({});
+        __crashCaptureInternals.registerCrashCapture(fake, {
+          exitOnUncaught: true,
+          hasFileTransport: false,
+        });
+
+        __crashCaptureInternals.invokeUncaught(new Error("boom"));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        expect(exitSpy).toHaveBeenCalledWith(1);
+      });
     });
   });
 

@@ -26,7 +26,9 @@ Fully typed, production-grade logging toolkit for Node.js applications. Built on
   - [Custom Transports](#custom-transports)
   - [JSON Output for Log Shippers](#json-output-for-log-shippers)
   - [Silent / No-op Logger for Libraries & SSR](#silent--no-op-logger-for-libraries--ssr)
+  - [Crash Capture](#crash-capture)
 - [Log Output Format](#log-output-format)
+- [Migration to v1.0.0](#migration-to-v100)
 - [Scripts](#scripts)
 - [Testing & Coverage](#testing--coverage)
 - [Security Notes](#security-notes)
@@ -111,10 +113,11 @@ Creates a fully configured Winston logger with safe defaults, rotating files, UT
 | `extraTimezones`       | `string \| string[]`  | `[]`                    | Additional IANA zones rendered beside UTC. Validity is enforced; invalid zones throw `InvalidTimezoneError`. |
 | `rotation`             | `RotationStrategy`    | 20 MB / 14 days / daily | Rotation config for the module file.                                                                         |
 | `globalRotation`       | `RotationStrategy`    | `rotation`              | Override rotation for the shared file. Falls back to `rotation` when omitted.                                |
-| `additionalTransports` | `winston.transport[]` | `[]`                    | Appends custom transports (e.g., HTTP, Kafka, Stream). Each entry is duck-type validated (must expose `log` and `on` methods) at construction time; invalid entries throw `TypeError`. The array is read once and defensively copied — mutating the input array after `createLogger()` returns has no effect. |
+| `additionalTransports` | `winston.transport[]` | `[]`                    | Appends custom transports (e.g., HTTP, Kafka, Stream). Each entry is duck-type validated (must expose `log` and `on` methods) at construction time; invalid entries throw `TypeError`. The array is read once and defensively copied — mutating the input array after `createLogger()` returns has no effect. **Note:** if an entry sets winston's `handleExceptions` / `handleRejections`, both are cleared (with a one-time warning), which changes where crashes land — see [Crash Capture](#crash-capture). |
 | `onTransportError`     | `(err, transport) => void` | `undefined`        | Optional callback invoked when any transport (built-in or `additionalTransports`) emits an `error` event (rotation/disk failures, EACCES, ENOSPC, gzip errors). Invoked inside a try/catch so a throwing callback cannot crash the process; errors then fall back to `console.error`. When omitted, errors go directly to `console.error` (the bare `console`, never through this logger). Repeated identical messages are deduplicated (up to 10 unique messages tracked per logger). |
 | `clock`                | `() => Date`          | `() => new Date()`      | Optional clock injection point used by the timestamp formatter. The clock is consulted at log-call time (not flush time), so async transports / queued writes / back-pressured streams cannot skew the rendered timestamp. Primarily intended for deterministic tests; production code should leave this option unset. |
-| `captureUncaught`      | `boolean`             | `true`                  | When `true`, sets `handleExceptions: true` AND `handleRejections: true` on whichever transport(s) exist — preferring file transports so the trace is persisted. Falls back to the Console transport when no file transports are enabled, then to `additionalTransports` when neither console nor files are enabled. When `false`, no transport is given exception/rejection handling. **Note:** the underlying winston logger always uses `exitOnError: false`, so once an uncaught exception is routed through the configured transport(s) the process is **NOT** terminated — install your own `process.on("uncaughtException", () => process.exit(1))` handler if you want a fatal exception to crash the process. |
+| `captureUncaught`      | `boolean`             | `true`                  | When `true`, registers this logger with a process-wide crash coordinator that captures `uncaughtException` and `unhandledRejection` into the log output (full stack, plus `process` / `os` / parsed `trace` detail). The coordinator owns **exactly one** listener pair for the whole process regardless of how many loggers you create, and a crash is logged **once**, through a single elected logger — see [Crash Capture](#crash-capture). When `false`, this logger does not participate and adds no process listener. |
+| `exitOnUncaught`       | `boolean`             | `true`                  | Whether a captured fatal terminates the process with exit code `1` after the crash is logged and flushed (bounded internally so a stuck transport cannot wedge the exit). Governs **both** `uncaughtException` and `unhandledRejection`. Set to `false` to log fatals without exiting (the pre-1.0.0 behavior). Only meaningful when `captureUncaught` is `true`. |
 | `colorize`             | `boolean \| { message?: boolean; level?: boolean; all?: boolean }` | `{ level: true, message: true }` | Controls ANSI colorization of the console transport. `false` disables colorization entirely; `true` colors both the `[LEVEL]` token and the message body; an object honors `level` / `message` flags independently, with `all: true` overriding both. File transports are never colorized. |
 | `maskMetaKeys`         | `string[]`            | `[]`                    | Metadata keys whose values are replaced with `[REDACTED]` before serialization. Matched **case-insensitively** and applied **deeply** (arrays + nested objects, including the enumerable own fields of class/`Error` instances). Targets the metadata object passed as the second-or-later argument to `logger.info(...)` / `logger.warn(...)` / etc. — for example, `logger.info("Login", { password: "topsecret" })` with `maskMetaKeys: ["password"]` writes `"password": "[REDACTED]"`. Empty by default for backward compatibility. The redaction runs in BOTH file and console pipelines. **Redaction boundary:** values that define their own `toJSON()` (`Date`, `URL`, custom serializable classes) or carry no enumerable own keys (`Map`, `Set`, `RegExp`) are serialized via that method/built-in and are **not** key-redacted — normalize to a plain object first if those need masking. |
 | `format`               | `"pretty" \| "json"`  | `"pretty"`              | Output format for BOTH the file pipeline and the console pipeline. `"pretty"` (default) emits the existing human-readable printf form. `"json"` emits one JSON object per line (NDJSON / JSON-Lines) suitable for log shippers like Datadog, Loki, ELK, Splunk, and Vector — see [JSON Output for Log Shippers](#json-output-for-log-shippers) below. |
@@ -518,6 +521,52 @@ init({ logger: createLogger({ moduleName: "my-app" }) });
 
 ---
 
+### Crash Capture
+
+With `captureUncaught: true` (the default), a logger registers with a **process-wide crash coordinator**. Two guarantees follow:
+
+**One listener pair, however many loggers you create.** Creating a logger per module is the normal pattern, and it stays cheap:
+
+```ts
+// auth.ts, db.ts, cache.ts, … — one logger per module
+const logger = createLogger({ moduleName: "auth" });
+```
+
+```ts
+process.listenerCount("uncaughtException"); // 1  (was 1-per-logger before v1.0.0)
+process.listenerCount("unhandledRejection"); // 1
+```
+
+Before v1.0.0 each logger installed its own pair, so around eleven modules tripped Node's default limit:
+
+```text
+(node:18524) MaxListenersExceededWarning: Possible EventEmitter memory leak detected.
+  11 uncaughtException listeners added to [process]. MaxListeners is 10.
+```
+
+That warning is gone, and shutting every logger down (`shutdownLogger` / `shutdownAllLoggers` / `resetLoggerRegistry`) returns the process to **zero** package-owned listeners.
+
+**One crash record.** A fatal is logged once, through a single elected logger — not once per logger into the shared `all-logs` file. The elected logger is the first still-registered one that writes to a **file** (so the trace is persisted across restarts), falling back to the first that has any transport at all. The entry carries winston's full diagnostic payload (`stack`, parsed `trace`, `process` / `os` blocks) and is marked with a `crash` field:
+
+```json
+{ "crash": "uncaughtException", "level": "error", "message": "uncaughtException: …" }
+```
+
+By default the process then flushes and exits with code `1`, matching Node's standard crash behavior. Opt out per logger:
+
+```ts
+createLogger({ moduleName: "auth", exitOnUncaught: false }); // log the fatal, keep running
+createLogger({ moduleName: "auth", captureUncaught: false }); // don't participate at all
+```
+
+**Custom transports.** The guarantee holds unconditionally, so an `additionalTransports` entry that sets winston's `handleExceptions` / `handleRejections` has both flags cleared (with a one-time warning). Those flags are what make winston install a listener **per logger**, and leaving them set would both re-create the warning above and log every crash twice.
+
+This does change where crashes land, so it is worth stating plainly: because a crash is recorded **once, through the elected logger**, a transport receives crashes only if it belongs to that logger. If you have a dedicated crash sink (Sentry, an HTTP transport) that previously relied on `handleExceptions` to receive crashes from its own module's logger, attach it to the elected logger instead — otherwise it will stop seeing them. To opt a logger out of crash capture entirely, use `captureUncaught: false`.
+
+> The coordinator is a singleton **per module instance**. Loading both the ESM and CJS builds into one process yields two coordinators (one pair each) — the same inherent limitation the logger registry has.
+
+---
+
 ## Log Output Format
 
 **File output** (with timestamps and extra timezones):
@@ -561,6 +610,26 @@ When `includeHttpContext` is enabled, the structured `RequestLogEntry` is attach
   "requestId": "req-abc-123"
 }
 ```
+
+## Migration to v1.0.0
+
+v1.0.0 removes the `MaxListenersExceededWarning` that appeared once an app created ~11 module loggers. Fixing it correctly meant this package takes ownership of crash capture instead of delegating to winston's per-logger handlers, which settles three behaviors that could not change without a major version.
+
+**Most applications need no code change.** Review the five items below only if they describe you.
+
+| # | Change | You are affected if… | Keep the old behavior |
+| - | ------ | -------------------- | --------------------- |
+| 1 | A captured fatal now **exits the process with code `1`** after logging. Previously the error was logged and the process kept running in a possibly inconsistent state. | You relied on the process surviving an `uncaughtException` / `unhandledRejection`. | `createLogger({ exitOnUncaught: false })` |
+| 2 | A crash is logged **once**, through one elected logger — not once per logger. It also reaches the console now, not only the file transports. | You expected a copy of the crash in every module's file, or parsed the N duplicate traces in `all-logs`. | No opt-out; the duplicates were the bug. |
+| 3 | The crash payload's `exception: true` / `rejection: true` is replaced by `crash: "uncaughtException" \| "unhandledRejection"`. | You grep or alert on `"exception":true`. | Match on `"crash":` instead. |
+| 4 | `logger.transports` holds a forwarding **handle** for the global log, not a `DailyRotateFile`. The module-scoped file is still a real `DailyRotateFile`. | You introspect `logger.transports` with `instanceof DailyRotateFile`. | Filter for the module file only; expect one match, not two. |
+| 5 | An `additionalTransports` entry that sets `handleExceptions` / `handleRejections` has both flags **cleared** (with a warning). Since crashes go only to the elected logger, a crash sink on a non-elected logger stops receiving them. | You attached a crash sink (Sentry, HTTP) to a module logger and relied on those flags to deliver crashes to it. | Attach that transport to the elected logger (the first capture-enabled logger created). |
+
+Why #3 is not optional: `exception` / `rejection` are winston-reserved routing flags. `winston-transport` **drops** an `{ exception: true }` record from any transport without `handleExceptions` — the very flag whose removal fixes the listener leak — so keeping the marker would have made every crash silently vanish from the logs. Everything else in the payload is unchanged.
+
+If you previously worked around the warning with `process.setMaxListeners(n)`, you can remove it.
+
+---
 
 ## Scripts
 
@@ -634,7 +703,9 @@ narrowly scoped `redactPaths` API.
 
 ### Release process
 
-Releases are **tag-triggered**: pushing a `vX.Y.Z` tag fires `.github/workflows/release.yml`, which re-runs every gate, verifies the tag matches `package.json` `version`, publishes to npm with [provenance](https://docs.npmjs.com/generating-provenance-statements) via OIDC, and creates a GitHub Release whose body is the matching `CHANGELOG.md` section.
+Releases are **tag-triggered**: pushing a `vX.Y.Z` tag fires `.github/workflows/release.yml`, which re-runs every gate, verifies the tag matches `package.json` `version`, publishes to npm with [provenance](https://docs.npmjs.com/generating-provenance-statements), and creates a GitHub Release whose body is the matching `CHANGELOG.md` section.
+
+Publishing uses npm [trusted publishing](https://docs.npmjs.com/trusted-publishers) (OIDC): the workflow authenticates by exchanging a short-lived GitHub Actions identity token for a registry token at publish time, so there is **no npm token stored in the repository** to leak, expire, or rotate. The trust relationship is configured on the npm package itself (Settings → Trusted Publisher → GitHub Actions), pinned to this repository and the `release.yml` workflow filename. Because trusted publishing requires npm >= 11.5.1, the release job runs on Node 24.x and asserts the npm floor before any npm work.
 
 The two-step flow:
 

@@ -241,28 +241,51 @@ export interface LoggerOptions {
    */
   clock?: () => Date;
   /**
-   * Whether the process should install winston's exception/rejection handlers
-   * onto its own transports so an `uncaughtException` or `unhandledRejection`
-   * is captured into the log output (with full stack trace) before the process
-   * decides what to do next. Defaults to `true`.
+   * Whether this logger participates in process-wide crash capture so an
+   * `uncaughtException` or `unhandledRejection` is recorded into the log output
+   * (with full stack trace, process/OS info, and parsed trace) before the
+   * process decides what to do next. Defaults to `true`.
    *
-   * When `true`, `handleExceptions: true` AND `handleRejections: true` are set
-   * on the FILE transports (so the trace is persisted across restarts). When
-   * file transports are disabled, the flags fall back to the Console transport.
-   * When all built-in transports are disabled, the flags are applied to every
-   * `additionalTransports` entry instead. When `captureUncaught: false`, no
-   * transport is given exception/rejection handling.
+   * ## How capture works (changed in v1.0.0)
    *
-   * Interaction with `exitOnError`: this logger ALWAYS sets `exitOnError:
-   * false` on the underlying winston logger, so once an uncaught exception is
-   * routed through the configured transport(s) the process is NOT terminated
-   * and continues running. Most consumers want a fatal exception to crash the
-   * process — install your own `process.on("uncaughtException", () => process.exit(1))`
-   * after `createLogger()` returns if that is the desired behavior. Without
-   * such a handler the Node default of crashing on an uncaught exception is
-   * suppressed, and the process can end up in an inconsistent state.
+   * Every capture-enabled logger registers with a single process-wide
+   * coordinator. The coordinator owns **exactly one** `uncaughtException` and
+   * **one** `unhandledRejection` listener for the whole process, no matter how
+   * many loggers are created. (Prior versions let winston install one listener
+   * pair PER logger, so an app with one logger per module hit Node's
+   * `MaxListenersExceededWarning` once it passed ~10 modules.)
+   *
+   * When a fatal event fires it is logged **once**, through a single elected
+   * logger (the first capture-enabled logger still registered). The crash is
+   * written to all of that logger's transports (console + files + any
+   * additional transports). Other loggers do not each re-log the same crash.
+   * `captureUncaught: false` opts a logger out of registration entirely.
+   *
+   * See {@link exitOnUncaught} for what happens to the process afterward.
    */
   captureUncaught?: boolean;
+  /**
+   * Whether capturing a fatal event (`uncaughtException` / `unhandledRejection`)
+   * should terminate the process with exit code `1` after the crash has been
+   * logged and flushed. Defaults to `true`.
+   *
+   * **Breaking change in v1.0.0.** Prior versions always set `exitOnError:
+   * false` on the underlying winston logger and installed no exit behavior of
+   * their own, so a captured fatal was logged and the process was left running
+   * in a potentially inconsistent state (the "limp on" behavior). The default
+   * is now to restore Node's standard crash-on-fatal semantics: the crash is
+   * logged, the elected logger's transports are flushed (bounded by an internal
+   * timeout so a stuck transport cannot wedge the exit), and then the process
+   * exits with code `1`.
+   *
+   * Set `exitOnUncaught: false` to keep logging fatals without exiting (the
+   * pre-v1.0.0 behavior). Only meaningful when {@link captureUncaught} is
+   * `true`. When several capture-enabled loggers set different values, the
+   * value of the elected primary logger governs the process-level decision.
+   *
+   * This option governs BOTH `uncaughtException` and `unhandledRejection`.
+   */
+  exitOnUncaught?: boolean;
   /**
    * Controls ANSI colorization of the console transport's output. Defaults to
    * `{ level: true, message: true }` — both the `[LEVEL]` token AND the

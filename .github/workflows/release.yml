@@ -7,13 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to publish (must already exist, e.g. v0.21.4). Leave blank to publish from the current default branch."
+        description: "Tag to publish (must already exist, e.g. v1.0.0). Leave blank to publish from the current default branch."
         required: false
         type: string
 
-permissions:
-  contents: write
-  id-token: write
+# Minimal by default; the publish job elevates only what it needs.
+permissions: {}
 
 concurrency:
   group: release-${{ github.ref }}
@@ -22,21 +21,56 @@ concurrency:
 jobs:
   publish:
     name: Publish to npm
+    # GitHub-hosted runner is REQUIRED: npm trusted publishing does not support
+    # self-hosted runners.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      # Needed only by the "Create GitHub Release" step.
+      contents: write
+      # Mints the OIDC id-token used for BOTH trusted publishing (auth) and the
+      # Sigstore provenance attestation. Without it: ENEEDAUTH.
+      id-token: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
+          # Nothing here pushes via git (the Release is created through the API),
+          # so don't leave GITHUB_TOKEN in .git/config for later steps to read.
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 22.x
+          # Node 24 is the ONLY practical choice: trusted publishing needs
+          # npm >= 11.5.1, and no Node 22.x release ever bundled npm 11.x
+          # (latest v22.23.1 ships npm 10.9.8, which contains no OIDC support
+          # at all). Node 24.18.0 bundles npm 11.16.0.
+          node-version: 24.x
+          # setup-node resolves from the runner's toolcache by default, so the
+          # bundled npm is an image property rather than a guarantee. This makes
+          # the npm floor deterministic instead of incidental.
+          check-latest: true
           registry-url: "https://registry.npmjs.org"
-          cache: "npm"
+          # npm's official trusted-publishing example: "never use caching in
+          # release builds" — a poisoned/stale cache must not reach an artifact
+          # that gets provenance-signed.
+          package-manager-cache: false
+
+      # Fails loudly and diagnosably if the toolchain ever regresses below the
+      # OIDC floor. Without this, an old npm silently skips the OIDC exchange
+      # and surfaces as a misleading E404/ENEEDAUTH at publish time.
+      - name: Verify npm supports trusted publishing (>= 11.5.1)
+        run: |
+          NPM_VERSION="$(npm --version)"
+          echo "npm $NPM_VERSION / node $(node --version)"
+          node -e 'const [maj,min,pat] = process.argv[1].split(".").map(Number);
+            process.exit((maj > 11 || (maj === 11 && (min > 5 || (min === 5 && pat >= 1)))) ? 0 : 1)' "$NPM_VERSION" \
+            || { echo "::error::npm $NPM_VERSION < 11.5.1 cannot use npm trusted publishing (OIDC). Bump node-version."; exit 1; }
 
       - name: Install dependencies
         run: npm ci
@@ -58,8 +92,13 @@ jobs:
 
       - name: Verify package.json version matches tag
         if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+        env:
+          # Passed via env, never interpolated into the script body: a ${{ }}
+          # expression is expanded textually before the shell parses it, so a
+          # crafted ref would execute as code in a job that can mint an npm
+          # publish token.
+          REF: ${{ inputs.tag || github.ref_name }}
         run: |
-          REF="${{ inputs.tag || github.ref_name }}"
           TAG_VERSION="${REF#v}"
           PKG_VERSION="$(node -p "require('./package.json').version")"
           echo "Tag version: $TAG_VERSION"
@@ -75,23 +114,40 @@ jobs:
       - name: Verify tarball contents
         run: npm pack --dry-run
 
+      # Authenticates via npm TRUSTED PUBLISHING (OIDC) — no npm secret exists.
+      # Configured at npmjs.com -> @hiprax/logger -> Settings -> Trusted Publisher
+      # -> GitHub Actions -> Hiprax/logger + workflow filename "release.yml".
+      #
+      # --provenance is kept deliberately. npm's docs say OIDC enables it
+      # automatically, but that auto-enable is best-effort: it depends on a live
+      # registry visibility lookup wrapped in a try/catch that only logs at
+      # verbose level, so a failure publishes with NO attestation, silently. The
+      # explicit flag makes provenance mandatory and fail-loud instead.
+      #
+      # --ignore-scripts is load-bearing: prepublishOnly re-runs `npm run build`,
+      # which would rebuild dist/ and discard the exact artifacts the Build and
+      # `npm pack --dry-run` steps just verified — so an unverified rebuild would
+      # be what gets provenance-signed.
       - name: Publish to npm with provenance
         run: npm publish --provenance --access public --ignore-scripts
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Extract changelog notes for this release
         id: changelog
         if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+        env:
+          REF: ${{ inputs.tag || github.ref_name }}
         run: |
-          REF="${{ inputs.tag || github.ref_name }}"
           VERSION="${REF#v}"
+          # Literal string matching, not a dynamic regex: `awk -v` processes
+          # escape sequences, so a pre-escaped "1\.0\.0" would be folded back to
+          # "1.0.0" and the dots would match any character again.
           notes="$(awk -v ver="$VERSION" '
-            $0 ~ "^## \\["ver"\\]" { capture = 1; next }
-            capture && /^## \[/ { exit }
+            index($0, "## [" ver "] - ") == 1 || $0 == "## [" ver "]" { capture = 1; next }
+            capture && index($0, "## [") == 1 { exit }
             capture { print }
           ' CHANGELOG.md)"
           if [ -z "$notes" ]; then
+            echo "::warning::No CHANGELOG section found for $VERSION; falling back to a link."
             notes="See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details."
           fi
           {
@@ -102,7 +158,7 @@ jobs:
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           name: ${{ inputs.tag || github.ref_name }}
@@ -114,6 +170,8 @@ jobs:
         run: |
           PKG_NAME="$(node -p "require('./package.json').name")"
           PKG_VERSION="$(node -p "require('./package.json').version")"
-          echo "Published $PKG_NAME@$PKG_VERSION" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "https://www.npmjs.com/package/$PKG_NAME/v/$PKG_VERSION" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Published \`$PKG_NAME@$PKG_VERSION\` via npm trusted publishing (OIDC)."
+            echo ""
+            echo "https://www.npmjs.com/package/$PKG_NAME/v/$PKG_VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -102,6 +102,7 @@ test-cjs-types.ts
 # Temporary files
 tmp/
 temp/
+*.tmp
 
 # Orchestrator
 .orchestrator/

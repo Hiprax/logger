@@ -5,6 +5,8 @@ import DailyRotateFile from "winston-daily-rotate-file";
 import moment from "moment-timezone";
 import { InvalidTimezoneError, LoggerOptionError } from "./errors";
 import { redactValue } from "./redact";
+import { registerCrashCapture, deregisterCrashCapture, resetCrashCapture } from "./crash-capture";
+import { acquireSharedGlobalFile, resetSharedFileRegistry } from "./shared-file-transport";
 import type { LoggerOptions, TimestampContext, LogLevel, RotationStrategy } from "./types";
 
 /**
@@ -221,6 +223,15 @@ interface RegistryEntry {
 const loggerRegistry = new Map<string, RegistryEntry>();
 
 /**
+ * Maps each public logger Proxy back to the underlying **base** winston logger
+ * it wraps. `shutdownLogger()` receives the Proxy but must deregister the base
+ * logger from the crash-capture coordinator (which stores base loggers, never
+ * the Proxy — the Proxy mints no-op shims for unknown property reads). A
+ * `WeakMap` so a logger that is garbage-collected drops its entry automatically.
+ */
+const proxyToBaseLogger = new WeakMap<winston.Logger, winston.Logger>();
+
+/**
  * Resolves a `logDirectory` to a stable absolute form suitable for cache key
  * comparisons. The resolved path:
  * - Is absolute (`path.resolve`).
@@ -302,10 +313,11 @@ export const getDefaultRotation = (): RotationStrategy => ({
  * `globalRotation`, `escapeMessageNewlines`, `format`, `maskMetaKeys`
  * (lowercased + sorted to be order-independent — security-relevant, so a
  * silently-dropped redaction config must surface as a conflict), `colorize`
- * (the *resolved* `{level, message}` flags, not the raw option shape), and
- * `captureUncaught`. Does NOT include `additionalTransports` — function/class
- * instances are not stably comparable; the registry tracks their count
- * separately and the warning surfaces it as a caveat.
+ * (the *resolved* `{level, message}` flags, not the raw option shape),
+ * `captureUncaught`, and `exitOnUncaught`. Does NOT include
+ * `additionalTransports` — function/class instances are not stably comparable;
+ * the registry tracks their count separately and the warning surfaces it as a
+ * caveat.
  */
 const buildOptionsSignature = (resolved: {
   level: LogLevel;
@@ -322,6 +334,7 @@ const buildOptionsSignature = (resolved: {
   maskMetaKeys: string[];
   colorize: { level: boolean; message: boolean };
   captureUncaught: boolean;
+  exitOnUncaught: boolean;
 }): string => {
   return JSON.stringify({
     level: resolved.level,
@@ -338,6 +351,7 @@ const buildOptionsSignature = (resolved: {
     maskMetaKeys: [...resolved.maskMetaKeys].map((key) => key.toLowerCase()).sort(),
     colorize: resolved.colorize,
     captureUncaught: resolved.captureUncaught,
+    exitOnUncaught: resolved.exitOnUncaught,
   });
 };
 
@@ -662,8 +676,6 @@ const buildRotateTransport = (options: {
   filename: string;
   level: LogLevel;
   rotation?: typeof defaultRotation | RotationStrategy;
-  handleExceptions?: boolean;
-  handleRejections?: boolean;
 }) => {
   const rotation = { ...defaultRotation, ...options.rotation };
 
@@ -674,8 +686,6 @@ const buildRotateTransport = (options: {
     maxFiles: normalizeMaxFiles(rotation.maxFiles),
     zippedArchive: rotation.zippedArchive,
     level: options.level,
-    handleExceptions: options.handleExceptions,
-    handleRejections: options.handleRejections,
   });
 };
 
@@ -708,6 +718,63 @@ const isWinstonCompatibleTransport = (value: unknown): value is winston.transpor
   }
   const candidate = value as { log?: unknown; on?: unknown };
   return typeof candidate.log === "function" && typeof candidate.on === "function";
+};
+
+/**
+ * Latches after the first `additionalTransports` entry is found carrying
+ * winston's crash flags, so the explanatory warning is emitted once per process
+ * rather than once per `createLogger()` call. Reset by
+ * `resetLoggerRegistry()` for testability.
+ */
+let crashFlagStripWarned = false;
+
+/**
+ * Clears winston's `handleExceptions` / `handleRejections` flags from every
+ * caller-supplied transport, warning once when any were set.
+ *
+ * This package owns crash capture process-wide (see `./crash-capture`), and it
+ * does so precisely BY never letting a transport carry these flags: winston's
+ * `Logger.add()` reacts to them by calling `exceptions.handle()` /
+ * `rejections.handle()`, which installs an `uncaughtException` /
+ * `unhandledRejection` listener **per logger**. A caller-supplied transport
+ * that arrives pre-flagged would therefore silently re-create the exact defect
+ * this design exists to remove — one process-listener pair per logger, tripping
+ * Node's `MaxListenersExceededWarning` at ~10 module loggers — and would ALSO
+ * double-log every crash (winston's own catcher writing the trace to that
+ * transport, on top of the coordinator's single record).
+ *
+ * Clearing the flags IS a real change for the caller, so we warn rather than
+ * stay silent: a crash is now recorded once, through the elected primary
+ * logger, so this transport sees crashes only if it belongs to that logger. A
+ * transport piped into any other logger — a dedicated Sentry/HTTP crash sink on
+ * a non-primary module logger, say — stops receiving them. Silently dropping an
+ * explicit caller choice is worse than saying so, and worse still would be
+ * reassuring them that nothing changed.
+ */
+const stripWinstonCrashFlags = (transports: readonly winston.transport[]): void => {
+  let stripped = false;
+  transports.forEach((transport) => {
+    const flagged = transport as winston.transport & {
+      handleExceptions?: boolean;
+      handleRejections?: boolean;
+    };
+    if (flagged.handleExceptions || flagged.handleRejections) {
+      stripped = true;
+      flagged.handleExceptions = false;
+      flagged.handleRejections = false;
+    }
+  });
+
+  if (stripped && !crashFlagStripWarned) {
+    crashFlagStripWarned = true;
+    console.warn(
+      `[@hiprax/logger] An \`additionalTransports\` entry set \`handleExceptions\`/\`handleRejections\`; both were cleared. ` +
+        `Leaving them set makes winston install one extra process listener per logger (Node warns past 10) and log every crash twice. ` +
+        `Note this changes where crashes land: they are recorded once, through the elected primary logger (the first capture-enabled logger still registered), ` +
+        `so this transport receives them only if it belongs to that logger. ` +
+        `If it is a dedicated crash sink, attach it to the primary logger. Use \`captureUncaught: false\` to opt this logger out of crash capture entirely.`,
+    );
+  }
 };
 
 /**
@@ -809,6 +876,7 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     onTransportError,
     clock = () => new Date(),
     captureUncaught = true,
+    exitOnUncaught = true,
     colorize,
     maskMetaKeys = [],
     escapeMessageNewlines = false,
@@ -839,6 +907,12 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
   // mutating the input array later cannot affect the logger's transports.
   validateAdditionalTransports(additionalTransports);
   const additionalTransportsCopy: winston.transport[] = [...additionalTransports];
+  // Guarantee the invariant the whole crash-capture design rests on: NO
+  // transport reaching winston.createLogger() may carry the crash flags, or
+  // winston installs a process listener for this logger (see
+  // `stripWinstonCrashFlags`). The built-in transports never set them; a
+  // caller-supplied one might.
+  stripWinstonCrashFlags(additionalTransportsCopy);
 
   // Normalize and validate timezones BEFORE the cache lookup so a second call
   // with bogus timezones still throws InvalidTimezoneError, even when a logger
@@ -889,6 +963,7 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     maskMetaKeys,
     colorize: colorizeFlags,
     captureUncaught,
+    exitOnUncaught,
   });
 
   const cached = loggerRegistry.get(registryKey);
@@ -1033,28 +1108,20 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     transports.push(transport);
   };
 
-  // Decide which transport(s) carry the uncaught-exception/rejection handlers.
-  // Prefer FILE transports so the trace is persisted across restarts. When
-  // neither file transport is enabled, fall back to the Console transport so
-  // crash output is at least visible. When ALL built-in transports are off,
-  // attach the handlers to every additionalTransports entry. When
-  // `captureUncaught` is `false`, no transport is given the flags.
-  const exceptionHandlerTarget: "file" | "console" | "additional" | "none" = !captureUncaught
-    ? "none"
-    : includeFile || includeGlobalFile
-      ? "file"
-      : includeConsole
-        ? "console"
-        : additionalTransportsCopy.length
-          ? "additional"
-          : "none";
+  // Crash capture (`uncaughtException` / `unhandledRejection`) is NOT wired
+  // through winston's per-transport `handleExceptions` / `handleRejections`
+  // flags. Winston installs one process-level listener PAIR per logger whose
+  // transports carry those flags (`Logger.add()` → `exceptions.handle()`), so
+  // an app with one logger per module accumulates one pair per module and Node
+  // emits a `MaxListenersExceededWarning`. Instead, capture-enabled loggers
+  // register with the process-wide coordinator in `./crash-capture` below,
+  // which owns a SINGLE listener pair and records a crash once through one
+  // elected logger. No transport receives the flags here.
 
   if (includeConsole) {
     registerTransport(
       new winston.transports.Console({
         level: consoleLevel,
-        handleExceptions: exceptionHandlerTarget === "console",
-        handleRejections: exceptionHandlerTarget === "console",
         format: consoleFormat,
       }),
     );
@@ -1070,41 +1137,37 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
         filename: moduleFilename,
         level,
         rotation,
-        handleExceptions: exceptionHandlerTarget === "file",
-        handleRejections: exceptionHandlerTarget === "file",
       }),
     );
   }
 
   if (includeGlobalFile) {
     ensureDirectory(path.dirname(globalFilename));
+    // Every logger with `includeGlobalFile` targets the SAME resolved path, so
+    // the underlying rotating-file transport is shared and reference-counted
+    // across loggers (one file handle, one rotation state machine) rather than
+    // duplicated per logger. What gets piped into THIS logger is a cheap
+    // per-logger handle that forwards to it — winston's `_final` ends the
+    // handle on shutdown, never the shared transport other loggers still use.
     registerTransport(
-      buildRotateTransport({
-        filename: globalFilename,
+      acquireSharedGlobalFile({
+        key: globalFilename,
         level,
-        rotation: globalRotation ?? rotation,
-        handleExceptions: exceptionHandlerTarget === "file",
-        handleRejections: exceptionHandlerTarget === "file",
+        rotationSignature: JSON.stringify(resolvedGlobalRotation),
+        createTransport: () =>
+          buildRotateTransport({
+            filename: globalFilename,
+            // The shared transport must accept every level that any sharing
+            // logger might emit; per-logger gating happens on the handle.
+            level: "silly",
+            rotation: globalRotation ?? rotation,
+          }),
       }),
     );
   }
 
   if (additionalTransportsCopy.length) {
     additionalTransportsCopy.forEach((transport) => {
-      // When the only available transports are the additionalTransports, set
-      // `handleExceptions` / `handleRejections` on each entry so an uncaught
-      // exception still has somewhere to land. We mutate the transport's
-      // `.handleExceptions` / `.handleRejections` properties directly because
-      // these are the documented winston-transport flags read by
-      // `winston.Logger.exceptions.handle()` / `rejections.handle()`.
-      if (exceptionHandlerTarget === "additional") {
-        const t = transport as winston.transport & {
-          handleExceptions?: boolean;
-          handleRejections?: boolean;
-        };
-        t.handleExceptions = true;
-        t.handleRejections = true;
-      }
       registerTransport(transport);
     });
   }
@@ -1211,7 +1274,25 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
         return proxyToJSON;
       }
 
-      // 2. Pass-through to base logger for any prop that already exists on the
+      // 2. `close()` must also leave crash capture. Winston's own
+      //    `Logger.close()` calls `exceptions.unhandle()` / `rejections.unhandle()`,
+      //    so before v1.0.0 closing a logger inherently stopped it from
+      //    capturing crashes. Now that capture is coordinated here rather than
+      //    by winston, a closed-but-still-registered logger could remain the
+      //    elected primary — and the coordinator would route the next crash
+      //    into its ended stream, where winston drops the write ("Attempt to
+      //    write logs with no transports") and our no-op `error` listener
+      //    swallows the failure. The crash would vanish silently. Deregistering
+      //    here preserves the pre-v1.0.0 semantics and hands the primary role to
+      //    a logger that can still write.
+      if (prop === "close") {
+        return (...args: unknown[]): unknown => {
+          deregisterCrashCapture(target);
+          return (target.close as (...inner: unknown[]) => unknown).apply(target, args);
+        };
+      }
+
+      // 3. Pass-through to base logger for any prop that already exists on the
       //    underlying winston logger (own or inherited).
       if (Reflect.has(target, prop)) {
         const value = Reflect.get(target, prop, receiver);
@@ -1221,28 +1302,28 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
         return value;
       }
 
-      // 3. Symbol props that are not on the base logger return undefined so the
+      // 4. Symbol props that are not on the base logger return undefined so the
       //    logger is not thenable, not iterable, and not picked up by inspectors
       //    that probe for `Symbol.toPrimitive`, `util.inspect.custom`, etc.
       if (typeof prop === "symbol") {
         return undefined;
       }
 
-      // 4. Hard deny-list of well-known engine/framework probes so the logger is
+      // 5. Hard deny-list of well-known engine/framework probes so the logger is
       //    NOT a thenable, NOT serializable as a function-bag, and NOT mistaken
       //    for a Vue/React component or a Jest mock.
       if (DENIED_PROXY_PROPS.has(prop)) {
         return undefined;
       }
 
-      // 5. Validate the prop name shape before treating it as a logging
+      // 6. Validate the prop name shape before treating it as a logging
       //    fallback method. Reject anything that does not look like a public
       //    method identifier.
       if (!FALLBACK_METHOD_NAME_PATTERN.test(prop)) {
         return undefined;
       }
 
-      // 6. Existing fallback warning behavior for legitimate typos like
+      // 7. Existing fallback warning behavior for legitimate typos like
       //    `logger.success("ok")` — emit the one-time warning and route the
       //    call to `info()`.
       return (...args: unknown[]) => {
@@ -1265,6 +1346,23 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     },
   }) as winston.Logger;
 
+  // Register with the process-wide crash-capture coordinator so an
+  // `uncaughtException` / `unhandledRejection` is recorded once through a
+  // single elected logger. The coordinator owns exactly one process-listener
+  // pair regardless of how many loggers register. We register the BASE logger
+  // (not the Proxy) and remember the Proxy→base mapping so `shutdownLogger()`
+  // can deregister it later.
+  proxyToBaseLogger.set(proxied, baseLogger);
+  if (captureUncaught) {
+    registerCrashCapture(baseLogger, {
+      exitOnUncaught,
+      // Lets the coordinator prefer a primary that can PERSIST the crash: only
+      // the elected logger records it, so a console-only logger winning the
+      // election would leave no trace on disk.
+      hasFileTransport: includeFile || includeGlobalFile,
+    });
+  }
+
   loggerRegistry.set(registryKey, {
     logger: proxied,
     optionsSignature,
@@ -1284,6 +1382,21 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
  * the previously cached logger remain valid but are detached from the
  * registry.
  *
+ * As of v1.0.0 this ALSO resets the process-wide crash-capture coordinator:
+ * every registered logger is deregistered and the single package-owned
+ * `uncaughtException` / `unhandledRejection` listener pair is uninstalled. This
+ * closes a listener-orphan leak that a bare cache-clear would otherwise leave
+ * behind (the detached loggers would keep the coordinator installed forever).
+ * Detached loggers keep functioning as ordinary loggers; they simply no longer
+ * participate in crash capture until re-created.
+ *
+ * The shared global-file registry is dropped too, so the next `createLogger()`
+ * for a previously-shared path builds a fresh transport. Already-created
+ * loggers keep writing through the handles they hold — their shared transport
+ * is NOT closed here (that would break the "detached loggers remain valid"
+ * contract above); it closes when its last handle is released via
+ * `shutdownLogger()` / `logger.close()`.
+ *
  * @example
  * ```ts
  * import { createLogger, resetLoggerRegistry } from "@hiprax/logger";
@@ -1301,6 +1414,9 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
  */
 export const resetLoggerRegistry = (): void => {
   loggerRegistry.clear();
+  resetCrashCapture();
+  resetSharedFileRegistry();
+  crashFlagStripWarned = false;
 };
 
 /**
@@ -1591,6 +1707,14 @@ export const shutdownLogger = (
   // early `shutdownPromises` cache hit above also short-circuits before we
   // ever reach this line on a repeat call.
   logger.end();
+
+  // Deregister from the crash-capture coordinator as the logger tears down, so
+  // once every logger has been shut down the process returns to zero
+  // package-owned `uncaughtException` / `unhandledRejection` listeners. We map
+  // the public Proxy back to the base logger the coordinator actually stored;
+  // deregistering a logger that was never registered (e.g. a no-op logger, or
+  // one created with `captureUncaught: false`) is a safe no-op.
+  deregisterCrashCapture(proxyToBaseLogger.get(logger) ?? logger);
 
   // Each per-transport awaiter exposes its own `cleanup()` so we can detach
   // the `finish`/`close` listeners regardless of which side of the race wins.
