@@ -1948,6 +1948,231 @@ describe("createRequestLogger", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Phase 6 — the error path must not leak the raw URL
+  //
+  // The happy path masks query secrets via `redactUrlQuery`, but finalize()'s
+  // catch used to rebuild its console.error message from the RAW
+  // `req.originalUrl ?? req.url`. Any throwing user callback therefore printed
+  // the cleartext query string to stderr — leaking exactly the secrets
+  // `maskQueryKeys` promises to mask. `code` is in DEFAULT_MASKED_QUERY_KEYS,
+  // so these tests need no explicit `maskQueryKeys` option.
+  //
+  // The pre-existing never-crash tests above all drive the query-less default
+  // url (`/auth/login`) and only assert the message prefix, which is why this
+  // went unnoticed.
+  // ---------------------------------------------------------------------------
+
+  const SECRET_URL = "/oauth/cb?code=SUPER_SECRET_AUTH_CODE&state=x";
+
+  it("redacts query secrets in the error-path message when enrich throws", () => {
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      enrich: () => {
+        throw new Error("enrich boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, { originalUrl: SECRET_URL });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const message = errSpy.mock.calls[0][0] as string;
+    expect(message).not.toContain("SUPER_SECRET_AUTH_CODE");
+    expect(message).toContain("code=[REDACTED]");
+    // Non-masked siblings must survive byte-for-byte.
+    expect(message).toContain("state=x");
+    expect(message).toContain("enrich boom");
+  });
+
+  it("redacts query secrets in the error-path message when messageBuilder throws", () => {
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      messageBuilder: () => {
+        throw new Error("messageBuilder boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, { originalUrl: SECRET_URL });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const message = errSpy.mock.calls[0][0] as string;
+    expect(message).not.toContain("SUPER_SECRET_AUTH_CODE");
+    expect(message).toContain("code=[REDACTED]");
+    expect(message).toContain("messageBuilder boom");
+  });
+
+  it("redacts query secrets in the error-path message when logger.log throws", () => {
+    const { logger, log } = createMockLogger();
+    log.mockImplementation(() => {
+      throw new Error("log boom");
+    });
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({ logger });
+
+    const { res } = runMiddleware(middleware, { originalUrl: SECRET_URL });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const message = errSpy.mock.calls[0][0] as string;
+    expect(message).not.toContain("SUPER_SECRET_AUTH_CODE");
+    expect(message).toContain("code=[REDACTED]");
+    expect(message).toContain("log boom");
+  });
+
+  it("redacts query secrets on the error path when the throw precedes URL resolution", () => {
+    // A function-form `level` throws BEFORE the happy path resolves/redacts the
+    // URL. This is why the catch recomputes the redacted URL itself rather than
+    // reading a value hoisted out of the try: at this throw position no such
+    // value would exist yet, and the message would lose the URL entirely.
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      level: () => {
+        throw new Error("level boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, { originalUrl: SECRET_URL });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const message = errSpy.mock.calls[0][0] as string;
+    expect(message).not.toContain("SUPER_SECRET_AUTH_CODE");
+    expect(message).toContain("code=[REDACTED]");
+  });
+
+  it("honors a custom maskQueryKeys list on the error path", () => {
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      maskQueryKeys: ["sessionid"],
+      enrich: () => {
+        throw new Error("enrich boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, {
+      originalUrl: "/x?sessionid=SUPER_SECRET_SESSION&page=2",
+    });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    const message = errSpy.mock.calls[0][0] as string;
+    expect(message).not.toContain("SUPER_SECRET_SESSION");
+    expect(message).toContain("sessionid=[REDACTED]");
+    expect(message).toContain("page=2");
+  });
+
+  it("falls back to the raw url when originalUrl is absent on the error path", () => {
+    // `req.url` is the raw-Node fallback and must be redacted just the same.
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      enrich: () => {
+        throw new Error("enrich boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, {
+      originalUrl: undefined as unknown as string,
+      url: SECRET_URL,
+    });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    const message = errSpy.mock.calls[0][0] as string;
+    expect(message).not.toContain("SUPER_SECRET_AUTH_CODE");
+    expect(message).toContain("code=[REDACTED]");
+  });
+
+  it("does not throw from the error path when reading the URL itself throws", () => {
+    // The error handler runs inside the `res` "finish" emitter, where an
+    // exception is an UNCAUGHT exception, not a dropped log line. An exotic
+    // request object can expose a throwing `originalUrl` getter, so the
+    // catch's own URL resolution is self-guarded and degrades to "".
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({ logger });
+
+    const { req, res } = runMiddleware(middleware);
+    // Defined AFTER middleware entry: the middleware body never reads the URL,
+    // only finalize() does, and `Object.assign` in runMiddleware would have
+    // invoked the getter too early.
+    Object.defineProperty(req, "originalUrl", {
+      get: () => {
+        throw new Error("hostile getter");
+      },
+    });
+
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toContain("hostile getter");
+  });
+
+  it("leaves the query untouched on the error path when maskQueryKeys is false", () => {
+    // The `false` opt-out disables query masking, and the error path must honor
+    // it exactly as the happy path does — not fall back to the default list.
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const middleware = createRequestLogger({
+      logger,
+      maskQueryKeys: false,
+      enrich: () => {
+        throw new Error("enrich boom");
+      },
+    });
+
+    const { res } = runMiddleware(middleware, { originalUrl: SECRET_URL });
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy.mock.calls[0][0]).toContain("code=SUPER_SECRET_AUTH_CODE");
+  });
+
+  it("does not throw from the error path when every reported field throws", () => {
+    // Last-resort guard: the handler runs inside the `res` "finish" emitter, so
+    // a throw here is an UNCAUGHT exception, not a dropped line. A request whose
+    // `method` getter throws (alongside an error whose `message` getter throws)
+    // must still degrade to a single console.error rather than crash.
+    const { logger } = createMockLogger();
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const hostileError = new Error("ignored");
+    Object.defineProperty(hostileError, "message", {
+      get: () => {
+        throw new Error("hostile message getter");
+      },
+    });
+
+    const middleware = createRequestLogger({
+      logger,
+      enrich: () => {
+        throw hostileError;
+      },
+    });
+
+    const { req, res } = runMiddleware(middleware);
+    Object.defineProperty(req, "method", {
+      get: () => {
+        throw new Error("hostile method getter");
+      },
+    });
+
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0]).toBe(
+      "@hiprax/logger request logger failed, and so did reporting the failure.",
+    );
+  });
+
+  // ---------------------------------------------------------------------------
   // Phase 2 — function-form level validated at request time (Task 2.3)
   // ---------------------------------------------------------------------------
 

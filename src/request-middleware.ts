@@ -536,6 +536,57 @@ const redactUrlQuery = (url: string, maskQueryKeys: ReadonlySet<string> | undefi
 };
 
 /**
+ * Resolves the URL for `finalize()`'s error-path fallback message, with query
+ * secrets masked exactly as the happy path masks them.
+ *
+ * Two properties are load-bearing:
+ *
+ * 1. **It redacts.** The fallback message is written to `console.error`, so
+ *    building it from the raw `req.originalUrl` leaked precisely the
+ *    query-string secrets `maskQueryKeys` promises to mask — a throwing
+ *    `enrich` / `messageBuilder` / `logger.log` printed
+ *    `?code=SUPER_SECRET_AUTH_CODE` to stderr in cleartext even though `code`
+ *    is in {@link DEFAULT_MASKED_QUERY_KEYS}.
+ * 2. **It degrades rather than throws.** The catch runs inside the `res`
+ *    `"finish"` / `"close"` emitter, where an exception is an UNCAUGHT
+ *    exception. Every value read here is caller-controlled (an exotic request
+ *    adapter can expose a throwing `originalUrl` getter, or a non-string url
+ *    that `redactUrlQuery` would choke on), so the resolution is self-guarded
+ *    and degrades to `""` — leaving the method and the failure reason still
+ *    reportable, which a guard around the whole message would not.
+ *
+ * The value is RECOMPUTED here rather than hoisted out of `finalize()`'s try
+ * block. Both work — hoisting *this* (already guarded) call above the try would
+ * be safe too — but recompute keeps the happy path byte-identical and pays
+ * nothing per request for a value only the error path ever reads. What does NOT
+ * work is hoisting a `let` that the try block assigns: a function-form `level`
+ * throws before the URL is resolved, so at that throw position the value does
+ * not exist yet and the message would lose the URL entirely (pinned by test).
+ * `redactUrlQuery` is pure, so recomputing re-reads only `req.originalUrl` /
+ * `req.url` — for any ordinary request object, the same value the entry carried.
+ *
+ * Boundary: this masks query secrets, which is what `maskQueryKeys` governs. A
+ * `redactPaths` entry targeting `url` itself (e.g. to suppress a path segment
+ * like `/users/<ssn>`) is NOT honored here, because this resolves from `req` and
+ * never consults `entry.url`: the entry is block-scoped to the try, and for a
+ * throw from `enrich` or a function-form `level` it does not exist yet at all.
+ * (For a later throw — `messageBuilder`, `logger.log` — it does exist with `url`
+ * already redacted, but reaching it would mean hoisting the entry out of the
+ * try, beyond this helper's query-secret mandate.) So a path segment the
+ * happy-path line redacts can still appear in the error-path message.
+ */
+const safeRedactedUrl = (
+  req: LoggableRequest,
+  maskQueryKeys: ReadonlySet<string> | undefined,
+): string => {
+  try {
+    return redactUrlQuery(req.originalUrl ?? req.url ?? "", maskQueryKeys);
+  } catch {
+    return "";
+  }
+};
+
+/**
  * Surgically redacts a value at the supplied dot-notation path on the entry
  * object. Missing intermediate keys are a no-op (we never create new sub-paths
  * just to write `[REDACTED]`). Mutates the passed object in place — callers
@@ -1007,12 +1058,27 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
 
         logger.log(logEntry);
       } catch (err) {
-        const method = req.method ?? "GET";
-        const reqUrl = req.originalUrl ?? req.url ?? "";
-        const reason = err instanceof Error ? err.message : String(err);
-        console.error(
-          `@hiprax/logger request logger failed while logging ${method} ${reqUrl}: ${reason}`,
-        );
+        // This handler runs inside the `res` "finish" / "close" emitter, where a
+        // throw is an UNCAUGHT exception — it would escalate a dropped log line
+        // into a crashed process. Every value read here is caller-controlled: an
+        // exotic request adapter can expose throwing `method` / `originalUrl`
+        // getters, and a custom `Error` subclass can expose a throwing `message`
+        // getter (or be a value whose `String()` conversion throws). So the whole
+        // assembly is guarded, with a last-resort message that reads nothing.
+        try {
+          const method = req.method ?? "GET";
+          // Never build this message from the raw URL: it goes to `console.error`,
+          // so an unredacted query string leaks the very secrets `maskQueryKeys`
+          // masks on the happy path. `safeRedactedUrl` degrades the URL alone, so
+          // a hostile url getter still leaves the method and reason reportable.
+          const reqUrl = safeRedactedUrl(req, queryMaskSet);
+          const reason = err instanceof Error ? err.message : String(err);
+          console.error(
+            `@hiprax/logger request logger failed while logging ${method} ${reqUrl}: ${reason}`,
+          );
+        } catch {
+          console.error("@hiprax/logger request logger failed, and so did reporting the failure.");
+        }
       }
     };
 
@@ -1039,6 +1105,7 @@ export const __requestInternals = {
   truncateString,
   buildTruncatedEnvelope,
   redactUrlQuery,
+  safeRedactedUrl,
   redactEntryPath,
   resolveMaskHeaderKeys,
   resolveMaskQueryKeys,
