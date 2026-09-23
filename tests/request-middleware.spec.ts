@@ -1998,12 +1998,71 @@ describe("createRequestLogger", () => {
       expect((caught as RequestLoggerOptionError).message).toContain("false");
     });
 
-    it("accepts maskHeaderKeys: false (opt-out for safe-defaults masking)", () => {
-      expect(() => createRequestLogger({ maskHeaderKeys: false })).not.toThrow();
+    // Both opt-out cases go through the DEFAULT-logger branch (no `logger`
+    // option) on purpose, so the spy stands in for the auto-created `http`
+    // logger: a real one would open rotating files under `<cwd>/logs`.
+    it("accepts maskHeaderKeys: false and logs safe-default headers unmasked through the default logger", () => {
+      const { logger, log } = createMockLogger();
+      const spy = jest.spyOn(loggerModule, "createLogger").mockReturnValue(logger);
+
+      const middleware = createRequestLogger({
+        maskHeaderKeys: false,
+        includeHttpContext: true,
+        includeRequestHeaders: ["authorization", "cookie"],
+      });
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith({ moduleName: "http" });
+
+      const { res, next } = runMiddleware(middleware, {
+        originalUrl: "/auth/login?token=abc&keep=me",
+        headers: { authorization: "Bearer top-secret", cookie: "session=abc" },
+      });
+      res.emit("finish");
+
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledTimes(1);
+      const payload = log.mock.calls[0][0];
+      // The opt-out's observable effect: both safe-default header keys survive verbatim.
+      expect(payload.http.requestHeaders).toEqual({
+        authorization: "Bearer top-secret",
+        cookie: "session=abc",
+      });
+      // The opt-out is scoped to headers: query masking still runs.
+      expect(payload.http.url).toBe("/auth/login?token=[REDACTED]&keep=me");
+      expect(payload.message).not.toContain("token=abc");
     });
 
-    it("accepts maskQueryKeys: false (opt-out for safe-defaults query masking)", () => {
-      expect(() => createRequestLogger({ maskQueryKeys: false })).not.toThrow();
+    it("accepts maskQueryKeys: false and logs safe-default query keys unmasked through the default logger", () => {
+      const { logger, log } = createMockLogger();
+      const spy = jest.spyOn(loggerModule, "createLogger").mockReturnValue(logger);
+
+      const middleware = createRequestLogger({
+        maskQueryKeys: false,
+        includeHttpContext: true,
+        includeRequestHeaders: ["authorization"],
+      });
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith({ moduleName: "http" });
+
+      const { res, next } = runMiddleware(middleware, {
+        originalUrl: "/auth/login?token=abc&code=xyz&keep=me",
+        headers: { authorization: "Bearer top-secret" },
+      });
+      res.emit("finish");
+
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledTimes(1);
+      const payload = log.mock.calls[0][0];
+      // The opt-out's observable effect: `token` and `code` are both in the
+      // safe-default query list, yet the URL (and the default message built
+      // from it) keeps them verbatim.
+      expect(payload.http.url).toBe("/auth/login?token=abc&code=xyz&keep=me");
+      expect(payload.message).toMatch(/^POST \/auth\/login\?token=abc&code=xyz&keep=me 200 /);
+      expect(payload.http.url).not.toContain("[REDACTED]");
+      // The opt-out is scoped to the query string: header masking still runs.
+      expect(payload.http.requestHeaders).toEqual({ authorization: "[REDACTED]" });
     });
 
     it("throws RequestLoggerOptionError({ code: 'INVALID_MASK' }) when maskQueryKeys is the wrong type", () => {

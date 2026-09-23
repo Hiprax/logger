@@ -17,6 +17,9 @@ const config: Config = {
     "^(\\.{1,2}/.*)\\.js$": "$1",
   },
   roots: ["<rootDir>/tests"],
+  // Fails the run if any test writes into the repository (see tests/repo-write-guard.mjs).
+  globalSetup: "<rootDir>/tests/global-setup.mjs",
+  globalTeardown: "<rootDir>/tests/global-teardown.mjs",
   collectCoverageFrom: ["src/**/*.ts"],
   coverageDirectory: "coverage",
   coverageProvider: "v8",
