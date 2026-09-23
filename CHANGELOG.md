@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Security
+
+- **Closed every open dev-tree `npm audit` advisory (4 packages: 1 moderate, 3 high)** (`package-lock.json`, `package.json`, `CLAUDE.md`). All are **devDependency-only** and build/test-time only: the published tarball and the runtime dependencies (`winston`, `winston-daily-rotate-file`, `moment-timezone`) are unaffected, and `npm audit --omit=dev` was already 0 before the change.
+  - `brace-expansion` (GHSA-3jxr-9vmj-r5cp, GHSA-mh99-v99m-4gvg, GHSA-rgw5-rvv9-x895; expansion DoS): the three vulnerable copies (1.1.14 under `test-exclude@6`, 2.1.0 under jest's `glob@10`, and the hoisted 5.0.6 under `minimatch@10`) collapse to a single `brace-expansion@5.0.12`, reached only through `minimatch@10` (used by `eslint`, `typescript-eslint`, `glob@13` under jest and `rimraf`, and `test-exclude@7`). The collapse also depends on the jest refresh and `test-exclude` override listed under Changed. Every patched 5.x release declares Node `20 || >=22`, so the Node 18 CI leg prints one more `EBADENGINE` warning. The package is plain JavaScript, and the Node 18 build and test run passes.
+  - `browserslist` 4.28.4 → 4.29.0 (GHSA-c83g-rgw3-j3cx, GHSA-73wf-gq98-2v4g) and `baseline-browser-mapping` 2.10.40 → 2.11.25 (GHSA-w5vr-8v7q-w6rv), reached through `@babel/core`.
+  - `js-yaml` 3.15.0 → 3.15.2 (GHSA-5p4m-2wfm-xmqj, GHSA-2883-xcg3-v3hh; CPU-exhaustion DoS), reached through `babel-plugin-istanbul`. The existing `"js-yaml@3"` override floor is raised from `^3.15.0` to `^3.15.2` so a regenerated lockfile cannot resolve a vulnerable 3.x release.
+  - The advisory fixes come from an in-range `npm audit fix` lockfile refresh (no `--force`, no parent range crossed); `npm audit` now reports 0 vulnerabilities.
+
+### Changed
+
+- **A fresh `npm ci` prints no deprecation or `allow-scripts` warnings** (`package.json`, `package-lock.json`, `CLAUDE.md`). Contributor-facing only: the published tarball and runtime dependencies are unchanged.
+  - The dev toolchain lockfile is refreshed inside the declared ranges: `jest` 30.4.2 → 30.5.2 and `ts-jest` 29.4.9 → 29.4.13. This removes the deprecated `inflight@1.0.6` and `glob@7.2.3` (they came in through `babel-plugin-istanbul@7` → `test-exclude@6`), and jest's own packages move from `glob@10` to `glob@13`.
+  - New override `"test-exclude@7": { "glob": "^13.0.6" }` clears the last deprecation warning (`glob@10.5.0`), which the latest `babel-plugin-istanbul@8.0.0` still pulls in through `test-exclude@7.0.2`. `test-exclude@8.0.0` ships the identical code against `glob@13`. The override is scoped to `test-exclude` 7.x, so it goes inert once upstream moves on. `npm ci` was checked on npm 10 (Node 18 and 22) as well as npm 11.
+  - New `allowScripts` field records the reviewed install scripts of `esbuild@0.28.1`, `unrs-resolver@1.12.2`, `@parcel/watcher@2.6.0` and `fsevents@2.3.3`. This silences npm 11's `allow-scripts` warning, makes `npm ci --strict-allow-scripts` pass, and keeps installs working once npm starts blocking unreviewed scripts. Older npm ignores the field.
+
 ## [1.1.0] - 2026-07-17
 
 ### Added
