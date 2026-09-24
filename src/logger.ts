@@ -451,7 +451,7 @@ export const getDefaultRotation = (): RotationStrategy => ({
  * Builds a stable canonical JSON representation of the *resolved* logger
  * options used for warning-on-mismatch detection in the registry. Includes all
  * options that affect runtime behavior: `level`, `consoleLevel`,
- * `includeConsole`, `includeFile`, `includeGlobalFile`, `globalModuleName`,
+ * `consoleLevelPinned`, `includeConsole`, `includeFile`, `includeGlobalFile`, `globalModuleName`,
  * `extraTimezones` (sorted to be order-independent), `rotation`,
  * `globalRotation`, `escapeMessageNewlines`, `format`, `maskMetaKeys`
  * (lowercased + sorted to be order-independent — security-relevant, so a
@@ -469,6 +469,14 @@ export const getDefaultRotation = (): RotationStrategy => ({
  * different one does not (both are `"function"`). This mirrors the
  * `additionalTransports(count)` caveat — presence/count, never deep identity.
  *
+ * `consoleLevelPinned` records whether the caller passed `consoleLevel` at all.
+ * The resolved `consoleLevel` alone cannot tell `{ level: "info" }` from
+ * `{ level: "info", consoleLevel: "info" }`, yet the two behave differently: a
+ * pinned console keeps its level when `logger.level` changes at runtime, while
+ * an unpinned one follows it. So a second `createLogger()` that adds or removes
+ * the pin on a cached key surfaces through the conflict warning, following the
+ * same presence-marker precedent as `onTransportError`.
+ *
  * Does NOT include `additionalTransports` — function/class instances are not
  * stably comparable; the registry tracks their count separately and the warning
  * surfaces it as a caveat.
@@ -476,6 +484,7 @@ export const getDefaultRotation = (): RotationStrategy => ({
 const buildOptionsSignature = (resolved: {
   level: LogLevel;
   consoleLevel: LogLevel;
+  consoleLevelPinned: boolean;
   includeConsole: boolean;
   includeFile: boolean;
   includeGlobalFile: boolean;
@@ -494,6 +503,7 @@ const buildOptionsSignature = (resolved: {
   return JSON.stringify({
     level: resolved.level,
     consoleLevel: resolved.consoleLevel,
+    consoleLevelPinned: resolved.consoleLevelPinned,
     includeConsole: resolved.includeConsole,
     includeFile: resolved.includeFile,
     includeGlobalFile: resolved.includeGlobalFile,
@@ -1902,6 +1912,11 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
   validateLogLevelOption("consoleLevel", consoleLevel);
   validateFormatOption(format);
 
+  // Whether the caller pinned the console to its own level. Only a pinned
+  // console keeps an explicit transport level; every other built-in transport
+  // inherits the logger's level so a runtime `logger.level = x` reaches it.
+  const consoleLevelPinned = options.consoleLevel !== undefined;
+
   // Validate `maskMetaKeys` BEFORE the cache lookup so a non-array or an
   // array-with-non-string entry throws a structured LoggerOptionError even
   // when a logger is already cached for the same module + directory.
@@ -1976,6 +1991,7 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
   const optionsSignature = buildOptionsSignature({
     level,
     consoleLevel,
+    consoleLevelPinned,
     includeConsole,
     includeFile,
     includeGlobalFile,
@@ -2199,11 +2215,24 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
   // register with the process-wide coordinator in `./crash-capture` below,
   // which owns a SINGLE listener pair and records a crash once through one
   // elected logger. No transport receives the flags here.
+  //
+  // Level gating: a built-in transport carries NO level of its own unless the
+  // caller pinned one (`consoleLevel`). `winston-transport` resolves
+  // `this.level || (this.parent && this.parent.level)` on every write
+  // (`modern.js`), and
+  // `parent` is this logger once it is piped, so each transport follows the
+  // logger's CURRENT level: at construction that is `level`, exactly as
+  // before, and a runtime `logger.level = "debug"` now reaches the console
+  // and both files. With an explicit level on each transport that assignment
+  // was silently ignored, and `logger.isLevelEnabled()` (which consults
+  // transport levels) agreed with the broken emission.
 
   if (includeConsole) {
     registerTransport(
       new winston.transports.Console({
-        level: consoleLevel,
+        // Pinned only when the caller passed `consoleLevel`; otherwise the
+        // console inherits the logger level (see "Level gating" above).
+        level: consoleLevelPinned ? consoleLevel : undefined,
         // In pretty mode this is the console's own timestamp-free, colorized
         // chain. In json mode it is `undefined`: the transport then has no
         // format and `winston-transport`'s `_write` emits the logger-level
@@ -2220,13 +2249,21 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
 
   if (includeFile) {
     ensureDirectory(path.dirname(moduleFilename));
-    registerTransport(
-      buildRotateTransport({
-        filename: moduleFilename,
-        level,
-        rotation,
-      }),
-    );
+    // Built WITH `level`, then cleared. The order is load-bearing:
+    // `winston-daily-rotate-file` names the rotation audit file
+    // `.<hash(constructor options)>-audit.json`, `level` included, and
+    // `file-stream-rotator` only prunes files listed in that audit file. So the
+    // constructor options must stay exactly what they have always been (same
+    // hash, same audit file, retention keeps working on existing installs);
+    // only the live `.level` is cleared so the transport inherits the logger
+    // level (see "Level gating" above).
+    const moduleTransport = buildRotateTransport({
+      filename: moduleFilename,
+      level,
+      rotation,
+    });
+    moduleTransport.level = undefined;
+    registerTransport(moduleTransport);
   }
 
   if (includeGlobalFile) {
@@ -2250,13 +2287,16 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
         // original-case `globalFilename` for the actual file path, so only the
         // registry-equality key is folded, never the on-disk name.
         key: buildRegistryKey(globalFilename),
-        level,
+        // No `level`: the handle inherits THIS logger's level through its
+        // `parent` (see "Level gating" above), so loggers sharing the file keep
+        // independent, runtime-adjustable levels. The handle has no audit file.
         rotationSignature: JSON.stringify(resolvedGlobalRotation),
         createTransport: () =>
           buildRotateTransport({
             filename: globalFilename,
             // The shared transport must accept every level that any sharing
-            // logger might emit; per-logger gating happens on the handle.
+            // logger might emit; per-logger gating happens on each logger's
+            // handle, which follows that logger's current level.
             level: "silly",
             rotation: globalRotation ?? rotation,
           }),

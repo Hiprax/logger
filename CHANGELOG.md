@@ -21,6 +21,15 @@
   - New Jest `globalSetup` / `globalTeardown` hooks snapshot the repository tree (type, size, nanosecond mtime) before and after the run, skipping `.git`, `node_modules`, Jest's coverage and cache directories, and top-level dot entries. Any created, changed or deleted path fails the run with the paths listed; under `--watch` / `--watchAll` (`npm run test:watch`) the same report is printed instead, so the watcher keeps running.
 - **Line endings normalized to LF** in `.gitignore`, `LICENSE`, `jest.config.ts`, `tsconfig.json` and `tsup.config.ts`, matching the repository's `.gitattributes` (`eol=lf`) and Prettier `endOfLine: "lf"`. Content is otherwise unchanged.
 
+### Fixed
+
+- **Runtime `logger.level` changes now apply to the built-in console, module-file, and global-file transports** (`src/logger.ts`, `src/shared-file-transport.ts`, `src/types.ts`, `README.md`; tests in `tests/logger.spec.ts`, shared `captureConsole` helper in `tests/_helpers.ts`). Each built-in transport used to receive an explicit level at construction, so `logger.level = "debug"` was silently ignored by all three and `logger.isLevelEnabled("debug")` returned `false`. They now carry no level of their own and inherit the logger's current level on every write (winston's transport level inheritance), so raising or lowering `logger.level` takes effect immediately, `isLevelEnabled()` agrees with what is emitted, and loggers sharing the global file keep independent levels.
+  - An explicit `consoleLevel` pins the console: runtime `logger.level` changes then reach the files but not the console. Without `consoleLevel` the console follows `logger.level`.
+  - `transport.level` now reads `undefined` on the built-in transports unless `consoleLevel` was passed (then the console reports it). `additionalTransports` are unchanged.
+  - The module file is still constructed with the same options as before and only its live level is cleared afterwards, so its rotation audit file (`.<hash>-audit.json`, whose name hashes every constructor option) keeps its name and `maxFiles` pruning keeps working on existing installs.
+  - The registry's conflict warning now also compares whether `consoleLevel` was passed (`consoleLevelPinned`), so a second `createLogger()` for a cached logger that adds or removes the pin is reported instead of silently dropped.
+  - Winston does not validate a runtime level, and invalid values behave in opposite ways: a non-empty unknown string such as `logger.level = "silent"` makes every inheriting transport drop every entry, crash records included, while an empty or missing value (`""`, `undefined`, `null`, e.g. an unset environment variable) makes them write every entry, `debug` and `silly` included. Validate a configured level before assigning it; use `logger.silent = true` to silence a logger.
+
 ## [1.1.0] - 2026-07-17
 
 ### Added

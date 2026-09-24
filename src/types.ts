@@ -141,7 +141,8 @@ export interface LoggerOptions {
    */
   logDirectory?: string;
   /**
-   * Logging level for all transports. Defaults to `"info"`.
+   * Initial level of the logger, which its built-in transports follow unless
+   * `consoleLevel` pins the console. Defaults to `"info"`.
    *
    * Winston uses the npm log-level hierarchy where lower numbers are more
    * severe and a level only emits messages whose severity is `<=` the
@@ -163,12 +164,45 @@ export interface LoggerOptions {
    * - `"info"` — default; standard production verbosity.
    * - `"http"` — include HTTP request/response logs from the middleware.
    * - `"debug"` / `"silly"` — development / deep diagnostics only.
+   *
+   * **Runtime changes:** this is the logger's initial level. Assigning
+   * `logger.level = "debug"` later takes effect on the console (unless
+   * `consoleLevel` pins it), the module file, and the global file, because
+   * those built-in transports carry no level of their own and inherit the
+   * logger's current level on every write (winston's documented transport
+   * level inheritance). `logger.isLevelEnabled()` agrees with what is
+   * emitted, for every level in the hierarchy.
+   * An `additionalTransports` entry constructed with its own `level` keeps
+   * that level. As a consequence, `transport.level` reads `undefined` on the
+   * built-in module-file and global-file transports, and on the console unless
+   * `consoleLevel` was passed (then it reads that value).
+   *
+   * The assigned value is not validated, and two kinds of invalid value
+   * behave in opposite ways:
+   * - A non-empty string outside the hierarchy (for example `"silent"`)
+   *   matches no level, so every inheriting transport drops EVERY entry,
+   *   errors and crash records included.
+   * - An empty or missing value (`""`, `undefined`, `null`, e.g. an unset
+   *   environment variable) leaves the transports with no level at all, so
+   *   they accept EVERY entry, `debug` and `silly` included, while
+   *   `logger.isLevelEnabled()` reports `false` for every level.
+   *
+   * Validate a level read from configuration before assigning it. To silence
+   * a logger, set `logger.silent = true` instead.
    */
   level?: LogLevel;
   /**
-   * Logging level used specifically for the console transport. Defaults to
-   * the value of `level`. Same npm-level semantics as `level` — see that
-   * option's docs for the full hierarchy.
+   * Logging level used specifically for the console transport. Same
+   * npm-level semantics as `level`; see that option's docs for the full
+   * hierarchy.
+   *
+   * When omitted, the console follows the logger's level, including runtime
+   * `logger.level` changes. When passed (even with the same value as
+   * `level`), it pins the console to this level: runtime `logger.level`
+   * changes then reach the files but not the console, and the console
+   * transport's `level` reads this value. Adding or removing the pin on a
+   * second `createLogger()` call for a cached logger is reported by the
+   * conflict warning as `consoleLevelPinned`.
    */
   consoleLevel?: LogLevel;
   /**

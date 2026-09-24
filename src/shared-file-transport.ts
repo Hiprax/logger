@@ -163,8 +163,13 @@ export const flushSharedFileTransportsForExit = (): Promise<void> =>
  * piped into the logger — never the shared transport itself.
  *
  * @param options.key - Resolved absolute global-log-file path (the share key).
- * @param options.level - The acquiring logger's level. Level gating happens on
- *   the handle, so loggers sharing one file keep independent levels.
+ * @param options.level - Optional explicit level for the handle. Level gating
+ *   happens on the handle, never on the shared transport, so loggers sharing
+ *   one file keep independent levels. `logger.ts` omits it: a level-less handle
+ *   resolves `this.level || (this.parent && this.parent.level)` on every write
+ *   (`winston-transport`'s `_write`), and `parent` is the logger it is piped
+ *   into, so it follows that logger's CURRENT level, including a runtime
+ *   `logger.level = x`. A handle given a level keeps that fixed level.
  * @param options.rotationSignature - Canonical JSON of the acquiring logger's
  *   resolved global rotation config. A second acquisition with a different
  *   signature keeps the first logger's config and warns once.
@@ -174,7 +179,7 @@ export const flushSharedFileTransportsForExit = (): Promise<void> =>
  */
 export const acquireSharedGlobalFile = (options: {
   key: string;
-  level: string;
+  level?: string;
   rotationSignature: string;
   createTransport: () => winston.transport;
 }): winston.transport => {

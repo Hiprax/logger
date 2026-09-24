@@ -123,6 +123,36 @@ export const teardownLogger = (logger: winston.Logger): void => {
   });
 };
 
+/**
+ * Captures what winston's Console transport actually writes while `emit` runs,
+ * and returns it as one string. The captured bytes are swallowed, not echoed.
+ *
+ * It writes to `console._stdout`, NOT to `process.stdout` directly
+ * (`winston/lib/winston/transports/console.js:85-87`: "Node.js maps
+ * `process.stdout` to `console._stdout`"). Those are the same object in a
+ * bare Node process, but jest replaces the global `console` with its own
+ * buffered Console whose `_stdout` is a different stream, so patching
+ * `process.stdout` captures nothing under a full-suite run while appearing
+ * to work when a single file runs alone. Patch the channel winston really uses,
+ * falling back to `process.stdout` if a future winston drops `_stdout`.
+ */
+export const captureConsole = (emit: () => void): string => {
+  const written: string[] = [];
+  const target =
+    (console as unknown as { _stdout?: NodeJS.WritableStream })._stdout ?? process.stdout;
+  const original = target.write.bind(target);
+  (target as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
+    written.push(String(chunk));
+    return true;
+  };
+  try {
+    emit();
+  } finally {
+    (target as unknown as { write: unknown }).write = original;
+  }
+  return written.join("");
+};
+
 /** Creates a fresh OS-temp directory under a stable prefix. */
 export const createTempDir = (): string => fs.mkdtempSync(path.join(os.tmpdir(), "adv-logger-"));
 

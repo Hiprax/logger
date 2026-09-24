@@ -28,7 +28,7 @@ import {
 } from "../src/shared-file-transport";
 import { MAX_REDACT_DEPTH, redactValue } from "../src/redact";
 import { InvalidTimezoneError, LoggerOptionError } from "../src/errors";
-import { createTempDir, teardownLogger } from "./_helpers";
+import { captureConsole, createTempDir, teardownLogger } from "./_helpers";
 
 /**
  * Minimal Winston-compatible transport used by the transport-error-handling
@@ -1842,6 +1842,7 @@ describe("createLogger", () => {
       const base = {
         level: "info" as const,
         consoleLevel: "info" as const,
+        consoleLevelPinned: false,
         includeConsole: false,
         includeFile: false,
         includeGlobalFile: false,
@@ -1871,6 +1872,7 @@ describe("createLogger", () => {
       const base = {
         level: "info" as const,
         consoleLevel: "info" as const,
+        consoleLevelPinned: false,
         includeConsole: false,
         includeFile: false,
         includeGlobalFile: false,
@@ -5310,35 +5312,6 @@ describe("createLogger", () => {
       expect(rendered).toContain("user loaded");
     });
 
-    /**
-     * Captures what winston's Console transport actually writes.
-     *
-     * It writes to `console._stdout`, NOT to `process.stdout` directly
-     * (`winston/lib/winston/transports/console.js:85-87` — "Node.js maps
-     * `process.stdout` to `console._stdout`"). Those are the same object in a
-     * bare Node process, but jest replaces the global `console` with its own
-     * buffered Console whose `_stdout` is a different stream — so patching
-     * `process.stdout` captures nothing under a full-suite run while appearing
-     * to work when this file runs alone. Patch the channel winston really uses,
-     * falling back to `process.stdout` if a future winston drops `_stdout`.
-     */
-    const captureConsole = (emit: () => void): string => {
-      const written: string[] = [];
-      const target =
-        (console as unknown as { _stdout?: NodeJS.WritableStream })._stdout ?? process.stdout;
-      const original = target.write.bind(target);
-      (target as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
-        written.push(String(chunk));
-        return true;
-      };
-      try {
-        emit();
-      } finally {
-        (target as unknown as { write: unknown }).write = original;
-      }
-      return written.join("");
-    };
-
     it("honors a top-level toJSON on the CONSOLE too when a mask is configured", () => {
       // The eager resolve happens in the logger-level chain, so the withheld
       // field never enters the rebuilt info at all. Since Phase 16.1 the Console
@@ -5570,23 +5543,6 @@ describe("createLogger", () => {
     const FIXED_ISO = "2031-03-04T05:06:07Z";
     const FIXED_TS = "2031-03-04 05:06:07";
     const fixedClock = (): Date => new Date(FIXED_ISO);
-
-    const captureConsole = (emit: () => void): string => {
-      const written: string[] = [];
-      const target =
-        (console as unknown as { _stdout?: NodeJS.WritableStream })._stdout ?? process.stdout;
-      const original = target.write.bind(target);
-      (target as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
-        written.push(String(chunk));
-        return true;
-      };
-      try {
-        emit();
-      } finally {
-        (target as unknown as { write: unknown }).write = original;
-      }
-      return written.join("");
-    };
 
     const renderStream = (
       options: Parameters<typeof createLogger>[0],
@@ -6591,22 +6547,6 @@ describe("createLogger", () => {
     });
 
     it("emits the same `module` field on the console as in the file (json)", () => {
-      const captureConsole = (emit: () => void): string => {
-        const written: string[] = [];
-        const target =
-          (console as unknown as { _stdout?: NodeJS.WritableStream })._stdout ?? process.stdout;
-        const original = target.write.bind(target);
-        (target as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
-          written.push(String(chunk));
-          return true;
-        };
-        try {
-          emit();
-        } finally {
-          (target as unknown as { write: unknown }).write = original;
-        }
-        return written.join("");
-      };
       const consoleOut = captureConsole(() => {
         const logger = createLogger({
           moduleName: "api",
@@ -6628,22 +6568,6 @@ describe("createLogger", () => {
       // (which still carries its `toJSON`) once, upstream. The console never sees
       // a second injector, so it cannot re-stamp `module` onto the shallow clone
       // whose prototype (and `toJSON`) was stripped — console and file agree.
-      const captureConsole = (emit: () => void): string => {
-        const written: string[] = [];
-        const target =
-          (console as unknown as { _stdout?: NodeJS.WritableStream })._stdout ?? process.stdout;
-        const original = target.write.bind(target);
-        (target as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
-          written.push(String(chunk));
-          return true;
-        };
-        try {
-          emit();
-        } finally {
-          (target as unknown as { write: unknown }).write = original;
-        }
-        return written.join("");
-      };
       class UserDto {
         public message = "user loaded";
         toJSON(): Record<string, unknown> {
@@ -8382,4 +8306,480 @@ describe("printf tokens in a message (winston splat parity)", () => {
     expect(util.format("route /caf%c3%a9", { ip: "1.2.3.4" })).toBe("route /caf3%a9");
     expect(util.format("route /a%d", { requestId: "r1" })).toBe("route /aNaN");
   });
+});
+
+describe("runtime level changes", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  /**
+   * Concatenates every rotated log file written for `prefix` in `dir`, read
+   * off disk. Reading the directory keeps the assertion independent of the
+   * rotator's local-vs-UTC `%DATE%` resolution.
+   */
+  const readLogFiles = (dir: string, prefix: string): string =>
+    fs
+      .readdirSync(dir)
+      .filter((name) => name.startsWith(`${prefix}-`) && name.endsWith(".log"))
+      .map((name) => fs.readFileSync(path.join(dir, name), "utf8"))
+      .join("");
+
+  /** The rotation audit files (`.<hash>-audit.json`) present in `dir`. */
+  const auditFiles = (dir: string): string[] =>
+    fs.readdirSync(dir).filter((name) => /^\..+-audit\.json$/.test(name));
+
+  describe.each([["pretty"], ["json"]] as const)("format: %s", (format) => {
+    it('delivers a debug line to the console, module file, and global file after `logger.level = "debug"`', async () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: `rl-raise-${format}`,
+        logDirectory: root,
+        captureUncaught: false,
+        format,
+      });
+
+      const consoleOut = captureConsole(() => {
+        logger.debug("RL-BEFORE-RAISE");
+        logger.level = "debug";
+        logger.debug("RL-AFTER-RAISE");
+      });
+      await shutdownLogger(logger);
+
+      const moduleFile = readLogFiles(root, `rl-raise-${format}`);
+      const globalFile = readLogFiles(root, "all-logs");
+      expect(consoleOut).toContain("RL-AFTER-RAISE");
+      expect(moduleFile).toContain("RL-AFTER-RAISE");
+      expect(globalFile).toContain("RL-AFTER-RAISE");
+      // The line logged BEFORE the change was still gated at "info" everywhere.
+      expect(consoleOut).not.toContain("RL-BEFORE-RAISE");
+      expect(moduleFile).not.toContain("RL-BEFORE-RAISE");
+      expect(globalFile).not.toContain("RL-BEFORE-RAISE");
+      // Exactly one line each: no duplicate delivery through any transport.
+      expect(moduleFile.split("RL-AFTER-RAISE").length - 1).toBe(1);
+      expect(globalFile.split("RL-AFTER-RAISE").length - 1).toBe(1);
+      expect(consoleOut.split("RL-AFTER-RAISE").length - 1).toBe(1);
+    });
+  });
+
+  it('stops an info line from reaching any built-in transport after `logger.level = "warn"`', async () => {
+    const root = createTempDir();
+    const logger = createLogger({
+      moduleName: "rl-lower",
+      logDirectory: root,
+      captureUncaught: false,
+    });
+
+    const consoleOut = captureConsole(() => {
+      logger.level = "warn";
+      logger.info("RL-INFO-SUPPRESSED");
+      logger.warn("RL-WARN-KEPT");
+    });
+    await shutdownLogger(logger);
+
+    const moduleFile = readLogFiles(root, "rl-lower");
+    const globalFile = readLogFiles(root, "all-logs");
+    expect(consoleOut).not.toContain("RL-INFO-SUPPRESSED");
+    expect(moduleFile).not.toContain("RL-INFO-SUPPRESSED");
+    expect(globalFile).not.toContain("RL-INFO-SUPPRESSED");
+    // The level still admits what it should: the suppression is not a blanket drop.
+    expect(consoleOut).toContain("RL-WARN-KEPT");
+    expect(moduleFile).toContain("RL-WARN-KEPT");
+    expect(globalFile).toContain("RL-WARN-KEPT");
+  });
+
+  it("keeps runtime levels independent between two loggers sharing the global file", async () => {
+    const root = createTempDir();
+    const chatty = createLogger({
+      moduleName: "rl-shared-chatty",
+      logDirectory: root,
+      includeConsole: false,
+      captureUncaught: false,
+    });
+    const quiet = createLogger({
+      moduleName: "rl-shared-quiet",
+      logDirectory: root,
+      includeConsole: false,
+      captureUncaught: false,
+    });
+
+    chatty.level = "debug";
+    chatty.debug("RL-CHATTY-DEBUG");
+    quiet.debug("RL-QUIET-DEBUG");
+    await shutdownLogger(chatty);
+    await shutdownLogger(quiet);
+
+    const globalFile = readLogFiles(root, "all-logs");
+    expect(globalFile).toContain("RL-CHATTY-DEBUG");
+    expect(readLogFiles(root, "rl-shared-chatty")).toContain("RL-CHATTY-DEBUG");
+    // The other logger sharing the same file never changed level, so its debug
+    // line reaches neither its own file nor the shared one.
+    expect(globalFile).not.toContain("RL-QUIET-DEBUG");
+    expect(readLogFiles(root, "rl-shared-quiet")).not.toContain("RL-QUIET-DEBUG");
+    expect(quiet.level).toBe("info");
+  });
+
+  it("keeps an explicit `consoleLevel` pinned while the files follow `logger.level`", async () => {
+    const root = createTempDir();
+    const logger = createLogger({
+      moduleName: "rl-pinned",
+      logDirectory: root,
+      consoleLevel: "info",
+      captureUncaught: false,
+    });
+
+    const consoleOut = captureConsole(() => {
+      logger.level = "debug";
+      logger.debug("RL-PINNED-DEBUG");
+      logger.info("RL-PINNED-INFO");
+    });
+    await shutdownLogger(logger);
+
+    expect(readLogFiles(root, "rl-pinned")).toContain("RL-PINNED-DEBUG");
+    expect(readLogFiles(root, "all-logs")).toContain("RL-PINNED-DEBUG");
+    // The pinned console ignores the runtime change...
+    expect(consoleOut).not.toContain("RL-PINNED-DEBUG");
+    // ...but still logs at its own pinned level.
+    expect(consoleOut).toContain("RL-PINNED-INFO");
+  });
+
+  it("reports `isLevelEnabled` consistently with emission when only built-in transports exist", async () => {
+    const root = createTempDir();
+    const logger = createLogger({
+      moduleName: "rl-enabled",
+      logDirectory: root,
+      captureUncaught: false,
+    });
+
+    expect(logger.isLevelEnabled("debug")).toBe(false);
+    const consoleOut = captureConsole(() => {
+      logger.level = "debug";
+      logger.debug("RL-ENABLED-DEBUG");
+    });
+
+    expect(logger.isLevelEnabled("debug")).toBe(true);
+    expect(logger.isDebugEnabled()).toBe(true);
+    // One level past the new threshold stays disabled.
+    expect(logger.isLevelEnabled("silly")).toBe(false);
+    await shutdownLogger(logger);
+    expect(consoleOut).toContain("RL-ENABLED-DEBUG");
+    expect(readLogFiles(root, "rl-enabled")).toContain("RL-ENABLED-DEBUG");
+    expect(readLogFiles(root, "all-logs")).toContain("RL-ENABLED-DEBUG");
+  });
+
+  it("leaves construction-time gating unchanged when the level is never changed", async () => {
+    const root = createTempDir();
+    const logger = createLogger({
+      moduleName: "rl-static",
+      logDirectory: root,
+      captureUncaught: false,
+    });
+
+    const consoleOut = captureConsole(() => {
+      logger.debug("RL-STATIC-DEBUG");
+      logger.info("RL-STATIC-INFO");
+    });
+    await shutdownLogger(logger);
+
+    const moduleFile = readLogFiles(root, "rl-static");
+    const globalFile = readLogFiles(root, "all-logs");
+    expect(consoleOut).not.toContain("RL-STATIC-DEBUG");
+    expect(moduleFile).not.toContain("RL-STATIC-DEBUG");
+    expect(globalFile).not.toContain("RL-STATIC-DEBUG");
+    expect(consoleOut).toContain("RL-STATIC-INFO");
+    expect(moduleFile).toContain("RL-STATIC-INFO");
+    expect(globalFile).toContain("RL-STATIC-INFO");
+    expect(logger.isLevelEnabled("debug")).toBe(false);
+  });
+
+  it("keeps the module file's rotation audit file name unchanged (same constructor options as before)", async () => {
+    // The audit file is named from a hash of EVERY DailyRotateFile constructor
+    // option, `level` included, and file-stream-rotator only prunes files listed
+    // in it. A reference transport built with the exact options the module file
+    // has always received must therefore land on the SAME audit file; if the
+    // module file were built with different options (say, without `level`) there
+    // would be two audit files and existing installs would stop pruning.
+    const root = createTempDir();
+    const logger = createLogger({
+      moduleName: "rl-audit",
+      logDirectory: root,
+      includeConsole: false,
+      includeGlobalFile: false,
+      captureUncaught: false,
+      rotation: { maxSize: "5M", maxFiles: "3D" },
+    });
+    expect(auditFiles(root)).toHaveLength(1);
+
+    const reference = new DailyRotateFile({
+      // `.native`, like the logger's own `resolveLogDirectory`: on Windows the
+      // JS `realpathSync` keeps 8.3 short names (`RUNNER~1`), which would change
+      // the absolute filename and therefore the hash.
+      filename: path.join(fs.realpathSync.native(root), "rl-audit-%DATE%.log"),
+      datePattern: "YYYY-MM-DD",
+      maxSize: "5m",
+      maxFiles: "3d",
+      zippedArchive: false,
+      level: "info",
+    });
+    await new Promise<void>((resolve) => {
+      reference.once("finish", () => resolve());
+      reference.close?.();
+    });
+    await shutdownLogger(logger);
+
+    const audits = auditFiles(root);
+    expect(audits).toHaveLength(1);
+    const audit = JSON.parse(fs.readFileSync(path.join(root, audits[0]), "utf8")) as {
+      files: { name: string }[];
+    };
+    // Every entry names this transport's own dated file (a run spanning local
+    // midnight may legitimately list two dates, so the count is not pinned).
+    const names = audit.files.map((file) => path.basename(file.name));
+    expect(names.length).toBeGreaterThan(0);
+    names.forEach((name) => expect(name).toMatch(/^rl-audit-\d{4}-\d{2}-\d{2}\.log$/));
+  });
+
+  it('keeps the shared global file\'s rotation audit file name unchanged (built at "silly")', async () => {
+    // Same retention hazard as the module file: the shared sink has always been
+    // constructed with `level: "silly"`, and that value feeds its audit-file
+    // hash. Its gating lives on each logger's handle, so the constructor option
+    // looks redundant, yet dropping it would orphan every existing install's
+    // `all-logs` audit file.
+    const root = createTempDir();
+    const logger = createLogger({
+      moduleName: "rl-global-audit",
+      logDirectory: root,
+      includeConsole: false,
+      includeFile: false,
+      captureUncaught: false,
+      rotation: { maxSize: "7M", maxFiles: "4D" },
+    });
+    expect(auditFiles(root)).toHaveLength(1);
+
+    const reference = new DailyRotateFile({
+      filename: path.join(fs.realpathSync.native(root), "all-logs-%DATE%.log"),
+      datePattern: "YYYY-MM-DD",
+      maxSize: "7m",
+      maxFiles: "4d",
+      zippedArchive: false,
+      level: "silly",
+    });
+    await new Promise<void>((resolve) => {
+      reference.once("finish", () => resolve());
+      reference.close?.();
+    });
+    await shutdownLogger(logger);
+
+    const audits = auditFiles(root);
+    expect(audits).toHaveLength(1);
+    const audit = JSON.parse(fs.readFileSync(path.join(root, audits[0]), "utf8")) as {
+      files: { name: string }[];
+    };
+    // Every entry names this transport's own dated file (a run spanning local
+    // midnight may legitimately list two dates, so the count is not pinned).
+    const names = audit.files.map((file) => path.basename(file.name));
+    expect(names.length).toBeGreaterThan(0);
+    names.forEach((name) => expect(name).toMatch(/^all-logs-\d{4}-\d{2}-\d{2}\.log$/));
+  });
+
+  it("keeps a pinned console at its level when `logger.level` is LOWERED below it", async () => {
+    const root = createTempDir();
+    const logger = createLogger({
+      moduleName: "rl-pinned-down",
+      logDirectory: root,
+      consoleLevel: "info",
+      captureUncaught: false,
+    });
+
+    const consoleOut = captureConsole(() => {
+      logger.level = "warn";
+      logger.info("RL-PINNED-DOWN-INFO");
+    });
+    await shutdownLogger(logger);
+
+    // The pinned console still admits info...
+    expect(consoleOut).toContain("RL-PINNED-DOWN-INFO");
+    // ...while the files follow the stricter logger level.
+    expect(readLogFiles(root, "rl-pinned-down")).not.toContain("RL-PINNED-DOWN-INFO");
+    expect(readLogFiles(root, "all-logs")).not.toContain("RL-PINNED-DOWN-INFO");
+  });
+
+  it('still records a crash in the module file after `logger.level` is lowered to "warn"', async () => {
+    // Crash records are logged at `error` through the elected primary's
+    // `log()`, so they pass every level the logger can be lowered to within the
+    // hierarchy.
+    const exitFn = jest.fn();
+    __crashCaptureInternals.setExitFn(exitFn);
+    try {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "rl-crash",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+        exitOnUncaught: false,
+      });
+
+      logger.level = "warn";
+      logger.info("RL-CRASH-INFO-SUPPRESSED");
+      __crashCaptureInternals.invokeUncaught(new Error("RL-CRASH-MARKER"));
+      await shutdownLogger(logger);
+
+      const moduleFile = readLogFiles(root, "rl-crash");
+      expect(moduleFile).toContain("uncaughtException: RL-CRASH-MARKER");
+      expect(moduleFile).not.toContain("RL-CRASH-INFO-SUPPRESSED");
+      expect(exitFn).not.toHaveBeenCalled();
+    } finally {
+      __crashCaptureInternals.restoreExitFn();
+    }
+  });
+
+  describe("consoleLevelPinned in the options signature", () => {
+    const quietOptions = (root: string): Parameters<typeof createLogger>[0] => ({
+      moduleName: "rl-signature",
+      logDirectory: root,
+      includeConsole: false,
+      includeFile: false,
+      includeGlobalFile: false,
+      captureUncaught: false,
+    });
+
+    it("warns when a cached key's second call adds a `consoleLevel` equal to `level`", () => {
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger(quietOptions(root));
+      const second = createLogger({ ...quietOptions(root), consoleLevel: "info" });
+
+      expect(second).toBe(first);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const message = String(warnSpy.mock.calls[0][0]);
+      // The resolved `consoleLevel` is "info" on both calls, so the pin is the
+      // ONLY divergence; it must be named on its own.
+      expect(message).toContain("Differing fields: consoleLevelPinned.");
+      teardownLogger(first);
+    });
+
+    it("warns when a cached key's second call removes the `consoleLevel` pin", () => {
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({ ...quietOptions(root), consoleLevel: "info" });
+      const second = createLogger(quietOptions(root));
+
+      expect(second).toBe(first);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain("Differing fields: consoleLevelPinned.");
+      teardownLogger(first);
+    });
+
+    it("does not warn when both calls pin the same `consoleLevel`", () => {
+      const root = createTempDir();
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      const first = createLogger({ ...quietOptions(root), consoleLevel: "warn" });
+      const second = createLogger({ ...quietOptions(root), consoleLevel: "warn" });
+
+      expect(second).toBe(first);
+      expect(warnSpy).not.toHaveBeenCalled();
+      teardownLogger(first);
+    });
+  });
+
+  it('drops even an error line from every built-in transport after `logger.level = "silent"` (a non-empty string outside the hierarchy matches no level)', async () => {
+    // "silent" is not an npm level: winston resolves it to no level value, so
+    // every transport that inherits the logger level rejects every entry.
+    // `logger.silent = true` is the supported way to silence a logger.
+    const root = createTempDir();
+    const logger = createLogger({
+      moduleName: "rl-silent",
+      logDirectory: root,
+      captureUncaught: false,
+    });
+
+    const consoleOut = captureConsole(() => {
+      logger.error("RL-ERROR-BEFORE-SILENT");
+      logger.level = "silent";
+      logger.error("RL-ERROR-WHILE-SILENT");
+    });
+    expect(logger.isLevelEnabled("error")).toBe(false);
+    await shutdownLogger(logger);
+
+    const moduleFile = readLogFiles(root, "rl-silent");
+    const globalFile = readLogFiles(root, "all-logs");
+    expect(consoleOut).toContain("RL-ERROR-BEFORE-SILENT");
+    expect(moduleFile).toContain("RL-ERROR-BEFORE-SILENT");
+    expect(globalFile).toContain("RL-ERROR-BEFORE-SILENT");
+    expect(consoleOut).not.toContain("RL-ERROR-WHILE-SILENT");
+    expect(moduleFile).not.toContain("RL-ERROR-WHILE-SILENT");
+    expect(globalFile).not.toContain("RL-ERROR-WHILE-SILENT");
+  });
+
+  it('drops the crash record too when the elected logger\'s level is "silent"', async () => {
+    // Crash records go through the elected primary's `log()` at `error`, so a
+    // level that matches nothing loses them exactly like any other entry.
+    const exitFn = jest.fn();
+    __crashCaptureInternals.setExitFn(exitFn);
+    try {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "rl-crash-silent",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+        exitOnUncaught: false,
+      });
+
+      logger.error("RL-CRASH-SILENT-BEFORE");
+      logger.level = "silent";
+      __crashCaptureInternals.invokeUncaught(new Error("RL-CRASH-SILENT-MARKER"));
+      await shutdownLogger(logger);
+
+      const moduleFile = readLogFiles(root, "rl-crash-silent");
+      expect(moduleFile).toContain("RL-CRASH-SILENT-BEFORE");
+      expect(moduleFile).not.toContain("RL-CRASH-SILENT-MARKER");
+      expect(exitFn).not.toHaveBeenCalled();
+    } finally {
+      __crashCaptureInternals.restoreExitFn();
+    }
+  });
+
+  it.each([
+    ["an empty string", ""],
+    ["undefined", undefined],
+    ["null", null],
+  ])(
+    "writes EVERY level to every built-in transport when `logger.level` is %s (no level at all)",
+    async (_label, value) => {
+      // The opposite of "silent": `winston-transport` treats a falsy level as
+      // "no level" and accepts everything, while winston's `isLevelEnabled`
+      // finds no numeric value and reports false. Reachable from an unset
+      // environment variable (`logger.level = process.env.LOG_LEVEL`).
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "rl-empty",
+        logDirectory: root,
+        captureUncaught: false,
+      });
+
+      const consoleOut = captureConsole(() => {
+        logger.silly("RL-EMPTY-BEFORE");
+        logger.level = value as unknown as string;
+        logger.silly("RL-EMPTY-SILLY");
+      });
+      expect(logger.isLevelEnabled("error")).toBe(false);
+      expect(logger.isLevelEnabled("silly")).toBe(false);
+      await shutdownLogger(logger);
+
+      const moduleFile = readLogFiles(root, "rl-empty");
+      const globalFile = readLogFiles(root, "all-logs");
+      expect(consoleOut).toContain("RL-EMPTY-SILLY");
+      expect(moduleFile).toContain("RL-EMPTY-SILLY");
+      expect(globalFile).toContain("RL-EMPTY-SILLY");
+      expect(consoleOut).not.toContain("RL-EMPTY-BEFORE");
+      expect(moduleFile).not.toContain("RL-EMPTY-BEFORE");
+      expect(globalFile).not.toContain("RL-EMPTY-BEFORE");
+    },
+  );
 });

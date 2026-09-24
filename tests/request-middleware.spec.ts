@@ -1589,7 +1589,7 @@ describe("createRequestLogger", () => {
     expect(context.token).toBe("REALSECRET");
   });
 
-  it("redacts a toJSON-defining context that carries a BigInt without mutating the caller (judge regression)", () => {
+  it("redacts a toJSON-defining context that carries a BigInt without mutating the caller (regression)", () => {
     // Composite case: a class instance that defines toJSON AND whose serialized
     // form is not JSON-expressible (a BigInt field). redactValue's forceCopy
     // would pass such an instance through BY IDENTITY (toJSON boundary), so the
