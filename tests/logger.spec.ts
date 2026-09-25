@@ -12200,6 +12200,35 @@ describe("nested Error serialization", () => {
       expect(err.cause).toBe(err);
     });
 
+    it("a NON-enumerable self-referencing cause makes pretty mode fall back for the whole block, a sibling Error included", async () => {
+      // The pretty retry re-renders the whole metadata block the pre-fix way,
+      // so every Error in it renders `{}`, not only the self-referencing one.
+      // JSON mode keeps rendering the sibling's fields.
+      const err = selfCausedError("loop");
+      const other = fixedError("card declined");
+
+      const out = await render("nested-ser-selfcause-sibling", format, (logger) =>
+        logger.info("m", { err, other, orderId: 7 }),
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine(
+              "nested-ser-selfcause-sibling",
+              ["m", "{", '  "err": {},', '  "other": {},', '  "orderId": 7', "}"].join("\n"),
+            )
+          : `{"err":{"cause":"[Circular]","message":"loop","name":"Error","stack":${STACK_JSON}},` +
+              `"level":"info","message":"m","module":"nested-ser-selfcause-sibling","orderId":7,` +
+              `"other":{"message":"card declined","name":"Error","stack":${STACK_JSON}},"timestamp":"${STAMP}"}\n`,
+      );
+      expect(out.fileOut).not.toContain("[UNSERIALIZABLE]");
+      expect(out.fileOut).not.toContain("_unserializable");
+      expectConsoleMatchesFile(format, out);
+      expect(err.cause).toBe(err);
+      expect(Object.keys(other)).toEqual([]);
+    });
+
     it("a top-level logged Error omits a cause set through the options bag (winston's errors() copies own enumerable fields)", async () => {
       // The README states this boundary: only an Error nested in metadata is
       // rendered through the shared view. A top-level Error is flattened by
