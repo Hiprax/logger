@@ -4877,3 +4877,44 @@ describe("nested Errors in the request-log context and body", () => {
     });
   });
 });
+
+describe("a child logger as the middleware's logger", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+  });
+
+  it("writes the child's metadata on each entry, the entry winning on a shared key", async () => {
+    const sink = new PassThrough();
+    const chunks: string[] = [];
+    sink.on("data", (chunk: Buffer | string) => chunks.push(String(chunk)));
+    const root = loggerModule.createLogger({
+      moduleName: "child-middleware",
+      format: "json",
+      includeConsole: false,
+      includeFile: false,
+      includeGlobalFile: false,
+      captureUncaught: false,
+      additionalTransports: [new winston.transports.Stream({ stream: sink, eol: "\n" })],
+    });
+    const child = root.child({ service: "billing", http: "child-value" });
+    const middleware = createRequestLogger({ logger: child, includeHttpContext: true });
+
+    const { res } = runMiddleware(middleware, {
+      url: "/report/a%d?q=%s",
+      originalUrl: "/report/a%d?q=%s",
+    });
+    res.emit("finish");
+    // A shutdown through the child drains the root it was derived from.
+    await loggerModule.shutdownLogger(child);
+
+    const lines = chunks.join("").trim().split("\n");
+    expect(lines).toHaveLength(1);
+    const line = JSON.parse(lines[0]) as { service: string; message: string; http: unknown };
+    expect(line.service).toBe("billing");
+    // The single-object form keeps the printf tokens verbatim and the context intact.
+    expect(line.message).toContain("/report/a%d?q=%s");
+    expect(line.http).toEqual(
+      expect.objectContaining({ url: "/report/a%d?q=%s", method: "POST", statusCode: 200 }),
+    );
+  });
+});

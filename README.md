@@ -25,6 +25,7 @@ Fully typed, production-grade logging toolkit for Node.js applications. Built on
   - [Timezone Handling](#timezone-handling)
   - [Custom Transports](#custom-transports)
   - [JSON Output for Log Shippers](#json-output-for-log-shippers)
+  - [Child Loggers](#child-loggers)
   - [Silent / No-op Logger for Libraries & SSR](#silent--no-op-logger-for-libraries--ssr)
   - [Crash Capture](#crash-capture)
 - [Log Output Format](#log-output-format)
@@ -526,6 +527,24 @@ output.elasticsearch:
 - `maskMetaKeys` redaction continues to apply, walking nested objects and arrays before `JSON.stringify`. Secret values are replaced with the literal string `"[REDACTED]"` before the line is serialized.
 
 ---
+
+### Child Loggers
+
+`logger.child(meta)` returns a logger that adds `meta` to every entry it writes. A child is a view over the logger it came from (its root): it owns its default metadata and nothing else, and it keeps the root's logger-level safety net (the unknown-method fallback, the safe `toJSON`, the non-thenable guards); see the winston boundary below for what differs.
+
+```ts
+const logger = createLogger({ moduleName: "api" });
+const requestLog = logger.child({ requestId: "r1" });
+
+requestLog.info("Charging card"); // carries requestId: "r1"
+requestLog.child({ step: "capture" }).info("Captured"); // carries requestId and step
+```
+
+- **Metadata:** a grandchild carries both metadata sets; the nearer one wins on a shared key, and a key in the logged payload wins over both. `maskMetaKeys` applies to child metadata like any other metadata. A child can be passed to `createRequestLogger({ logger })`.
+- **Logger-level safety net:** an unknown method (`child.success("ok")`) warns once and logs at `info` with the child's metadata (one warning per method name for the root and all its children); `JSON.stringify(child)` returns the root's safe summary, never the child's metadata; a child is not thenable.
+- **Shared transports and lifetime:** `shutdownLogger(child)`, `child.close()` and `child.end()` act on the root. `shutdownLogger(child)` and `shutdownLogger(root)` return the same promise, and both `close()` and `end()` drop the root from the cache so the next `createLogger()` builds a fresh logger; `close()` also leaves crash capture and releases the shared global file. `child.end(entry)` writes `entry` with the child's metadata before ending the root. `child.add()`, `remove()`, `clear()`, `configure()`, `pipe()` and `unpipe()` change the root's transports, exactly as calling them on the root does. `close()`, `end()`, `add()`, `remove()`, `clear()` and `unpipe()` return the logger they were called on. A child of a logger that was shut down stays shut down; derive children again from the new logger.
+- **Levels:** output is gated by the root's level. `child.level = "debug"` sets a property on the child only: it changes nothing that is written (it only changes that child's `isLevelEnabled()` answers). Change the level on the root.
+- **winston's child boundary:** winston merges the child metadata by copying each entry (`Object.assign({}, meta, entry)`) before any of this package's formats run. So, only through a child: a getter on the logged object that throws is thrown out of the log call instead of degrading the line; a class instance is logged as a plain copy, so its own `toJSON()` is not used and every enumerable field is written (log a plain object, or add the field to `maskMetaKeys`); an array payload is written as an object keyed by index; and a logged `Error` always carries a `cause` key, so in pretty format an `Error` without a `cause` gets an empty `{}` metadata line.
 
 ### Silent / No-op Logger for Libraries & SSR
 

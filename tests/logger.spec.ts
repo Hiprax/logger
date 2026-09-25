@@ -13141,3 +13141,662 @@ describe("module and global files on the same path", () => {
     });
   });
 });
+
+describe("child loggers", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const FIXED_ISO = "2031-03-04T05:06:07Z";
+  const FIXED_TS = "2031-03-04 05:06:07";
+  const fixedClock = (): Date => new Date(FIXED_ISO);
+
+  /** A logger whose only transport is a formatless Stream sink, plus the sink's text. */
+  const sinkLogger = (
+    format: "pretty" | "json",
+    extra: Partial<LoggerOptions> = {},
+  ): { logger: winston.Logger; output: () => string } => {
+    const chunks: string[] = [];
+    const stream = new PassThrough();
+    stream.on("data", (chunk) => chunks.push(String(chunk)));
+    const logger = createLogger({
+      moduleName: `child-${format}`,
+      includeConsole: false,
+      includeFile: false,
+      includeGlobalFile: false,
+      captureUncaught: false,
+      clock: fixedClock,
+      format,
+      additionalTransports: [new winston.transports.Stream({ stream })],
+      ...extra,
+    });
+    return { logger, output: () => chunks.join("") };
+  };
+
+  const jsonLines = (text: string): Record<string, unknown>[] =>
+    text
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+  const occurrences = (text: string, marker: string): number => text.split(marker).length - 1;
+
+  /** Options for a file-backed root logger in `root`. */
+  const fileOptions = (root: string, moduleName: string): LoggerOptions => ({
+    moduleName,
+    logDirectory: root,
+    includeConsole: false,
+    captureUncaught: true,
+    exitOnUncaught: false,
+  });
+
+  describe("logging through a child", () => {
+    it("writes the child's metadata on every line (json, exact line)", () => {
+      const { logger, output } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+
+      child.info("CHILD-JSON");
+      logger.info("ROOT-JSON");
+
+      expect(output().split("\n")[0]).toBe(
+        `{"level":"info","message":"CHILD-JSON","module":"child-json","requestId":"r1","timestamp":"${FIXED_TS}"}`,
+      );
+      // The root logger is not affected by its child's metadata.
+      expect(jsonLines(output())[1]).not.toHaveProperty("requestId");
+      teardownLogger(logger);
+    });
+
+    it("writes the child's metadata on every line (pretty, exact block)", () => {
+      const { logger, output } = sinkLogger("pretty");
+      const child = logger.child({ requestId: "r1" });
+
+      child.info("CHILD-PRETTY");
+
+      expect(output()).toBe(
+        `UTC: ${FIXED_TS}\n[INFO] (child-pretty)\nCHILD-PRETTY\n{\n  "requestId": "r1"\n}\n\n`,
+      );
+      teardownLogger(logger);
+    });
+
+    it.each([["pretty"], ["json"]] as const)(
+      "applies maskMetaKeys to the child's metadata (%s)",
+      (format) => {
+        const { logger, output } = sinkLogger(format, { maskMetaKeys: ["token"] });
+        const meta = { token: "CHILD-SECRET", requestId: "r1" };
+        const child = logger.child(meta);
+
+        child.info("masked");
+
+        expect(output()).not.toContain("CHILD-SECRET");
+        expect(output()).toContain("[REDACTED]");
+        expect(output()).toContain("r1");
+        // The caller's metadata object is left alone.
+        expect(meta).toEqual({ token: "CHILD-SECRET", requestId: "r1" });
+        teardownLogger(logger);
+      },
+    );
+
+    it("routes an unknown method to the child's info, keeping its metadata, and warns once", () => {
+      const { logger, output } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+
+      expect(() => (child as any).success("FALLBACK-1")).not.toThrow();
+      (child as any).success("FALLBACK-2");
+
+      const lines = jsonLines(output());
+      const logged = lines.filter((line) => String(line.message).startsWith("FALLBACK-"));
+      expect(logged).toEqual([
+        expect.objectContaining({ level: "info", message: "FALLBACK-1", requestId: "r1" }),
+        expect.objectContaining({ level: "info", message: "FALLBACK-2", requestId: "r1" }),
+      ]);
+      const warnings = lines.filter((line) =>
+        String(line.message).includes('Unknown logger method "success"'),
+      );
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatchObject({ level: "warn" });
+      teardownLogger(logger);
+    });
+
+    it("shares the root logger's one warning per unknown method name", () => {
+      const { logger, output } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+
+      (logger as any).notice("FROM-ROOT");
+      (child as any).notice("FROM-CHILD");
+
+      expect(occurrences(output(), 'Unknown logger method \\"notice\\"')).toBe(1);
+      expect(jsonLines(output()).filter((line) => line.level === "info")).toHaveLength(2);
+      teardownLogger(logger);
+    });
+
+    it("gives a grandchild both metadata sets, the nearer one winning, and the fallback", () => {
+      const { logger, output } = sinkLogger("json");
+      const grandchild = logger
+        .child({ outer: 1, shared: "outer" })
+        .child({ inner: 2, shared: "inner" });
+
+      grandchild.info("NESTED");
+      (grandchild as any).audit("NESTED-FALLBACK");
+
+      const lines = jsonLines(output()).filter((line) => String(line.message).startsWith("NESTED"));
+      expect(lines).toEqual([
+        expect.objectContaining({ message: "NESTED", outer: 1, inner: 2, shared: "inner" }),
+        expect.objectContaining({
+          message: "NESTED-FALLBACK",
+          outer: 1,
+          inner: 2,
+          shared: "inner",
+        }),
+      ]);
+      teardownLogger(logger);
+    });
+
+    it("keeps winston's own child write reachable through the child (it adds the metadata)", () => {
+      const { logger, output } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+
+      expect(typeof child.write).toBe("function");
+      child.write({ level: "info", message: "RAW-WRITE" } as any);
+
+      expect(jsonLines(output())).toEqual([
+        expect.objectContaining({ message: "RAW-WRITE", requestId: "r1" }),
+      ]);
+      teardownLogger(logger);
+    });
+
+    it("keeps output gated by the root's level: a child level write changes nothing", () => {
+      const { logger, output } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+
+      child.level = "debug";
+      child.debug("CHILD-DEBUG");
+      child.info("CHILD-INFO");
+
+      expect(logger.level).toBe("info");
+      expect(output()).not.toContain("CHILD-DEBUG");
+      expect(output()).toContain("CHILD-INFO");
+      teardownLogger(logger);
+    });
+  });
+
+  describe("the child's safety surface", () => {
+    it("serializes to the root's safe summary", () => {
+      const { logger } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+
+      expect(JSON.parse(JSON.stringify(child))).toEqual({
+        type: "@hiprax/logger",
+        moduleName: "child-json",
+        label: "child-json",
+        level: "info",
+        transports: 1,
+      });
+      expect(JSON.stringify(child)).toBe(JSON.stringify(logger));
+      teardownLogger(logger);
+    });
+
+    it("is not thenable: awaiting a child resolves to the child itself", async () => {
+      const { logger } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+
+      await expect(Promise.resolve(child)).resolves.toBe(child);
+      expect((child as any).then).toBeUndefined();
+      expect((child as any).catch).toBeUndefined();
+      expect("then" in child).toBe(false);
+      expect((child as any)[Symbol.toPrimitive]).toBeUndefined();
+      expect((child as any)["not a method"]).toBeUndefined();
+      teardownLogger(logger);
+    });
+  });
+
+  describe("teardown through a child acts on the root logger", () => {
+    it("shutdownLogger(child) shuts the root down, evicts it, and shares its promise", async () => {
+      const root = createTempDir();
+      const parent = createLogger(fileOptions(root, "parent"));
+      const child = parent.child({ requestId: "r1" });
+      expect(__crashCaptureInternals.registered.size).toBe(1);
+
+      const childShutdown = shutdownLogger(child);
+      expect(shutdownLogger(parent)).toBe(childShutdown);
+      await childShutdown;
+
+      expect(__crashCaptureInternals.registered.size).toBe(0);
+      const next = createLogger(fileOptions(root, "parent"));
+      expect(next).not.toBe(parent);
+      expect(next.transports.length).toBeGreaterThan(0);
+
+      next.info("AFTER-CHILD-SHUTDOWN");
+      await shutdownLogger(next);
+      const written = fs
+        .readdirSync(root)
+        .filter((name) => name.startsWith("parent-") && name.endsWith(".log"))
+        .map((name) => fs.readFileSync(path.join(root, name), "utf8"))
+        .join("");
+      expect(written).toContain("AFTER-CHILD-SHUTDOWN");
+    });
+
+    it("shutdownLogger(parent) then shutdownLogger(child) returns the settled promise", async () => {
+      const root = createTempDir();
+      const parent = createLogger(fileOptions(root, "parent-first"));
+      const child = parent.child({ requestId: "r1" });
+
+      const parentShutdown = shutdownLogger(parent);
+      await parentShutdown;
+
+      expect(shutdownLogger(child)).toBe(parentShutdown);
+    });
+
+    it("child.close() deregisters the root, evicts it, and releases the shared global file", () => {
+      const root = createTempDir();
+      const parent = createLogger(fileOptions(root, "closing"));
+      const child = parent.child({ requestId: "r1" });
+      expect(__crashCaptureInternals.registered.size).toBe(1);
+      expect(__sharedFileInternals.sharedFileRegistry.size).toBe(1);
+
+      child.close();
+
+      expect(__crashCaptureInternals.registered.size).toBe(0);
+      expect(__sharedFileInternals.sharedFileRegistry.size).toBe(0);
+      expect(parent.transports).toHaveLength(0);
+      const next = createLogger(fileOptions(root, "closing"));
+      expect(next).not.toBe(parent);
+      teardownLogger(next);
+    });
+
+    it("child.close() keeps the shared global file open for another logger", () => {
+      const root = createTempDir();
+      const parent = createLogger(fileOptions(root, "closing-a"));
+      const other = createLogger(fileOptions(root, "closing-b"));
+      const child = parent.child({ requestId: "r1" });
+
+      child.close();
+
+      const entries = Array.from(__sharedFileInternals.sharedFileRegistry.values());
+      expect(entries).toHaveLength(1);
+      expect(entries[0].refCount).toBe(1);
+      expect(__crashCaptureInternals.registered.size).toBe(1);
+      expect(createLogger(fileOptions(root, "closing-b"))).toBe(other);
+      teardownLogger(other);
+    });
+
+    it("child.end() ends the root logger and evicts it", async () => {
+      const root = createTempDir();
+      const parent = createLogger(fileOptions(root, "ending"));
+      const child = parent.child({ requestId: "r1" });
+      const finished = new Promise((resolve) => parent.once("finish", resolve));
+
+      child.end();
+      await finished;
+
+      const next = createLogger(fileOptions(root, "ending"));
+      expect(next).not.toBe(parent);
+      teardownLogger(next);
+      expect(parent.transports).toHaveLength(0);
+    });
+
+    it("child.end(entry) writes the entry with the child's metadata, then ends the root", async () => {
+      const { logger, output } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+      const ended = jest.fn();
+      const finished = new Promise((resolve) => logger.once("finish", resolve));
+
+      child.end({ level: "info", message: "LAST-ENTRY" } as any, ended);
+      await finished;
+
+      expect(jsonLines(output())).toEqual([
+        expect.objectContaining({ level: "info", message: "LAST-ENTRY", requestId: "r1" }),
+      ]);
+      expect(ended).toHaveBeenCalledTimes(1);
+      expect(logger.transports).toHaveLength(0);
+    });
+
+    it("child.end(entry, encoding, callback) writes the entry and still calls back", async () => {
+      const { logger, output } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+
+      await new Promise<void>((resolve) => {
+        child.end({ level: "info", message: "WITH-ENCODING" } as any, "utf8", () => resolve());
+      });
+
+      expect(jsonLines(output())).toEqual([
+        expect.objectContaining({ message: "WITH-ENCODING", requestId: "r1" }),
+      ]);
+    });
+
+    it("child.end(entry) whose entry throws while being copied leaves the root cached and open", () => {
+      const root = createTempDir();
+      const parent = createLogger(fileOptions(root, "end-throws"));
+      const child = parent.child({ requestId: "r1" });
+      const hostile = {
+        level: "info",
+        message: "hostile",
+        get broken(): string {
+          throw new Error("getter failed");
+        },
+      };
+
+      expect(() => child.end(hostile as any)).toThrow("getter failed");
+
+      expect(createLogger(fileOptions(root, "end-throws"))).toBe(parent);
+      expect(parent.transports.length).toBeGreaterThan(0);
+      expect(__crashCaptureInternals.registered.size).toBe(1);
+      teardownLogger(parent);
+    });
+
+    it("child.end(callback) ends the root and calls back without writing an entry", async () => {
+      const { logger, output } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+
+      await new Promise<void>((resolve) => {
+        child.end(() => resolve());
+      });
+
+      expect(output()).toBe("");
+      expect(logger.transports).toHaveLength(0);
+    });
+
+    it("a timed-out shutdown through a child can be retried through the root", async () => {
+      class StalledTransport extends Transport {
+        public name = "stalled-child";
+        public log = jest.fn((_info: unknown, callback?: () => void) => callback?.());
+        public _final = (_callback: (err?: Error | null) => void): void => {
+          // Never calls back, so the first shutdown times out.
+        };
+      }
+      const stalled = new StalledTransport();
+      const parent = createLogger({
+        moduleName: "child-timeout",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        captureUncaught: false,
+        additionalTransports: [stalled as unknown as winston.transport],
+      });
+      const child = parent.child({ requestId: "r1" });
+
+      const first = shutdownLogger(child, { timeoutMs: 20 });
+      await expect(first).rejects.toThrow(/shutdownLogger timed out after 20ms/);
+
+      const retry = shutdownLogger(parent, { timeoutMs: 2000 });
+      expect(retry).not.toBe(first);
+      stalled.emit("finish");
+      await expect(retry).resolves.toBeUndefined();
+    });
+
+    it("close() and end() return the logger they were called on", () => {
+      const { logger } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+      const other = sinkLogger("json", { moduleName: "child-json-other" }).logger;
+      const otherChild = other.child({ requestId: "r2" });
+
+      expect(child.close()).toBe(child);
+      expect(otherChild.end()).toBe(otherChild);
+      const root = sinkLogger("json", { moduleName: "child-json-root" }).logger;
+      const extra = new winston.transports.Stream({ stream: new PassThrough() });
+      expect(root.add(extra)).toBe(root);
+      expect(root.remove(extra)).toBe(root);
+      expect(root.close()).toBe(root);
+      const ended = sinkLogger("json", { moduleName: "child-json-ended" }).logger;
+      expect(ended.end()).toBe(ended);
+    });
+
+    it("child.end() evicts the root but leaves it registered for crash capture", () => {
+      const root = createTempDir();
+      const parent = createLogger(fileOptions(root, "ending-crash"));
+      const child = parent.child({ requestId: "r1" });
+
+      child.end();
+
+      expect(__crashCaptureInternals.registered.size).toBe(1);
+      const next = createLogger(fileOptions(root, "ending-crash"));
+      expect(next).not.toBe(parent);
+      teardownLogger(next);
+      teardownLogger(parent);
+    });
+
+    it("a grandchild's close() acts on the root logger", () => {
+      const root = createTempDir();
+      const parent = createLogger(fileOptions(root, "grand-closing"));
+      const grandchild = parent.child({ a: 1 }).child({ b: 2 });
+
+      expect(grandchild.close()).toBe(grandchild);
+
+      expect(__crashCaptureInternals.registered.size).toBe(0);
+      expect(__sharedFileInternals.sharedFileRegistry.size).toBe(0);
+      const next = createLogger(fileOptions(root, "grand-closing"));
+      expect(next).not.toBe(parent);
+      teardownLogger(next);
+    });
+
+    it("a grandchild's shutdown is its root's shutdown", async () => {
+      const root = createTempDir();
+      const parent = createLogger(fileOptions(root, "grand-shutdown"));
+      const grandchild = parent.child({ a: 1 }).child({ b: 2 });
+
+      const grandchildShutdown = shutdownLogger(grandchild);
+
+      expect(shutdownLogger(parent)).toBe(grandchildShutdown);
+      await grandchildShutdown;
+      expect(__crashCaptureInternals.registered.size).toBe(0);
+      const next = createLogger(fileOptions(root, "grand-shutdown"));
+      expect(next).not.toBe(parent);
+      teardownLogger(next);
+    });
+
+    it("a child of a logger that was already shut down returns the settled shutdown", async () => {
+      const root = createTempDir();
+      const parent = createLogger(fileOptions(root, "late-child"));
+      const parentShutdown = shutdownLogger(parent);
+      await parentShutdown;
+
+      const late = parent.child({ requestId: "r1" });
+
+      expect(shutdownLogger(late)).toBe(parentShutdown);
+    });
+
+    it("a detached child's shutdown leaves the replacement logger cached", async () => {
+      const root = createTempDir();
+      const detached = createLogger(fileOptions(root, "replaced"));
+      const child = detached.child({ requestId: "r1" });
+      resetLoggerRegistry();
+      const replacement = createLogger(fileOptions(root, "replaced"));
+
+      await shutdownLogger(child);
+
+      expect(createLogger(fileOptions(root, "replaced"))).toBe(replacement);
+      await shutdownLogger(replacement);
+    });
+  });
+
+  describe("transport changes through a child act on the root logger", () => {
+    /** A transport that records its lines and counts `close()` calls. */
+    const recordingTransport = () => {
+      const lines: Record<string, unknown>[] = [];
+      let closed = 0;
+      const transport = new Transport({
+        log(info: Record<string, unknown>, callback: () => void) {
+          lines.push(info);
+          callback();
+        },
+        close() {
+          closed += 1;
+        },
+      }) as unknown as winston.transport;
+      return { transport, lines, closed: () => closed };
+    };
+
+    const globalOnly = (root: string, moduleName: string): LoggerOptions => ({
+      moduleName,
+      logDirectory: root,
+      includeConsole: false,
+      includeFile: false,
+      captureUncaught: false,
+    });
+
+    it.each([
+      [
+        "remove(handle)",
+        (child: winston.Logger, handle: winston.transport) => child.remove(handle),
+      ],
+      ["clear()", (child: winston.Logger) => child.clear()],
+      [
+        "unpipe(handle)",
+        (child: winston.Logger, handle: winston.transport) => child.unpipe(handle),
+      ],
+    ] as const)(
+      "child.%s releases the shared global file without evicting the root",
+      (_title, detach) => {
+        const root = createTempDir();
+        const parent = createLogger(globalOnly(root, "detaching"));
+        const child = parent.child({ requestId: "r1" });
+        const [handle] = parent.transports;
+        expect(__sharedFileInternals.sharedFileRegistry.size).toBe(1);
+
+        // The call returns the logger it was made on, not the raw root.
+        expect(detach(child, handle)).toBe(child);
+
+        expect(parent.transports).toHaveLength(0);
+        expect(__sharedFileInternals.sharedFileRegistry.size).toBe(0);
+        // Detaching a transport is not a teardown: the root stays cached.
+        expect(createLogger(globalOnly(root, "detaching"))).toBe(parent);
+        teardownLogger(parent);
+      },
+    );
+
+    it("child.add() gives the root the transport: the root's close() closes it", () => {
+      const { logger } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+      const added = recordingTransport();
+
+      expect(child.add(added.transport)).toBe(child);
+      // The transport's source is the root base (the child's prototype), not the child.
+      expect((added.transport as unknown as { parent: unknown }).parent).toBe(
+        Object.getPrototypeOf(child),
+      );
+      logger.close();
+
+      expect(added.closed()).toBe(1);
+    });
+
+    it("child.add() keeps the chain on the child and the transport gated by the root's level", () => {
+      const { logger } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+      const added = recordingTransport();
+
+      child.level = "silly";
+      child.add(added.transport).info("ADDED-INFO");
+      child.debug("ADDED-DEBUG");
+
+      expect(added.lines).toEqual([
+        expect.objectContaining({ message: "ADDED-INFO", requestId: "r1" }),
+      ]);
+      teardownLogger(logger);
+    });
+
+    it("child.pipe() pipes into the root: the root's close() closes the transport", () => {
+      const { logger } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+      const piped = recordingTransport();
+
+      expect(child.pipe(piped.transport as unknown as NodeJS.WritableStream)).toBe(piped.transport);
+      child.info("PIPED");
+      logger.close();
+
+      expect(piped.lines).toEqual([expect.objectContaining({ message: "PIPED", requestId: "r1" })]);
+      expect(piped.closed()).toBe(1);
+    });
+
+    it("child.configure() reconfigures the root and releases its old transports", () => {
+      const root = createTempDir();
+      const parent = createLogger(globalOnly(root, "configuring"));
+      const child = parent.child({ requestId: "r1" });
+      const replacement = recordingTransport();
+
+      child.configure({ level: "debug", transports: [replacement.transport] });
+      child.debug("CONFIGURED");
+
+      expect(parent.level).toBe("debug");
+      expect(Object.prototype.hasOwnProperty.call(child, "level")).toBe(false);
+      expect(__sharedFileInternals.sharedFileRegistry.size).toBe(0);
+      expect(replacement.lines).toEqual([
+        expect.objectContaining({ message: "CONFIGURED", requestId: "r1" }),
+      ]);
+      parent.close();
+      expect(replacement.closed()).toBe(1);
+    });
+  });
+
+  describe("winston's child write runs before this package's formats (documented boundary)", () => {
+    it("reports the child's own level from isLevelEnabled while output follows the root", () => {
+      const { logger } = sinkLogger("json");
+      const child = logger.child({ requestId: "r1" });
+
+      child.level = "debug";
+
+      expect(child.isLevelEnabled("debug")).toBe(true);
+      expect(logger.isLevelEnabled("debug")).toBe(false);
+      teardownLogger(logger);
+    });
+
+    it("a throwing getter on the payload throws out of the child's log call", () => {
+      const { logger, output } = sinkLogger("json");
+      const payload = {
+        message: "getter",
+        get broken(): string {
+          throw new Error("getter failed");
+        },
+      };
+
+      expect(() => logger.info(payload)).not.toThrow();
+      expect(() => logger.child({ requestId: "r1" }).info(payload)).toThrow("getter failed");
+      expect(jsonLines(output())).toHaveLength(1);
+      teardownLogger(logger);
+    });
+
+    it("a class-instance payload is cloned into a plain object, so its toJSON is not used", () => {
+      const { logger, output } = sinkLogger("json");
+      class Dto {
+        public message = "dto";
+        public ssn = "WITHHELD";
+        public toJSON(): Record<string, unknown> {
+          return { message: this.message };
+        }
+      }
+
+      logger.info(new Dto());
+      logger.child({ requestId: "r1" }).info(new Dto());
+
+      const [rootLine, childLine] = output().split("\n");
+      expect(rootLine).toBe('{"message":"dto"}');
+      expect(childLine).toContain('"ssn":"WITHHELD"');
+      teardownLogger(logger);
+    });
+
+    it("an array payload is written as an object keyed by index", () => {
+      const { logger, output } = sinkLogger("json");
+
+      logger.log("info", ["a", "b"] as any);
+      logger.child({}).log("info", ["a", "b"] as any);
+
+      expect(output().split("\n").slice(0, 2)).toEqual([
+        '["a","b"]',
+        `{"0":"a","1":"b","level":"info","module":"child-json","timestamp":"${FIXED_TS}"}`,
+      ]);
+      teardownLogger(logger);
+    });
+
+    it("an Error payload gains a cause key (pretty: an empty metadata block)", () => {
+      const { logger, output } = sinkLogger("pretty");
+      const err = new Error("boom");
+      err.stack = "Error: boom\n    at fixed";
+
+      logger.child({}).error(err);
+
+      expect(output()).toBe(
+        `UTC: ${FIXED_TS}\n[ERROR] (child-pretty)\nboom\nError: boom\n    at fixed\n{}\n\n`,
+      );
+      teardownLogger(logger);
+    });
+  });
+});

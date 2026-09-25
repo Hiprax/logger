@@ -318,6 +318,56 @@ const proxyToBaseLogger = new WeakMap<winston.Logger, winston.Logger>();
 const proxyToRegistryKey = new WeakMap<winston.Logger, string>();
 
 /**
+ * Maps every child logger Proxy (`logger.child(meta)`, grandchildren included)
+ * straight to the ROOT logger Proxy it descends from. A child is a view over
+ * its root: it owns its default metadata and nothing else, so every piece of
+ * teardown bookkeeping (`shutdownPromises`, the registry slot, crash capture,
+ * the shared global-file handle) belongs to the root. {@link shutdownLogger}
+ * resolves its argument through this map first, which is why children need no
+ * entry in `proxyToBaseLogger` / `proxyToRegistryKey`: every lookup after the
+ * resolution is a root lookup. Children are never cached in the registry, and
+ * `resetLoggerRegistry()` does not touch this map, so a detached root's
+ * children keep resolving to that root.
+ */
+const childToRootProxy = new WeakMap<winston.Logger, winston.Logger>();
+
+/** The root logger Proxy of a child logger Proxy; any other logger unchanged. */
+const resolveRootLogger = (logger: winston.Logger): winston.Logger =>
+  childToRootProxy.get(logger) ?? logger;
+
+/**
+ * Methods the logger Proxy always runs on the ROOT base logger, with the root
+ * base as `this`, whether they are called on the root or on a child.
+ *
+ * They all change which transports are piped into the logger, and that
+ * bookkeeping depends on `this`: `add()` / `pipe()` pipe with `this` as the
+ * source, and each transport records its source as `parent`
+ * (`winston-transport/modern.js`, `once('pipe')`), while `close()` / `clear()`
+ * / `remove()` / `unpipe()` emit `'unpipe'` with `this` as the source, and a
+ * transport closes (the shared global-file handle: releases its refcount) only
+ * when that source is its `parent`. A winston child is
+ * `Object.create(base, { write })`, so with the child as `this` a transport
+ * added through it gets the child as `parent` (the root's `close()` then never
+ * closes it, and it follows the child's own `level`), and a transport removed
+ * through it is detached from the root's shared pipe state without being
+ * closed, where no later teardown can reach it. `configure()` runs `clear()` and
+ * `add()` internally and would otherwise write `level` / `format` / crash
+ * handlers as own properties of the child, where nothing reads them. `end()`
+ * ends the root's stream either way; it is routed so the root's `Logger._final`
+ * and `finish` run with the root as `this`.
+ */
+const ROOT_ROUTED_METHODS: ReadonlySet<string> = new Set([
+  "add",
+  "remove",
+  "clear",
+  "configure",
+  "pipe",
+  "unpipe",
+  "close",
+  "end",
+]);
+
+/**
  * Drops a logger's `loggerRegistry` slot the moment it becomes unfit to be
  * handed out again, so the next `createLogger()` for the same `moduleName` +
  * `logDirectory` builds a fresh instance with live transports.
@@ -346,7 +396,9 @@ const proxyToRegistryKey = new WeakMap<winston.Logger, string>();
  *
  * A logger with no `WeakMap` entry (a `createNoopLogger()` result, or any
  * winston logger the caller built themselves and passed to `shutdownLogger`)
- * was never registered, so there is nothing to evict.
+ * was never registered, so there is nothing to evict. Callers pass a ROOT
+ * logger Proxy: the Proxy traps pass their root, and `shutdownLogger` resolves
+ * a child to its root ({@link resolveRootLogger}) before it gets here.
  *
  * Deliberately side-effect free beyond the `Map` delete: it runs inside the
  * `close`/`end` proxy traps and on `shutdownLogger`'s synchronous path, where a
@@ -2963,18 +3015,28 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     return String(value ?? "");
   };
 
-  const invokeInfoFallback = (args: unknown[]) => {
+  // Routes an unknown-method call to `info()` on the logger it was made on: the
+  // root base, or a winston child object, whose `write` adds the child's
+  // metadata. Each method runs with `target` as `this` (`Reflect.apply`, never
+  // a detached reference): winston's level methods fall back to the ROOT when
+  // `this` is `undefined` (`const self = this || logger`), which would drop a
+  // child's metadata without any error.
+  const invokeInfoFallback = (target: winston.Logger, args: unknown[]) => {
     const infoArgs = ensureLogArgs(args);
-    if (typeof baseLogger.info === "function") {
-      return (baseLogger.info as (...inner: any[]) => winston.Logger)(...infoArgs);
+    if (typeof target.info === "function") {
+      return Reflect.apply(target.info, target, infoArgs) as winston.Logger;
     }
-    if (typeof baseLogger.log === "function") {
+    if (typeof target.log === "function") {
       const [message, ...rest] = infoArgs;
       const normalizedMessage = toMessageString(message);
       if (rest.length > 0) {
-        return (baseLogger.log as winston.LeveledLogMethod)("info", normalizedMessage, ...rest);
+        return Reflect.apply(target.log, target, [
+          "info",
+          normalizedMessage,
+          ...rest,
+        ]) as winston.Logger;
       }
-      return baseLogger.log({
+      return target.log({
         level: "info",
         message: normalizedMessage,
       });
@@ -2994,15 +3056,33 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     transports: baseLogger.transports.length,
   });
 
-  const proxied = new Proxy(baseLogger, {
+  // ONE Proxy handler serves the root logger and every child logger built from
+  // it (`wrapLogger` below): the traps receive the wrapped object as `target`
+  // (the root base, or a winston child object whose `write` adds the child's
+  // metadata), so a child keeps the whole safety surface (safe `toJSON`, the
+  // symbol / deny-list guards, the unknown-method fallback) without a second
+  // copy of the trap body. Only the root's own state is shared through this
+  // closure: `baseLogger`, the root Proxy `proxied`, the summary, and the
+  // warned-method set.
+  const loggerProxyHandler: ProxyHandler<winston.Logger> = {
     get(target, prop, receiver) {
       // 1. Provide a safe `toJSON` so `JSON.stringify(logger)` cannot throw on
-      //    the circular stream internals of the underlying winston logger.
+      //    the circular stream internals of the underlying winston logger. A
+      //    child serializes to its root's summary, never to its metadata.
       if (prop === "toJSON") {
         return proxyToJSON;
       }
 
-      // 2. `close()` must also leave crash capture. Winston's own
+      // 2. Transport-topology and lifecycle methods run on the ROOT base with
+      //    the root base as `this`, from the root and from every child (see
+      //    `ROOT_ROUTED_METHODS` for why `this` decides whether a transport is
+      //    closed and whether the shared global-file handle is released). A
+      //    result that is the root base itself (`close()`, `end()`, `add()`,
+      //    `remove()`, `clear()` and `unpipe()` return `this`) is replaced by the
+      //    Proxy the call was made on, so a chain such as `child.add(t).info(x)`
+      //    stays on that logger, child metadata and safety net included.
+      //
+      //    `close()` must also leave crash capture. Winston's own
       //    `Logger.close()` calls `exceptions.unhandle()` / `rejections.unhandle()`,
       //    so before v1.0.0 closing a logger inherently stopped it from
       //    capturing crashes. Now that capture is coordinated here rather than
@@ -3020,70 +3100,121 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
       //    key. `close()` is a documented teardown path (`resetLoggerRegistry`'s
       //    own JSDoc treats it as co-equal to `shutdownLogger()` for releasing
       //    a shared-file handle), so it needs the same eviction.
-      if (prop === "close") {
+      //
+      //    `end()` is the third door to the same dead-logger-in-the-cache
+      //    state: it is terminal for the underlying stream, and winston's
+      //    `Logger._final` ends every transport, each of which Node then
+      //    auto-unpipes — leaving `transports` empty exactly as `close()`
+      //    does. A caller draining a logger by hand (rather than through
+      //    `shutdownLogger`) must not poison this cache key either. Eviction
+      //    is idempotent, so `shutdownLogger`'s own `end()` passing through
+      //    here costs nothing. Crash-capture deregistration is deliberately
+      //    NOT duplicated on `end()`: `close()` inherits it from winston's own
+      //    `unhandle()` semantics and `shutdownLogger` does it explicitly,
+      //    whereas a bare `end()` never carried it before and changing that
+      //    would alter crash-capture election beyond this cache fix.
+      //
+      //    The other routed methods neither evict nor deregister: a logger
+      //    emptied by `clear()` or `configure()` is commonly refilled with
+      //    `add()`, and evicting it would let the next `createLogger()` open a
+      //    second rotator on the same file while this one still writes.
+      if (typeof prop === "string" && ROOT_ROUTED_METHODS.has(prop)) {
         return (...args: unknown[]): unknown => {
-          deregisterCrashCapture(target);
-          evictRegistryEntry(proxied);
-          return (target.close as (...inner: unknown[]) => unknown).apply(target, args);
+          let routedArgs = args;
+          // `end(entry, cb)` writes its entry with `this` as the writer before
+          // ending. Through a child, that must be the child's own `write`, which
+          // adds the child's metadata; the root then ends with the callback only.
+          // It runs BEFORE the bookkeeping below: winston's child `write` copies
+          // the entry with `Object.assign`, which can throw (a throwing getter),
+          // and a root evicted from the cache but never ended would let the next
+          // `createLogger()` open a second rotator on its still-open files.
+          const entry = args[0];
+          if (
+            prop === "end" &&
+            target !== baseLogger &&
+            entry != null &&
+            typeof entry !== "function"
+          ) {
+            target.write(entry);
+            routedArgs = args.filter((arg) => typeof arg === "function");
+          }
+          if (prop === "close") {
+            deregisterCrashCapture(baseLogger);
+          }
+          if (prop === "close" || prop === "end") {
+            evictRegistryEntry(proxied);
+          }
+          const method = (
+            baseLogger as unknown as Record<string, (...inner: unknown[]) => unknown>
+          )[prop];
+          const result = Reflect.apply(method, baseLogger, routedArgs);
+          return result === baseLogger ? receiver : result;
         };
       }
 
-      // 2b. `end()` is the third door to the same dead-logger-in-the-cache
-      //     state: it is terminal for the underlying stream, and winston's
-      //     `Logger._final` ends every transport, each of which Node then
-      //     auto-unpipes — leaving `transports` empty exactly as `close()`
-      //     does. A caller draining a logger by hand (rather than through
-      //     `shutdownLogger`) must not poison this cache key either. Eviction
-      //     is idempotent, so `shutdownLogger`'s own `end()` passing through
-      //     here costs nothing. Crash-capture deregistration is deliberately
-      //     NOT duplicated here: `close()` inherits it from winston's own
-      //     `unhandle()` semantics and `shutdownLogger` does it explicitly,
-      //     whereas a bare `end()` never carried it before and changing that
-      //     would alter crash-capture election beyond this cache fix.
-      if (prop === "end") {
-        return (...args: unknown[]): unknown => {
-          evictRegistryEntry(proxied);
-          return (target.end as (...inner: unknown[]) => unknown).apply(target, args);
+      // 3. `child()` returns a child logger wrapped by this same handler, so it
+      //    keeps the fallback, the safe `toJSON` and the guards, and can mint
+      //    its own children. Winston's `child()` runs on `target`, so a
+      //    grandchild's `write` merges its own metadata over its parent's. Every
+      //    child maps straight to the root Proxy, which `shutdownLogger`
+      //    resolves first.
+      if (prop === "child") {
+        return (...args: unknown[]): winston.Logger => {
+          const childLogger = Reflect.apply(target.child, target, args) as winston.Logger;
+          const childProxy = wrapLogger(childLogger);
+          childToRootProxy.set(childProxy, proxied);
+          return childProxy;
         };
       }
 
-      // 3. Pass-through to base logger for any prop that already exists on the
-      //    underlying winston logger (own or inherited).
+      // 4. Pass-through to the wrapped logger for any prop that already exists
+      //    on it (own or inherited). Methods are bound to `target`, so a child's
+      //    level methods reach the child's own `write`. The one exception is an
+      //    own non-writable, non-configurable data property: the Proxy `get`
+      //    invariant requires the trap to return exactly that value, and a
+      //    winston child's own `write` is one (`Object.create(base, { write:
+      //    { value } })`); returning a bound copy throws a `TypeError`. That
+      //    `write` reads its parent from a closure, not from `this`.
       if (Reflect.has(target, prop)) {
         const value = Reflect.get(target, prop, receiver);
         if (typeof value === "function") {
+          const own = Reflect.getOwnPropertyDescriptor(target, prop);
+          if (own?.configurable === false && own.writable === false) {
+            return value;
+          }
           return value.bind(target);
         }
         return value;
       }
 
-      // 4. Symbol props that are not on the base logger return undefined so the
+      // 5. Symbol props that are not on the base logger return undefined so the
       //    logger is not thenable, not iterable, and not picked up by inspectors
       //    that probe for `Symbol.toPrimitive`, `util.inspect.custom`, etc.
       if (typeof prop === "symbol") {
         return undefined;
       }
 
-      // 5. Hard deny-list of well-known engine/framework probes so the logger is
+      // 6. Hard deny-list of well-known engine/framework probes so the logger is
       //    NOT a thenable, NOT serializable as a function-bag, and NOT mistaken
       //    for a Vue/React component or a Jest mock.
       if (DENIED_PROXY_PROPS.has(prop)) {
         return undefined;
       }
 
-      // 6. Validate the prop name shape before treating it as a logging
+      // 7. Validate the prop name shape before treating it as a logging
       //    fallback method. Reject anything that does not look like a public
       //    method identifier.
       if (!FALLBACK_METHOD_NAME_PATTERN.test(prop)) {
         return undefined;
       }
 
-      // 7. Existing fallback warning behavior for legitimate typos like
-      //    `logger.success("ok")` — emit the one-time warning and route the
-      //    call to `info()`.
+      // 8. Existing fallback warning behavior for legitimate typos like
+      //    `logger.success("ok")` — emit the one-time warning (one per method
+      //    name for the root and all its children) and route the call to
+      //    `info()` on the logger it was made on, so a child keeps its metadata.
       return (...args: unknown[]) => {
         emitUnknownMethodWarning(prop);
-        return invokeInfoFallback(args);
+        return invokeInfoFallback(target, args);
       };
     },
     has(target, prop) {
@@ -3099,7 +3230,12 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     ownKeys(target) {
       return Reflect.ownKeys(target);
     },
-  }) as winston.Logger;
+  };
+
+  const wrapLogger = (target: winston.Logger): winston.Logger =>
+    new Proxy(target, loggerProxyHandler) as winston.Logger;
+
+  const proxied = wrapLogger(baseLogger);
 
   // Register with the process-wide crash-capture coordinator so an
   // `uncaughtException` / `unhandledRejection` is recorded once through a
@@ -3491,7 +3627,14 @@ export const shutdownLogger = (
   logger: winston.Logger,
   options: ShutdownOptions = {},
 ): Promise<void> => {
-  const existing = shutdownPromises.get(logger);
+  // A child logger shares its root's transports and lifetime, so shutting a
+  // child down shuts its root down. Resolve BEFORE the `shutdownPromises`
+  // lookup: every step below (the cached promise, the transport snapshot,
+  // `end()`, crash capture, the registry slot, the timeout path's eviction)
+  // must key on the root, or `shutdownLogger(child)` and `shutdownLogger(root)`
+  // would each issue their own `end()`.
+  const root = resolveRootLogger(logger);
+  const existing = shutdownPromises.get(root);
   if (existing) {
     return existing;
   }
@@ -3502,7 +3645,7 @@ export const shutdownLogger = (
   // transports detach themselves from the logger when they close). winston's
   // `Logger.transports` is always an array per the public API, so no nullish
   // fallback is required.
-  const transports = [...logger.transports];
+  const transports = [...root.transports];
 
   // Subscribe BEFORE `end()`. Each per-transport awaiter exposes its own
   // `cleanup()` so we can detach the `finish`/`close` listeners regardless of
@@ -3523,7 +3666,7 @@ export const shutdownLogger = (
   // documented no-op), so the idempotent re-shutdown path is safe — but the
   // early `shutdownPromises` cache hit above also short-circuits before we
   // ever reach this line on a repeat call.
-  logger.end();
+  root.end();
 
   // Deregister from the crash-capture coordinator as the logger tears down, so
   // once every logger has been shut down the process returns to zero
@@ -3531,7 +3674,7 @@ export const shutdownLogger = (
   // the public Proxy back to the base logger the coordinator actually stored;
   // deregistering a logger that was never registered (e.g. a no-op logger, or
   // one created with `captureUncaught: false`) is a safe no-op.
-  deregisterCrashCapture(proxyToBaseLogger.get(logger) ?? logger);
+  deregisterCrashCapture(proxyToBaseLogger.get(root) ?? root);
 
   // Evict the registry slot NOW — synchronously, in the same tick as `end()`,
   // and regardless of how the flush below turns out.
@@ -3547,13 +3690,14 @@ export const shutdownLogger = (
   //   mean "not ended yet"; it means "ended, and still not drained" — strictly
   //   MORE broken, not less. Leaving it cached would trade a guaranteed,
   //   unbounded, silent loss for a bounded one. Retryability is unaffected:
-  //   `shutdownLogger` reads only its argument, `shutdownPromises` and
-  //   `proxyToBaseLogger` — never the registry — so the documented
-  //   escalate-with-a-longer-timeout idiom works exactly as before.
+  //   `shutdownLogger` reads only its argument, `childToRootProxy`,
+  //   `shutdownPromises` and `proxyToBaseLogger` — never the registry — so
+  //   the documented escalate-with-a-longer-timeout idiom works exactly as
+  //   before.
   //   (`shutdownAllLoggers` is the one caller that iterates the registry, so a
   //   second bulk call will not re-attempt a timed-out logger; retry it through
   //   the reference you hold.)
-  evictRegistryEntry(logger);
+  evictRegistryEntry(root);
 
   const flushAll = Promise.all(awaiters.map((awaiter) => awaiter.promise)).then(() => undefined);
 
@@ -3582,8 +3726,8 @@ export const shutdownLogger = (
       // so that if this function is ever refactored to be partially async (e.g.
       // an `await` is introduced before the `set`), a retry that managed to
       // install a newer entry first would not be accidentally evicted here.
-      if (shutdownPromises.get(logger) === promise) {
-        shutdownPromises.delete(logger);
+      if (shutdownPromises.get(root) === promise) {
+        shutdownPromises.delete(root);
       }
       throw err;
     })
@@ -3599,7 +3743,7 @@ export const shutdownLogger = (
       awaiters.forEach((awaiter) => awaiter.cleanup());
     });
 
-  shutdownPromises.set(logger, promise);
+  shutdownPromises.set(root, promise);
   return promise;
 };
 
