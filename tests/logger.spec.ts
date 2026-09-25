@@ -5128,9 +5128,9 @@ describe("createLogger", () => {
       // Pins why the prototype must NOT be copied onto the rebuild
       // (`Object.create(getPrototypeOf(info))` / `setPrototypeOf` / copying
       // `toJSON` across): the copy is not a real instance, so a brand check on
-      // `this.#secret` throws a TypeError from inside the unwrapped `json()`,
-      // crashing `logger.info(dto)`. Invoking toJSON on the REAL instance here
-      // is what makes this work.
+      // `this.#secret` throws a TypeError from inside `json()`, and the line
+      // would be replaced by the `_unserializable` sentinel. Invoking toJSON on
+      // the REAL instance here is what makes this work.
       class PrivDto {
         #secret = "PRIVATE-VAL";
         public message = "priv";
@@ -10684,5 +10684,516 @@ describe("caller-safe Error-in-message payloads", () => {
       ]);
       expectErrorUntouched(err);
     });
+  });
+});
+
+describe("maskMetaKeys masks the output of a metadata object's own toJSON in pretty mode", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  interface ToJSONForm {
+    title: string;
+    make: (secret: string) => Record<string, unknown>;
+    emit: (logger: winston.Logger, payload: Record<string, unknown>) => void;
+    /** Own keys of the payload afterwards (winston-core adds `level` only when it is the info). */
+    keysAfter: string[];
+  }
+
+  // winston keeps the caller's object as the info when it has a truthy
+  // `message`, and merges a metadata object into a fresh info on the
+  // multi-argument form, so an own `toJSON` reaches the metadata bag both ways.
+  const forms: ToJSONForm[] = [
+    {
+      title: 'logger.info({ message: "m", user, toJSON })',
+      make: (secret) => ({
+        message: "m",
+        user: "bob",
+        toJSON: () => ({ user: "bob", password: secret }),
+      }),
+      emit: (logger, payload) => logger.info(payload as never),
+      keysAfter: ["message", "user", "toJSON", "level"],
+    },
+    {
+      title: 'logger.info("m", { user, toJSON })',
+      make: (secret) => ({ user: "bob", toJSON: () => ({ user: "bob", password: secret }) }),
+      emit: (logger, payload) => logger.info("m", payload),
+      keysAfter: ["user", "toJSON"],
+    },
+  ];
+
+  it.each(forms)(
+    "pretty: $title masks the toJSON output exactly like the unmasked line, file and console",
+    async ({ make, emit, keysAfter }) => {
+      const plain = await render("mtj-off", "pretty", (logger) => {
+        emit(logger, make("secret-T1"));
+      });
+      const payload = make("secret-T1");
+      const masked = await render(
+        "mtj-on",
+        "pretty",
+        (logger) => {
+          emit(logger, payload);
+        },
+        ["password"],
+      );
+
+      // Unchanged without a mask: JSON.stringify calls the bag's toJSON.
+      expect(plain.fileOut).toBe(
+        prettyLine("mtj-off", 'm\n{\n  "user": "bob",\n  "password": "secret-T1"\n}'),
+      );
+      expect(masked.thrown).toBeUndefined();
+      expect(masked.fileOut).toBe(
+        prettyLine("mtj-on", 'm\n{\n  "user": "bob",\n  "password": "[REDACTED]"\n}'),
+      );
+      expectConsoleMatchesFile("pretty", masked);
+      for (const output of [masked.fileOut, masked.consoleOut]) {
+        expect(output).not.toContain("secret-T1");
+      }
+      // The caller's object is never rewritten.
+      expect(Object.keys(payload)).toEqual(keysAfter);
+      expect(payload.user).toBe("bob");
+      expect((payload.toJSON as () => unknown)()).toEqual({ user: "bob", password: "secret-T1" });
+    },
+  );
+
+  it.each(forms)(
+    "json: $title masks the same toJSON output (parity pin)",
+    async ({ make, emit }) => {
+      const out = await render(
+        "mtj-json",
+        "json",
+        (logger) => {
+          emit(logger, make("secret-T2"));
+        },
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      // json() lets a top-level toJSON own the whole line; the mask applies to it.
+      expect(out.fileOut).toBe('{"password":"[REDACTED]","user":"bob"}\n');
+      expect(out.consoleOut).toBe(out.fileOut);
+      expect(out.fileOut).not.toContain("secret-T2");
+    },
+  );
+
+  it("pretty: a toJSON reading a masked field through `this` still sees the placeholder", async () => {
+    // The toJSON runs on the masked copy, exactly where JSON.stringify ran it
+    // before, so a renamed field built from `this.password` stays masked.
+    const out = await render(
+      "mtj-this",
+      "pretty",
+      (logger) => {
+        logger.info("login", {
+          password: "secret-T7",
+          toJSON() {
+            return { pw: this.password };
+          },
+        });
+      },
+      ["password"],
+    );
+
+    expect(out.thrown).toBeUndefined();
+    expect(out.fileOut).toBe(prettyLine("mtj-this", 'login\n{\n  "pw": "[REDACTED]"\n}'));
+    expectConsoleMatchesFile("pretty", out);
+    expect(out.fileOut).not.toContain("secret-T7");
+  });
+
+  it("pretty: a toJSON that returns the bag itself is read by its own keys, not called again", async () => {
+    let calls = 0;
+    const emit = (logger: winston.Logger): void => {
+      logger.info("m", {
+        password: "secret-T3",
+        note: "n",
+        toJSON() {
+          calls += 1;
+          return this;
+        },
+      });
+    };
+    const plain = await render("mtj-self", "pretty", emit);
+    const plainCalls = calls;
+    calls = 0;
+    const masked = await render("mtj-self", "pretty", emit, ["password"]);
+
+    // The serializer calls toJSON once and omits the function-valued key of
+    // the result; the masked line keeps exactly those keys.
+    expect(plain.fileOut).toBe(
+      prettyLine("mtj-self", 'm\n{\n  "password": "secret-T3",\n  "note": "n"\n}'),
+    );
+    expect(masked.thrown).toBeUndefined();
+    expect(masked.fileOut).toBe(
+      prettyLine("mtj-self", 'm\n{\n  "password": "[REDACTED]",\n  "note": "n"\n}'),
+    );
+    expectConsoleMatchesFile("pretty", masked);
+    expect(masked.fileOut).not.toContain("secret-T3");
+    // One call per rendering (file and console) either way: the result's own
+    // toJSON key is dropped rather than called a second time.
+    expect(plainCalls).toBe(2);
+    expect(calls).toBe(plainCalls);
+  });
+
+  it.each([
+    ["a primitive", (): unknown => "summary", '"summary"'],
+    ["an empty object", (): unknown => ({}), "{}"],
+    ["an empty array", (): unknown => [], "[]"],
+  ])(
+    "pretty: a toJSON returning %s renders the same block with and without a mask",
+    async (_name, result, block) => {
+      const emit = (logger: winston.Logger): void => {
+        logger.info("m", { toJSON: result });
+      };
+      const plain = await render("mtj-shape", "pretty", emit);
+      const masked = await render("mtj-shape", "pretty", emit, ["password"]);
+
+      expect(plain.fileOut).toBe(prettyLine("mtj-shape", `m\n${block}`));
+      expect(masked.thrown).toBeUndefined();
+      expect(masked.fileOut).toBe(plain.fileOut);
+      expectConsoleMatchesFile("pretty", masked);
+    },
+  );
+
+  it("pretty: a toJSON returning an array masks the secret inside it", async () => {
+    const emit = (logger: winston.Logger): void => {
+      logger.info("m", { toJSON: () => [{ password: "secret-T4", id: 1 }] });
+    };
+    const plain = await render("mtj-array", "pretty", emit);
+    const masked = await render("mtj-array", "pretty", emit, ["password"]);
+
+    expect(plain.fileOut).toBe(
+      prettyLine("mtj-array", 'm\n[\n  {\n    "password": "secret-T4",\n    "id": 1\n  }\n]'),
+    );
+    expect(masked.fileOut).toBe(
+      prettyLine("mtj-array", 'm\n[\n  {\n    "password": "[REDACTED]",\n    "id": 1\n  }\n]'),
+    );
+    expectConsoleMatchesFile("pretty", masked);
+    expect(masked.consoleOut).not.toContain("secret-T4");
+  });
+
+  it("pretty: a mask that names toJSON itself replaces the method, so the object's own keys print (documented exception)", async () => {
+    // The walk masks the `toJSON` key like any other, turning the method into
+    // the placeholder string, so there is no method left to call and
+    // JSON.stringify prints the bag's own keys. This is the one exception the
+    // maskMetaKeys JSDoc names; json mode resolves the method before masking.
+    const emit = (logger: winston.Logger): void => {
+      logger.info("m", { hidden: "kept-H1", toJSON: () => ({ shown: 1 }) });
+    };
+    const pretty = await render("mtj-named", "pretty", emit, ["toJSON"]);
+    const json = await render("mtj-named", "json", emit, ["toJSON"]);
+
+    expect(pretty.thrown).toBeUndefined();
+    expect(pretty.fileOut).toBe(
+      prettyLine("mtj-named", 'm\n{\n  "hidden": "kept-H1",\n  "toJSON": "[REDACTED]"\n}'),
+    );
+    expectConsoleMatchesFile("pretty", pretty);
+    expect(json.fileOut).toBe('{"shown":1}\n');
+    expect(json.fileOut).not.toContain("kept-H1");
+  });
+
+  it("pretty: metadata without a toJSON renders exactly as before under a mask", async () => {
+    const out = await render(
+      "mtj-none",
+      "pretty",
+      (logger) => {
+        logger.info("m", { user: "bob", password: "secret-T5", nested: { password: "secret-T6" } });
+      },
+      ["password"],
+    );
+
+    expect(out.fileOut).toBe(
+      prettyLine(
+        "mtj-none",
+        'm\n{\n  "user": "bob",\n  "password": "[REDACTED]",\n  "nested": {\n    "password": "[REDACTED]"\n  }\n}',
+      ),
+    );
+    expectConsoleMatchesFile("pretty", out);
+    expect(out.fileOut).not.toContain("secret-T");
+  });
+});
+
+describe("a payload whose keys or prototype cannot be read", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const LEVEL_SLOT = Symbol.for("level");
+  const refuse = (trap: string) => (): never => {
+    throw new Error(`${trap} refused`);
+  };
+  class Dto {
+    public message = "hi";
+    public password = "secret-X1";
+  }
+
+  interface HostileCase {
+    title: string;
+    make: () => { payload: object; target: Record<string | symbol, unknown> };
+    emit: (logger: winston.Logger, payload: object) => void;
+    /** The level the entry was logged at, which the degraded line keeps. */
+    level: string;
+    /** The message the degraded line keeps: the payload's own string, else the sentinel. */
+    message: string;
+    /** The target's own keys afterwards. */
+    keysAfter: string[];
+  }
+
+  const plainTarget = (): Record<string | symbol, unknown> => ({
+    message: "hi",
+    password: "secret-X1",
+  });
+
+  const cases: HostileCase[] = [
+    {
+      title: "a plain Proxy whose ownKeys trap throws, logged with logger.info",
+      make: () => {
+        const target = plainTarget();
+        return { payload: new Proxy(target, { ownKeys: refuse("ownKeys") }), target };
+      },
+      emit: (logger, payload) => logger.info(payload as never),
+      level: "info",
+      message: "hi",
+      keysAfter: ["message", "password", "level"],
+    },
+    {
+      title: "the same Proxy logged with logger.error, which keeps its level",
+      make: () => {
+        const target = plainTarget();
+        return { payload: new Proxy(target, { ownKeys: refuse("ownKeys") }), target };
+      },
+      emit: (logger, payload) => logger.error(payload as never),
+      level: "error",
+      message: "hi",
+      keysAfter: ["message", "password", "level"],
+    },
+    {
+      title: 'the same Proxy logged with logger.log("info", payload)',
+      make: () => {
+        const target = plainTarget();
+        return { payload: new Proxy(target, { ownKeys: refuse("ownKeys") }), target };
+      },
+      emit: (logger, payload) => logger.log("info", payload as never),
+      level: "info",
+      message: "hi",
+      keysAfter: ["message", "password", "level"],
+    },
+    {
+      title: "a class-instance Proxy whose ownKeys trap throws",
+      make: () => {
+        const target = new Dto() as unknown as Record<string | symbol, unknown>;
+        return { payload: new Proxy(target, { ownKeys: refuse("ownKeys") }), target };
+      },
+      emit: (logger, payload) => logger.info(payload as never),
+      level: "info",
+      message: "hi",
+      // A class instance keeps the documented in-place `timestamp` write.
+      keysAfter: ["message", "password", "level", "timestamp"],
+    },
+    {
+      title: "a plain Proxy whose getPrototypeOf trap throws",
+      make: () => {
+        const target = plainTarget();
+        return { payload: new Proxy(target, { getPrototypeOf: refuse("getPrototypeOf") }), target };
+      },
+      emit: (logger, payload) => logger.info(payload as never),
+      level: "info",
+      message: "hi",
+      keysAfter: ["message", "password", "level"],
+    },
+    {
+      title: "a Proxy without a message whose ownKeys trap throws, logged at warn",
+      make: () => {
+        const target: Record<string | symbol, unknown> = { password: "secret-X1" };
+        return { payload: new Proxy(target, { ownKeys: refuse("ownKeys") }), target };
+      },
+      emit: (logger, payload) => logger.log("warn", payload as never),
+      level: "warn",
+      message: "[UNSERIALIZABLE]",
+      keysAfter: ["password", "level"],
+    },
+    {
+      title: "a Proxy whose message read and ownKeys trap both throw",
+      make: () => {
+        const target: Record<string | symbol, unknown> = { password: "secret-X1" };
+        const payload = new Proxy(target, {
+          ownKeys: refuse("ownKeys"),
+          get: (obj, key, receiver) => {
+            if (key === "message") {
+              throw new Error("message refused");
+            }
+            return Reflect.get(obj, key, receiver);
+          },
+        });
+        return { payload, target };
+      },
+      emit: (logger, payload) => logger.log("info", payload as never),
+      level: "info",
+      message: "[UNSERIALIZABLE]",
+      keysAfter: ["password", "level"],
+    },
+  ];
+
+  const FORMATS: Format[] = ["pretty", "json"];
+
+  describe.each(FORMATS)("%s", (format) => {
+    const degradedLine = (label: string, message: string, level: string): string =>
+      format === "pretty"
+        ? `UTC: ${STAMP}\n[${level.toUpperCase()}] (${label})\n${message}\n{\n  "_unserializable": true\n}\n\n`
+        : `{"_unserializable":true,"level":"${level}","message":${JSON.stringify(message)},` +
+          `"module":"${label}","timestamp":"${STAMP}"}\n`;
+
+    // The throw happens before any mask-dependent format, so the degraded line
+    // is the same with and without `maskMetaKeys`.
+    describe.each([
+      ["without maskMetaKeys", undefined],
+      ["with maskMetaKeys", ["password"]],
+    ] as [string, string[] | undefined][])("%s", (_maskTitle, maskMetaKeys) => {
+      it.each(cases)(
+        "$title renders a degraded line instead of throwing",
+        async ({ make, emit, level, message, keysAfter }) => {
+          const label = `hostile-${format}`;
+          const { payload, target } = make();
+
+          const out = await render(label, format, (logger) => emit(logger, payload), maskMetaKeys);
+
+          expect(out.thrown).toBeUndefined();
+          expect(out.fileOut).toBe(degradedLine(label, message, level));
+          expectConsoleMatchesFile(format, out);
+          for (const output of [out.fileOut, out.consoleOut]) {
+            expect(output).not.toContain("refused");
+            // Nothing the payload holds beyond a string message is written.
+            expect(output).not.toContain("secret-X1");
+          }
+          // Only winston-core's own `level` / `[LEVEL]` write lands on a plain
+          // target; the secret is still there, unmasked and untouched.
+          expect(Object.keys(target)).toEqual(keysAfter);
+          expect(Object.getOwnPropertySymbols(target)).toEqual([LEVEL_SLOT]);
+          expect(target[LEVEL_SLOT]).toBe(level);
+          expect(target.password).toBe("secret-X1");
+        },
+      );
+    });
+
+    interface LevelCase {
+      title: string;
+      /** Values the Proxy's `get` trap reports instead of the target's. */
+      overrides: Map<string | symbol, unknown>;
+      expectedLevel: string;
+      /** Whether winston itself reports an unknown level before the chain runs. */
+      winstonReportsUnknownLevel: boolean;
+    }
+
+    it.each<LevelCase>([
+      {
+        title: "an unreadable `[LEVEL]` slot falls back to `level`",
+        overrides: new Map<string | symbol, unknown>([[LEVEL_SLOT, undefined]]),
+        expectedLevel: "warn",
+        winstonReportsUnknownLevel: true,
+      },
+      {
+        title: "an unreadable `[LEVEL]` slot and `level` fall back to info",
+        overrides: new Map<string | symbol, unknown>([
+          [LEVEL_SLOT, undefined],
+          ["level", undefined],
+        ]),
+        expectedLevel: "info",
+        winstonReportsUnknownLevel: true,
+      },
+      {
+        title: "the `[LEVEL]` slot wins over `level` when both are readable",
+        overrides: new Map<string | symbol, unknown>([[LEVEL_SLOT, "error"]]),
+        expectedLevel: "error",
+        winstonReportsUnknownLevel: false,
+      },
+    ])(
+      "$title, so the degraded line is still written at a real level",
+      async ({ overrides, expectedLevel, winstonReportsUnknownLevel }) => {
+        const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+        const label = `hostile-level-${format}`;
+        const payload = new Proxy(plainTarget(), {
+          ownKeys: refuse("ownKeys"),
+          get: (obj, key, receiver) =>
+            overrides.has(key) ? overrides.get(key) : Reflect.get(obj, key, receiver),
+        });
+
+        const out = await render(label, format, (logger) => logger.log("warn", payload as never));
+
+        expect(out.thrown).toBeUndefined();
+        expect(out.fileOut).toBe(degradedLine(label, "hi", expectedLevel));
+        expectConsoleMatchesFile(format, out);
+        // winston itself reports a level it could not read; this package never
+        // writes to stderr on this path.
+        expect(errorSpy.mock.calls).toEqual(
+          winstonReportsUnknownLevel ? [["[winston] Unknown logger level: %s", undefined]] : [],
+        );
+      },
+    );
+
+    it("a throwing clock still throws its ORIGINAL error out of the log call, as before", () => {
+      // The degraded pass runs the same chain, so a configuration error that
+      // throws on every pass is not swallowed; the caller sees the first throw.
+      let calls = 0;
+      const sink = new PassThrough();
+      const chunks: string[] = [];
+      sink.on("data", (chunk: Buffer | string) => chunks.push(String(chunk)));
+      const logger = createLogger({
+        moduleName: `hostile-clock-${format}`,
+        format,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        captureUncaught: false,
+        clock: (): Date => {
+          calls += 1;
+          throw new Error(`clock failure ${calls}`);
+        },
+        additionalTransports: [new winston.transports.Stream({ stream: sink, eol: "\n" })],
+      });
+
+      expect(() => logger.info("x")).toThrow(new Error("clock failure 1"));
+      // The degraded pass was attempted once and failed the same way.
+      expect(calls).toBe(2);
+      expect(chunks).toEqual([]);
+      teardownLogger(logger);
+    });
+  });
+
+  it("pretty: the console transport degrades like the file when a message Proxy defeats its Error flattening", async () => {
+    // The Console re-runs its own format over a copy of the rendered entry. A
+    // message whose prototype cannot be read and whose `message` is itself
+    // makes the Error-flattening step throw there too, and winston-transport
+    // re-throws a transport-format error out of the log call.
+    const message = new Proxy(
+      { a: 1 },
+      {
+        getPrototypeOf: refuse("getPrototypeOf"),
+        get: (obj, key, receiver) =>
+          key === "message" ? receiver : Reflect.get(obj, key, receiver),
+      },
+    );
+
+    const out = await render("hostile-console", "pretty", (logger) =>
+      logger.log("info", { message }),
+    );
+
+    expect(out.thrown).toBeUndefined();
+    expect(out.fileOut).toBe(
+      prettyLine("hostile-console", '{\n  "a": 1\n}\n{\n  "_errorFlattenFailed": true\n}'),
+    );
+    expectConsoleMatchesFile("pretty", out);
+    expect(out.consoleOut).not.toContain("refused");
+  });
+
+  it("negative control: an ordinary payload never takes the degraded path", async () => {
+    const out = await render("hostile-control", "json", (logger) =>
+      logger.info({ message: "hi", user: "bob" }),
+    );
+
+    expect(out.fileOut).toBe(
+      `{"level":"info","message":"hi","module":"hostile-control","timestamp":"${STAMP}","user":"bob"}\n`,
+    );
+    expect(out.fileOut).not.toContain("_unserializable");
   });
 });

@@ -386,11 +386,15 @@ export interface LoggerOptions {
    * serializable classes) or that carry no enumerable own keys (`Map`, `Set`,
    * `RegExp`, etc.) are serialized via their built-in method and are **not**
    * key-redacted — use `redactPaths` or normalize to a plain object for those.
-   * Two top-level values are the exception, and their `toJSON()` is resolved
+   * Three top-level values are the exception, and their `toJSON()` is resolved
    * first so the resulting fields ARE key-redacted: a `toJSON`-defining message
-   * (any format), and a `toJSON`-defining object passed as the log call's own
-   * subject (`logger.info(dto)` in `format: "json"`). Enabling the mask never
-   * emits more than logging the same value without it would.
+   * (any format), a `toJSON`-defining object passed as the log call's own
+   * subject (`logger.info(dto)` in `format: "json"`), and, in the default
+   * pretty format, a metadata object with its own `toJSON()` method, which is
+   * called on the masked copy. A field such a `toJSON()` withholds is never
+   * printed because a mask is on. The one exception is a mask that names
+   * `toJSON` itself: in pretty mode it replaces a metadata object's method with
+   * the placeholder, so that object's own keys are printed instead.
    *
    * **Console/file parity (`format: "json"`).** The json-mode Console transport
    * carries no per-transport format, so `winston-transport` writes the
@@ -470,7 +474,10 @@ export interface LoggerOptions {
    * pipeline depends on multi-line stack rendering should leave the option at
    * its `false` default, in which both the message and the stack render exactly
    * as they always have. Values that are not strings on either branch are
-   * serialized through `JSON.stringify`, which escapes newlines regardless.
+   * serialized through `JSON.stringify`, which escapes newlines inside
+   * strings. The exception is a message JSON cannot express at all (a
+   * function, a symbol, a `toJSON()` returning `undefined`): it is rendered
+   * with `String()` and is not escaped, since the option covers string values.
    *
    * Mature production loggers (pino, bunyan, application-log shippers) ship
    * the equivalent of this option enabled by default; this package keeps it

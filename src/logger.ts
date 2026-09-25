@@ -1095,9 +1095,9 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
     // (`Object.create(Object.getPrototypeOf(info))`, `setPrototypeOf`, or
     // copying `toJSON` across as an own key): the copy is not a real instance,
     // so a `toJSON` reading a private `#field` throws a brand `TypeError` from
-    // inside `json()` — which this package deliberately does not wrap (see the
-    // KNOWN BOUNDARY note in `createLogger`) — turning an ordinary
-    // `logger.info(dto)` into an application crash. Invoking `toJSON` HERE calls
+    // inside `json()`, which `buildSafeJsonFormat` then replaces with its
+    // `_unserializable` sentinel line — turning an ordinary `logger.info(dto)`
+    // into a lost log entry. Invoking `toJSON` HERE calls
     // it on the real instance (`this === source`), so private fields work, and
     // it runs inside our own try/catch, so a hostile `toJSON` fails closed
     // rather than escaping. This mirrors the resolve-then-redact precedent
@@ -1612,11 +1612,15 @@ const buildSafeErrorsFormat = (): winston.Logform.Format => {
       return errorsFormat.transform(target, errorsFormat.options);
     } catch {
       const source = info as unknown as Record<string | symbol, unknown>;
-      // Never let the safety net itself throw: every read below is a
-      // caller-controlled value that may be a throwing accessor, so the read is
-      // wrapped — a throw, OR a null/undefined target, fails closed to undefined
-      // (reading a key off null/undefined throws a TypeError the catch absorbs, so
-      // no separate nullish guard is needed).
+      // Every property read below is a caller-controlled value that may be a
+      // throwing accessor, so the read is wrapped: a throw, OR a null/undefined
+      // target, fails closed to undefined (reading a key off null/undefined
+      // throws a TypeError the catch absorbs, so no separate nullish guard is
+      // needed). The `instanceof` check and the Symbol listing are not wrapped:
+      // they throw only for a Proxy whose `getPrototypeOf` / `ownKeys` trap
+      // throws, and that throw reaches `buildFailClosedChain` around the whole
+      // logger-level chain, whose degraded line keeps a string message that a
+      // local fallback here would lose.
       const safeReadFrom = (obj: unknown, key: string): unknown => {
         try {
           return (obj as Record<string, unknown>)[key];
@@ -1646,6 +1650,78 @@ const buildSafeErrorsFormat = (): winston.Logform.Format => {
     }
   })();
 };
+
+/**
+ * Registered `triple-beam` slot holding the entry's level. Like
+ * {@link MESSAGE_SLOT}, it is the process-wide `Symbol.for("level")`, so no
+ * import of the undeclared `triple-beam` package is needed.
+ */
+const LEVEL_SLOT = Symbol.for("level");
+
+/**
+ * The fresh info {@link buildFailClosedChain} renders when the caller's own
+ * info made the chain throw: a level, a string message, and the
+ * `_unserializable` marker the json sentinel line already uses. Everything else
+ * on the caller's object is dropped, because it is exactly what could not be
+ * read. Every read is guarded. The level comes from `info[LEVEL]` (what winston
+ * read before the chain ran, and what every transport gates on), then
+ * `info.level`, then `"info"` (the same default `formatMessage` renders for a
+ * non-string level), so the degraded line is never dropped for want of a level.
+ * A non-string message becomes `UNSERIALIZABLE`: the object holds only strings
+ * and a boolean, so no format in the chain can fail on it.
+ */
+const buildUnreadableInfo = (info: unknown): winston.Logform.TransformableInfo => {
+  const read = (key: string | symbol): unknown => {
+    try {
+      return (info as Record<string | symbol, unknown>)[key];
+    } catch {
+      return undefined;
+    }
+  };
+  const slotLevel = read(LEVEL_SLOT);
+  const infoLevel = read("level");
+  const level =
+    typeof slotLevel === "string" ? slotLevel : typeof infoLevel === "string" ? infoLevel : "info";
+  const message = read("message");
+  return {
+    level,
+    message: typeof message === "string" ? message : UNSERIALIZABLE,
+    [JSON_SERIALIZE_FAILED]: true,
+    [LEVEL_SLOT]: level,
+  } as unknown as winston.Logform.TransformableInfo;
+};
+
+/**
+ * Wraps the whole logger-level chain so a payload the chain cannot read renders
+ * a degraded line instead of throwing out of `logger.log()`.
+ *
+ * Each format guards the caller reads it knows about, but every rebuild relies
+ * on plain object operations that a Proxy payload can make throw: listing its
+ * keys (an `ownKeys` trap, reached by the timestamp copy, `Object.keys`, and
+ * the Symbol listings) or reading its prototype (a `getPrototypeOf` trap,
+ * reached by the plain-object test and `instanceof`). Winston runs the chain
+ * synchronously inside the caller's own `logger.info(...)` with no catch
+ * (`Logger._transform`), so such a payload crashed the call in both formats.
+ * On a throw the chain runs again over {@link buildUnreadableInfo}. The happy
+ * path is the chain's own call, unchanged.
+ *
+ * If the second pass throws too, the ORIGINAL error is re-thrown, exactly as
+ * before this wrapper existed: that is a failure the payload did not cause (a
+ * caller-supplied `clock` that throws fails on every pass), and swallowing it
+ * would hide a configuration error.
+ */
+const buildFailClosedChain = (chain: winston.Logform.Format): winston.Logform.Format =>
+  winston.format((info) => {
+    try {
+      return chain.transform(info, chain.options);
+    } catch (err) {
+      try {
+        return chain.transform(buildUnreadableInfo(info), chain.options);
+      } catch {
+        throw err;
+      }
+    }
+  })();
 
 /**
  * Resolves every caller-supplied own ENUMERABLE accessor on the info to a plain
@@ -1696,7 +1772,10 @@ const buildSafeErrorsFormat = (): winston.Logform.Format => {
  * flattens it via `Object.assign` is likewise NOT on this list — that crash
  * happens INSIDE a package-composed format, so it too is closed by
  * {@link buildSafeErrorsFormat} (which wraps `errors()` the way
- * {@link buildSafeJsonFormat} wraps `json()`), not left to the caller.
+ * {@link buildSafeJsonFormat} wraps `json()`), not left to the caller. Neither
+ * is a payload whose keys or prototype cannot be read at all (a Proxy whose
+ * `ownKeys` or `getPrototypeOf` trap throws): {@link buildFailClosedChain}
+ * around the whole logger-level chain renders a degraded line for it.
  */
 const neutralizeCallerAccessors = winston.format((info) => {
   const source = info as unknown as Record<string | symbol, unknown>;
@@ -1846,7 +1925,10 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
     // log parser), it keeps every frame present and greppable rather than
     // dropped, and the option is opt-in (default `false`), so no default
     // behavior changes. Non-string values on either branch are serialized
-    // through `safeStringify`, whose JSON encoding already escapes newlines.
+    // through `safeStringify`, whose JSON encoding escapes newlines inside
+    // strings. The exception is a message JSON cannot express at all (a
+    // function, a symbol, a `toJSON` returning `undefined`): it falls back to
+    // `String()` and is not escaped, since the option covers string messages.
     const escapeIfEnabled = (value: string): string =>
       escapeMessageNewlines ? value.replace(/\r/g, "\\r").replace(/\n/g, "\\n") : value;
     const message = typeof info.message === "string" ? escapeIfEnabled(rawMessage) : rawMessage;
@@ -1974,7 +2056,23 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
     }
 
     if (cleanedMeta) {
-      lines.push(safeStringify(cleanedMeta, 2));
+      // The walk above keeps a function value as it is, so an own `toJSON` on
+      // the bag (an object logged with a `toJSON` method, or merged into the
+      // info from one) survives onto the masked copy, and `JSON.stringify`
+      // would call it and print its output unmasked. With a mask it goes
+      // through the shared reserved-slot helper instead. The helper still calls
+      // it on the masked copy, as the serializer did, so a field it reads
+      // through `this` is already the placeholder; it then masks the output by
+      // its own keys. A throw renders the same sentinel the serializer's own
+      // failure does. This is the pretty counterpart of `buildMetaRedactor`
+      // resolving a top-level `toJSON` in json mode.
+      const resolvedMeta =
+        cleanedMeta !== metadata && typeof cleanedMeta.toJSON === "function"
+          ? redactMessagePayload(cleanedMeta, maskMetaKeys as ReadonlySet<string>, "")
+          : cleanedMeta;
+      lines.push(
+        resolvedMeta === REDACTION_FAILED ? UNSERIALIZABLE : safeStringify(resolvedMeta, 2),
+      );
     }
 
     return `${lines.join("\n")}\n`;
@@ -2479,7 +2577,9 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
       // `buildSafeJsonFormat` set `info[MESSAGE]`, so the console line is unchanged.
       jsonPieces.push(neutralizeCallerAccessors);
     }
-    sharedFormat = winston.format.combine(...jsonPieces);
+    // `buildFailClosedChain` renders a degraded line when a payload's keys or
+    // prototype cannot be read, instead of throwing out of `logger.log()`.
+    sharedFormat = buildFailClosedChain(winston.format.combine(...jsonPieces));
     consoleFormat = undefined;
   } else {
     // Pretty branch — preserves the existing human-readable printf output
@@ -2514,7 +2614,8 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     if (includeConsole || hasFormatCarryingAdditionalTransport) {
       prettyPieces.push(neutralizeCallerAccessors);
     }
-    sharedFormat = winston.format.combine(...prettyPieces);
+    // Degrades an unreadable payload instead of throwing (see the json branch).
+    sharedFormat = buildFailClosedChain(winston.format.combine(...prettyPieces));
     // `winston.format.colorize()` returns a Format-shaped object that ALSO
     // exposes a public `colorize(level, message)` helper used to wrap an
     // arbitrary string in the ANSI codes for a given level. We use that
@@ -2532,10 +2633,13 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
       maskMetaKeys: maskMetaKeySet,
       escapeMessageNewlines,
     });
-    consoleFormat = winston.format.combine(
-      winston.format.errors({ stack: true }),
-      consoleMessageFormat,
-    );
+    // The Console re-runs this chain over a copy of the entry, and
+    // winston-transport re-throws a transport-format error out of the log call,
+    // so its Error-flattening step is the same getter-safe wrapper the
+    // logger-level chains use. Its happy path is the plain `errors()` call, and
+    // a message that defeats `errors()` degrades through that wrapper's
+    // fallback instead of being re-thrown out of the log call.
+    consoleFormat = winston.format.combine(buildSafeErrorsFormat(), consoleMessageFormat);
   }
 
   const transports: winston.transport[] = [];
