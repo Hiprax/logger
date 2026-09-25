@@ -1572,7 +1572,12 @@ describe("createRequestLogger", () => {
     }
   });
 
-  it("uses the redactPaths list as validated at construction; later mutation of the caller's array has no effect", () => {
+  it("applies paths added to the caller's redactPaths array later, and ignores non-strings in it", () => {
+    // The middleware keeps the caller's live array, so a path added after it
+    // was created still applies (dropping it would log what it was meant to
+    // hide). Construction-time validation cannot see a value added later: a
+    // non-string used to make the path pass throw on every request, so no
+    // request was logged at all.
     const paths = ["body.password"];
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
@@ -1582,17 +1587,14 @@ describe("createRequestLogger", () => {
       redactPaths: paths,
     });
 
-    // Bypasses construction-time validation. It used to make the path pass
-    // throw on every request, so no request was logged at all.
-    paths.push(42 as unknown as string);
-    paths[0] = "body.email";
+    paths.push(42 as unknown as string, "body.email");
 
     const { res } = runMiddleware(middleware);
     res.emit("finish");
 
     expect(log).toHaveBeenCalledTimes(1);
     expect(log.mock.calls[0][0].http.requestBody).toEqual({
-      email: "user@example.com",
+      email: "[REDACTED]",
       password: "[REDACTED]",
     });
   });
@@ -3580,11 +3582,19 @@ describe("request middleware internals", () => {
     }
   });
 
-  it("redactEntryPath never throws for a path that is not a string", () => {
+  it("redactEntryPath ignores a path that is not a string, and never calls its methods", () => {
+    let splitCalls = 0;
+    const withSplit = {
+      split: (): string[] => {
+        splitCalls += 1;
+        return ["context", "token"];
+      },
+    };
     const entry = { context: { token: "SECRET" } } as unknown as Record<string, unknown>;
-    for (const path of [42, {}, ["context", "token"]]) {
+    for (const path of [42, {}, ["context", "token"], withSplit]) {
       expect(() => redactEntryPath(entry, path as unknown as string)).not.toThrow();
     }
+    expect(splitCalls).toBe(0);
     expect(entry).toEqual({ context: { token: "SECRET" } });
   });
 

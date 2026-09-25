@@ -758,6 +758,14 @@ const PATH_ROOT_FIELDS = new Set(["requestBody", "requestHeaders", "responseHead
  * `Set`) has neither, so this is the ownership test. `Object.prototype` itself
  * fails it (its prototype is `null`). A Proxy trap that throws here is caught by
  * the caller's try/catch.
+ *
+ * Boundary: the test is by shape, so it trusts the copies to be fresh. They are
+ * for everything a request can carry (JSON round-trips, and `redactValue`'s
+ * rebuilds of plain objects). An application that builds a header value
+ * itself can still defeat it: an array with its own `map` or a replaced
+ * `constructor` / `Symbol.species` (the copy is made with `value.map` in
+ * `src/redact.ts`), or a Proxy whose `getPrototypeOf` trap answers differently
+ * on each call, can hand the walk an object the application owns.
  */
 const isOwnedPathContainer = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" &&
@@ -818,10 +826,12 @@ const isOwnedPathContainer = (value: unknown): value is Record<string, unknown> 
  * target, and a non-writable (frozen) slot.
  */
 const redactEntryPath = (entry: Record<string, unknown>, path: string): void => {
+  // A non-string is never split: an object carrying its own `split` method
+  // would otherwise run caller code here.
+  if (typeof path !== "string" || path === "") {
+    return;
+  }
   try {
-    if (!path) {
-      return;
-    }
     const segments = path.split(".").filter(Boolean);
     if (segments.length === 0) {
       return;
@@ -1039,11 +1049,11 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
     Array.isArray(maskBodyKeys) && maskBodyKeys.length > 0
       ? new Set(maskBodyKeys.map((key) => key.toLowerCase()))
       : undefined;
-  // A copy, like `additionalTransports` in `createLogger`: the list was
-  // validated above, and a later change to the caller's array must neither
-  // bypass that validation nor let the body pass and the entry pass (with
-  // `enrich()` running between them) see different lists.
-  const resolvedRedactPaths = Array.isArray(redactPaths) ? [...redactPaths] : [];
+  // The caller's LIVE array, deliberately not a copy: a path an application
+  // adds after creating the middleware keeps applying (a copy would silently
+  // drop it and log what it was meant to hide). Validation above cannot see a
+  // value added later, so `redactEntryPath` ignores any non-string itself.
+  const resolvedRedactPaths = Array.isArray(redactPaths) ? redactPaths : [];
 
   return (req: LoggableRequest, res: LoggableResponse, next: LoggableNext) => {
     if (skip?.(req, res)) {
