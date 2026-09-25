@@ -28,6 +28,7 @@ import {
 } from "../src/shared-file-transport";
 import { MAX_REDACT_DEPTH, redactValue } from "../src/redact";
 import { InvalidTimezoneError, LoggerOptionError } from "../src/errors";
+import type { LoggerOptions } from "../src/types";
 import { captureConsole, createTempDir, teardownLogger } from "./_helpers";
 
 /**
@@ -4146,11 +4147,10 @@ describe("createLogger", () => {
       if (!format) {
         throw new Error("expected the Console transport to expose a format pipeline");
       }
-      // winston's `format.colorize()` reads `info[Symbol.for("level")]` to
-      // look up the ANSI codes for the level (the symbol-keyed slot is set
-      // by the upstream `Logger.log()` flow before any format runs). When we
-      // call `format.transform` directly on a hand-built info object we have
-      // to populate the symbol slot ourselves.
+      // The upstream `Logger.log()` flow sets the symbol-keyed level slot
+      // before any format runs; the console printf colors by `info.level`,
+      // but the hand-built info mirrors the real shape so the format chain
+      // sees exactly what winston would hand it.
       const enriched = {
         ...info,
         [Symbol.for("level")]: info.level,
@@ -8780,6 +8780,301 @@ describe("runtime level changes", () => {
       expect(consoleOut).not.toContain("RL-EMPTY-BEFORE");
       expect(moduleFile).not.toContain("RL-EMPTY-BEFORE");
       expect(globalFile).not.toContain("RL-EMPTY-BEFORE");
+    },
+  );
+});
+
+describe("pretty console message rendering", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const ANSI_PATTERN = /\x1b\[[0-9;]*m/g;
+  const stripAnsi = (value: string): string => value.replace(ANSI_PATTERN, "");
+  const FIXED_NOW = new Date(Date.UTC(2026, 0, 2, 3, 4, 5));
+  const GREEN = "\x1b[32m";
+  const YELLOW = "\x1b[33m";
+  const RED = "\x1b[31m";
+  const BLUE = "\x1b[34m";
+  const CLOSE = "\x1b[39m";
+
+  /**
+   * Logs through a real pretty logger whose only outputs are the built-in
+   * Console and a formatless `Stream` sink. The sink writes the logger-level
+   * `info[MESSAGE]`, which is exactly the pretty file line, so the two strings
+   * can be compared: the console line must be the file line without its
+   * timestamp header (plus ANSI codes). Both transports append `os.EOL`; the
+   * sink is given `eol: "\n"` and the console's platform EOL is normalized to
+   * `"\n"`, so the byte pins hold on Windows as well.
+   */
+  const render = async (
+    moduleName: string,
+    emit: (logger: winston.Logger) => void,
+    options: Partial<LoggerOptions> = {},
+  ): Promise<{ consoleOut: string; fileOut: string }> => {
+    const sink = new PassThrough();
+    const chunks: string[] = [];
+    sink.on("data", (chunk: Buffer | string) => chunks.push(String(chunk)));
+    const logger = createLogger({
+      moduleName,
+      includeFile: false,
+      includeGlobalFile: false,
+      captureUncaught: false,
+      clock: () => FIXED_NOW,
+      ...options,
+      // Last, so a test option can never replace the capture sink.
+      additionalTransports: [new winston.transports.Stream({ stream: sink, eol: "\n" })],
+    });
+    const rawConsole = captureConsole(() => emit(logger));
+    await shutdownLogger(logger);
+    // Normalized only when present: a missing line ending is left for each
+    // test's exact comparison to report, next to the real failure reason.
+    const consoleOut = rawConsole.endsWith(os.EOL)
+      ? `${rawConsole.slice(0, rawConsole.length - os.EOL.length)}\n`
+      : rawConsole;
+    return { consoleOut, fileOut: chunks.join("") };
+  };
+
+  /** The file line with its `UTC:` header removed, i.e. the console's visible text. */
+  const withoutTimestamp = (fileOut: string): string => {
+    expect(fileOut.startsWith("UTC: 2026-01-02 03:04:05\n")).toBe(true);
+    return fileOut.slice("UTC: 2026-01-02 03:04:05\n".length);
+  };
+
+  const nestedObject = { a: 1, b: { c: { d: { e: 1 } } } };
+  const nestedArray = [1, { x: [2, [3, [4]]] }];
+
+  const payloads: [string, unknown, string][] = [
+    ["an undefined message", undefined, "undefined"],
+    ["a BigInt message", 123n, "123"],
+    ["a deeply nested object message", nestedObject, JSON.stringify(nestedObject, null, 2)],
+    ["a deeply nested array message", nestedArray, JSON.stringify(nestedArray, null, 2)],
+  ];
+
+  const colorizeModes: [string, LoggerOptions["colorize"], boolean, boolean][] = [
+    ["default colorize", undefined, true, true],
+    ["colorize { level: false, message: true }", { level: false, message: true }, false, true],
+    ["colorize { level: true, message: false }", { level: true, message: false }, true, false],
+    ["colorize false", false, false, false],
+  ];
+
+  describe.each(colorizeModes)("%s", (_title, colorize, levelColored, messageColored) => {
+    it.each(payloads)(
+      "renders %s with the same visible text as the file line",
+      async (_name, payload, expectedMessage) => {
+        const { consoleOut, fileOut } = await render(
+          "pcm-parity",
+          (logger) => {
+            logger.info(payload);
+          },
+          { colorize },
+        );
+
+        const expectedVisible = `[INFO] (pcm-parity)\n${expectedMessage}\n\n`;
+        expect(withoutTimestamp(fileOut)).toBe(expectedVisible);
+        expect(stripAnsi(consoleOut)).toBe(expectedVisible);
+        // Never the level name, a BigInt literal, or util.inspect's depth markers.
+        expect(stripAnsi(consoleOut)).not.toMatch(/\ninfo\n/);
+        expect(consoleOut).not.toContain("123n");
+        expect(consoleOut).not.toContain("[Object]");
+        expect(consoleOut).not.toContain("[Array]");
+
+        const [levelLine, ...messageLines] = consoleOut.split("\n").slice(0, -2);
+        expect(levelLine).toBe(
+          levelColored ? `${GREEN}[INFO]${CLOSE} (pcm-parity)` : "[INFO] (pcm-parity)",
+        );
+        // Every physical line of the message block carries exactly one
+        // open/close pair when the message is colored, and none otherwise.
+        for (const line of messageLines) {
+          if (messageColored) {
+            expect(line.startsWith(GREEN)).toBe(true);
+            expect(line.endsWith(CLOSE)).toBe(true);
+            expect(line.split(GREEN).length - 1).toBe(1);
+            expect(line.split(CLOSE).length - 1).toBe(1);
+          } else {
+            expect(line.includes("\x1b")).toBe(false);
+          }
+        }
+      },
+    );
+  });
+
+  describe("byte-identical console output for messages the change does not target", () => {
+    const fixedError = (): Error => {
+      const err = new Error("boom");
+      err.stack = "Error: boom\n    at fixed (fixed.js:1:1)";
+      return err;
+    };
+
+    it.each([
+      [
+        "a single-line string",
+        (logger: winston.Logger) => logger.info("hello world"),
+        `${GREEN}[INFO]${CLOSE} (pcm-bytes)\n${GREEN}hello world${CLOSE}\n\n`,
+      ],
+      [
+        "a string with metadata (the metadata block stays uncolored)",
+        (logger: winston.Logger) => logger.info("hello", { k: 1 }),
+        `${GREEN}[INFO]${CLOSE} (pcm-bytes)\n${GREEN}hello${CLOSE}\n{\n  "k": 1\n}\n\n`,
+      ],
+      [
+        "an Error (message colored, stack uncolored)",
+        (logger: winston.Logger) => logger.error(fixedError()),
+        `${RED}[ERROR]${CLOSE} (pcm-bytes)\n${RED}boom${CLOSE}\nError: boom\n    at fixed (fixed.js:1:1)\n\n`,
+      ],
+      [
+        "an empty string (never wrapped)",
+        (logger: winston.Logger) => logger.info(""),
+        `${GREEN}[INFO]${CLOSE} (pcm-bytes)\n\n\n`,
+      ],
+      [
+        "a null message",
+        (logger: winston.Logger) => logger.info(null as unknown as string),
+        `${GREEN}[INFO]${CLOSE} (pcm-bytes)\n${GREEN}null${CLOSE}\n\n`,
+      ],
+      [
+        "a debug-level string (a non-default color)",
+        (logger: winston.Logger) => {
+          logger.level = "debug";
+          logger.debug("dbg");
+        },
+        `${BLUE}[DEBUG]${CLOSE} (pcm-bytes)\n${BLUE}dbg${CLOSE}\n\n`,
+      ],
+      [
+        "a string carrying a raw carriage return",
+        (logger: winston.Logger) => logger.info("a\rb"),
+        `${GREEN}[INFO]${CLOSE} (pcm-bytes)\n${GREEN}a\rb${CLOSE}\n\n`,
+      ],
+      [
+        "a multi-line string (codes closed and reopened around each newline)",
+        (logger: winston.Logger) => logger.warn("line1\nline2"),
+        `${YELLOW}[WARN]${CLOSE} (pcm-bytes)\n${YELLOW}line1${CLOSE}\n${YELLOW}line2${CLOSE}\n\n`,
+      ],
+    ])("renders %s exactly as before", async (_name, emit, expected) => {
+      const { consoleOut, fileOut } = await render("pcm-bytes", emit);
+
+      expect(consoleOut).toBe(expected);
+      // The console shows exactly what the file shows, minus the timestamp.
+      expect(stripAnsi(consoleOut)).toBe(withoutTimestamp(fileOut));
+    });
+
+    it.each([
+      [
+        "colorize { level: true, message: false }",
+        { level: true, message: false },
+        `${GREEN}[INFO]${CLOSE} (pcm-flags)\nhi\n\n`,
+      ],
+      [
+        "colorize { level: false, message: true }",
+        { level: false, message: true },
+        `[INFO] (pcm-flags)\n${GREEN}hi${CLOSE}\n\n`,
+      ],
+      ["colorize false", false, "[INFO] (pcm-flags)\nhi\n\n"],
+    ] as [string, LoggerOptions["colorize"], string][])(
+      "honors %s for a single-line string",
+      async (_name, colorize, expected) => {
+        const { consoleOut } = await render("pcm-flags", (logger) => logger.info("hi"), {
+          colorize,
+        });
+
+        expect(consoleOut).toBe(expected);
+      },
+    );
+  });
+
+  it("keeps a message that carries its own color-close code colored to the end", async () => {
+    const { consoleOut, fileOut } = await render("pcm-close-code", (logger) =>
+      logger.info(`x${CLOSE}y`),
+    );
+
+    // @colors/colors reopens the level color at an embedded close code, so the
+    // tail of the message is never left uncolored (unchanged behavior).
+    expect(consoleOut).toBe(
+      `${GREEN}[INFO]${CLOSE} (pcm-close-code)\n${GREEN}x${GREEN}y${CLOSE}\n\n`,
+    );
+    // The file keeps the caller's bytes verbatim; only the console recolors.
+    expect(withoutTimestamp(fileOut)).toBe(`[INFO] (pcm-close-code)\nx${CLOSE}y\n\n`);
+  });
+
+  describe("a message neither JSON nor String() can express", () => {
+    const nullPrototypeUndefinedJson = (): unknown =>
+      Object.assign(Object.create(null) as object, { toJSON: () => undefined });
+    const functionWithThrowingToString = (): unknown => {
+      const fn = (): number => 1;
+      Object.defineProperty(fn, "toString", {
+        value: () => {
+          throw new Error("toString refused");
+        },
+      });
+      return fn;
+    };
+
+    it.each([
+      ["a null-prototype object whose toJSON returns undefined", nullPrototypeUndefinedJson],
+      ["a function whose toString throws", functionWithThrowingToString],
+    ])("renders %s as the sentinel instead of throwing", async (_name, build) => {
+      let thrown: unknown;
+      const { consoleOut, fileOut } = await render("pcm-inexpressible", (logger) => {
+        try {
+          logger.info(build());
+        } catch (err) {
+          thrown = err;
+        }
+      });
+
+      expect(thrown).toBeUndefined();
+      expect(withoutTimestamp(fileOut)).toBe("[INFO] (pcm-inexpressible)\n[UNSERIALIZABLE]\n\n");
+      expect(consoleOut).toBe(
+        `${GREEN}[INFO]${CLOSE} (pcm-inexpressible)\n${GREEN}[UNSERIALIZABLE]${CLOSE}\n\n`,
+      );
+    });
+  });
+
+  it("wraps an escaped multi-line message in exactly one color pair, like any single line", async () => {
+    const { consoleOut, fileOut } = await render(
+      "pcm-escaped",
+      (logger) => logger.warn("line1\nline2"),
+      { escapeMessageNewlines: true },
+    );
+
+    // The escaped message is one physical line, so it is colored as one unit.
+    expect(consoleOut).toBe(
+      `${YELLOW}[WARN]${CLOSE} (pcm-escaped)\n${YELLOW}line1\\nline2${CLOSE}\n\n`,
+    );
+    expect(stripAnsi(consoleOut)).toBe(withoutTimestamp(fileOut));
+    // No raw newline survives inside the message: the escape still holds.
+    expect(consoleOut.split("\n")).toHaveLength(4);
+  });
+
+  it.each(colorizeModes)(
+    "renders an entry whose level has no configured color as plain text under %s instead of throwing",
+    async (_title, colorize) => {
+      const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+      let thrown: unknown;
+      const { consoleOut, fileOut } = await render(
+        "pcm-unknown-level",
+        (logger) => {
+          // An empty logger level lets every inheriting transport accept any
+          // entry, so an entry with an unknown level reaches the console format.
+          logger.level = "";
+          try {
+            logger.log({ level: "bogus", message: "no color for this level" });
+          } catch (err) {
+            thrown = err;
+          }
+        },
+        { colorize },
+      );
+
+      expect(thrown).toBeUndefined();
+      expect(consoleOut).toBe("[BOGUS] (pcm-unknown-level)\nno color for this level\n\n");
+      expect(withoutTimestamp(fileOut)).toBe(
+        "[BOGUS] (pcm-unknown-level)\nno color for this level\n\n",
+      );
+      // winston itself reports the unknown level; nothing else is written to stderr.
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledWith("[winston] Unknown logger level: %s", "bogus");
     },
   );
 });

@@ -340,6 +340,12 @@ export interface LoggerOptions {
    *   prefix; `message` colorizes the message body; `all` overrides both
    *   flags and colorizes everything when `true`.
    *
+   * The message body is colorized AFTER it is rendered, so the console shows
+   * the same message text as the file line (an `undefined` message reads
+   * `undefined`, a BigInt its digits, an object or array its full-depth JSON);
+   * only the color codes differ. A level with no configured color is rendered
+   * without color.
+   *
    * File transports are NEVER colorized regardless of this option.
    */
   colorize?: boolean | { message?: boolean; level?: boolean; all?: boolean };

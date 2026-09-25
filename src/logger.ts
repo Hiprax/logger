@@ -597,6 +597,16 @@ const normalizeTimezones = (zones?: string | string[]): string[] => {
   return unique;
 };
 
+/**
+ * The public `colorize(lookup, text)` helper a `winston.format.colorize()`
+ * instance exposes: wraps `text` in the ANSI codes configured for the `lookup`
+ * level (logform substitutes the second argument as the text when the third is
+ * omitted).
+ */
+interface Colorizer {
+  colorize: (level: string, message: string) => string;
+}
+
 interface FormatOptions {
   includeTimestamps?: boolean;
   /**
@@ -606,7 +616,20 @@ interface FormatOptions {
    * File transports never receive a colorizer; the option is intended for the
    * console transport only.
    */
-  levelColorizer?: { colorize: (level: string, message: string) => string };
+  levelColorizer?: Colorizer;
+  /**
+   * When provided, the printf formatter wraps the FINAL rendered message
+   * string (after non-string values are serialized and after
+   * `escapeMessageNewlines` is applied) in the ANSI codes for the entry's
+   * level, looked up with the same key as the `[LEVEL]` token. Colorizing the
+   * rendered string rather than the raw `info.message` is what keeps the
+   * console's visible text identical to the file line: winston's
+   * `format.colorize({ message: true })` ran on the raw value, so an
+   * `undefined` message rendered as the level name, a BigInt as `123n`, and an
+   * object through `util.inspect` (depth-limited). When omitted, the message is
+   * emitted uncolored. Console transport only, like `levelColorizer`.
+   */
+  messageColorizer?: Colorizer;
   /**
    * Lowercased set of metadata keys whose values should be replaced with
    * `"[REDACTED]"` BEFORE the metadata is serialized into the log line.
@@ -631,16 +654,20 @@ interface FormatOptions {
 /**
  * Resolves the user-facing `colorize` option to a normalized
  * `{ level, message }` flag pair. The flags are honored independently by the
- * console pipeline:
- * - `level: true` wraps the `[LEVEL]` token in winston colorize ANSI codes.
- * - `message: true` runs winston's `format.colorize({ message: true })` over
- *   the message body.
+ * console pipeline's `formatMessage` printf, which uses one winston
+ * `colorize()` colorizer for both:
+ * - `level: true` wraps the `[LEVEL]` token in winston colorize ANSI codes
+ *   (`levelColorizer`).
+ * - `message: true` wraps the FINAL rendered message (the same text the file
+ *   line shows, after `escapeMessageNewlines`) in the codes for the entry's
+ *   level (`messageColorizer`). No colorize transform runs on the raw
+ *   `info.message`.
  *
  * Special-case behavior:
  * - `undefined` / `true` → `{ level: true, message: true }` (back-compat-ish
  *   default; the level token also gets colorized now).
- * - `false` → `{ level: false, message: false }` (no colorize transform on
- *   the console transport).
+ * - `false` → `{ level: false, message: false }` (no colors on the console
+ *   transport).
  * - object with `all: true` → both flags are forced `true`, overriding the
  *   per-flag values.
  * - object with `all: false` → both flags are forced `false`.
@@ -1442,18 +1469,58 @@ const neutralizeCallerAccessors = winston.format((info) => {
   return next as unknown as winston.Logform.TransformableInfo;
 })();
 
+/**
+ * `String(value)` that cannot throw. It is the last resort for a message that
+ * `JSON.stringify` cannot express (a function, a symbol, `undefined`, or a
+ * `toJSON` returning `undefined`); `String()` itself throws for a
+ * null-prototype object or a throwing `toString`, which would escape the
+ * caller's own `logger.info(...)` because the printf runs synchronously. Fails
+ * closed to `UNSERIALIZABLE`.
+ */
+const safeString = (value: unknown): string => {
+  try {
+    return String(value);
+  } catch {
+    return UNSERIALIZABLE;
+  }
+};
+
+/**
+ * Applies an optional colorizer, falling back to the uncolored text when the
+ * colorizer throws. logform's `Colorizer.colorize` indexes `@colors/colors` by
+ * the color configured for the lookup level, so a level with no configured
+ * color throws `TypeError: colors[...] is not a function`. Such an entry
+ * reaches the console when a transport accepts every level (an empty
+ * `logger.level` makes every inheriting transport do so) and the caller logs
+ * `logger.log({ level: "bogus", ... })`; the throw would escape the caller's own
+ * `logger.log(...)`, because the transport re-throws format errors. Color is
+ * cosmetic, so the text is rendered plain instead.
+ */
+const applyColorizer = (colorizer: Colorizer | undefined, lookup: string, text: string): string => {
+  if (!colorizer) {
+    return text;
+  }
+  try {
+    return colorizer.colorize(lookup, text);
+  } catch {
+    return text;
+  }
+};
+
 const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
   winston.format.printf((info) => {
     const {
       includeTimestamps = true,
       levelColorizer,
+      messageColorizer,
       maskMetaKeys,
       escapeMessageNewlines = false,
     } = options;
-    // Strip any ANSI codes a previous colorize() pass may have wrapped around
-    // `info.level` so the uppercase form is clean. winston's colorize()
-    // appends the codes around the LOWERCASE level value when run before this
-    // formatter — re-wrapping is the responsibility of the consumer below.
+    // Strip any ANSI codes a colorize() transform may have wrapped around
+    // `info.level` so the uppercase form is clean. None of this package's
+    // chains runs one (the console colors inside this printf instead), so this
+    // is defensive: winston's colorize() transform wraps the LOWERCASE level
+    // value, and re-wrapping is the responsibility of the consumer below.
     // The strip pattern matches the full ANSI SGR sequence (`\x1b[<digits>m`);
     // the leading `\x1b` (ESC, 0x1B) is required so the regex actually removes
     // the codes instead of leaving the bare ESC byte behind.
@@ -1486,7 +1553,7 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
         ? info.message
         : typeof info.message === "bigint"
           ? info.message.toString()
-          : (safeStringify(info.message, 2) ?? String(info.message));
+          : (safeStringify(info.message, 2) ?? safeString(info.message));
     // When `escapeMessageNewlines` is on, rewrite embedded `\r` / `\n` to their
     // visible escape sequences so a user-supplied payload like
     // `"alice\n[ERROR] (admin)\nfake event"` cannot forge an extra log line that
@@ -1610,11 +1677,17 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
     // resolved by winston's colorize() colorizer for that level. The colorize
     // call is forwarded the LOWERCASE level (winston's color map keys are
     // lowercased) but applies the codes around the supplied display string,
-    // which preserves our uppercase token form.
-    const levelToken = levelColorizer
-      ? levelColorizer.colorize(strippedLevel, `[${level}]`)
-      : `[${level}]`;
-    lines.push(`${levelToken} (${label})`, message);
+    // which preserves our uppercase token form. The message colorizer
+    // (`colorize.message === true`) wraps the FINAL rendered message with the
+    // same lookup key, so the console shows exactly the file's message text
+    // and the token and message colors always agree. Colorizing last also
+    // means an escaped multi-line message (one physical line) gets a single
+    // open/close pair.
+    const levelToken = applyColorizer(levelColorizer, strippedLevel, `[${level}]`);
+    lines.push(
+      `${levelToken} (${label})`,
+      applyColorizer(messageColorizer, strippedLevel, message),
+    );
 
     if (stack) {
       lines.push(typeof stack === "string" ? escapeIfEnabled(stack) : safeStringify(stack, 2));
@@ -2165,27 +2238,24 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     // `winston.format.colorize()` returns a Format-shaped object that ALSO
     // exposes a public `colorize(level, message)` helper used to wrap an
     // arbitrary string in the ANSI codes for a given level. We use that
-    // helper directly inside the printf so the `[LEVEL]` token is colored
-    // without pulling the colorize transform into the pipeline (which would
-    // replace `info.level` with the colored string and break the
-    // formatter's strip pass).
-    const levelColorizer = colorizeFlags.level
-      ? (winston.format.colorize() as unknown as {
-          colorize: (level: string, message: string) => string;
-        })
-      : undefined;
+    // helper directly inside the printf for BOTH the `[LEVEL]` token and the
+    // rendered message, so no colorize transform runs in the pipeline: the
+    // transform would replace `info.level` with the colored string (breaking
+    // the formatter's strip pass) and, with `message: true`, would stringify
+    // the RAW message before the printf renders it (`undefined` became the
+    // level name, a BigInt `123n`, an object `util.inspect` output).
+    const colorizer = winston.format.colorize() as unknown as Colorizer;
     const consoleMessageFormat = formatMessage(ctx, {
       includeTimestamps: false,
-      levelColorizer,
+      levelColorizer: colorizeFlags.level ? colorizer : undefined,
+      messageColorizer: colorizeFlags.message ? colorizer : undefined,
       maskMetaKeys: maskMetaKeySet,
       escapeMessageNewlines,
     });
-    const consoleFormatPieces: winston.Logform.Format[] = [winston.format.errors({ stack: true })];
-    if (colorizeFlags.message) {
-      consoleFormatPieces.push(winston.format.colorize({ message: true }));
-    }
-    consoleFormatPieces.push(consoleMessageFormat);
-    consoleFormat = winston.format.combine(...consoleFormatPieces);
+    consoleFormat = winston.format.combine(
+      winston.format.errors({ stack: true }),
+      consoleMessageFormat,
+    );
   }
 
   const transports: winston.transport[] = [];
