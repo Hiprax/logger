@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-25
+
 ### Security
 
 - **`redactPaths` can no longer write through the prototype chain or into your application's objects** (`src/request-middleware.ts`, `README.md`; tests in `tests/request-middleware.spec.ts`). Resolves the CodeQL `js/prototype-polluting-assignment` finding (CWE-1321) on the path walker. The walker read each path segment as `container[segment]`, which follows inherited properties and runs getters, and it checked only the final target before writing. The `__proto__` / `constructor` / `prototype` deny-list kept it off `Object.prototype` itself, but three real defects remained:
