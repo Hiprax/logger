@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Security
+
+- **`redactPaths` can no longer write through the prototype chain or into your application's objects** (`src/request-middleware.ts`, `README.md`; tests in `tests/request-middleware.spec.ts`). Resolves the CodeQL `js/prototype-polluting-assignment` finding (CWE-1321) on the path walker. The walker read each path segment as `container[segment]`, which follows inherited properties and runs getters, and it checked only the final target before writing. The `__proto__` / `constructor` / `prototype` deny-list kept it off `Object.prototype` itself, but three real defects remained:
+  - A path through an object parked on `Object.prototype` (by a library, or in an already polluted process) reached that one shared object and overwrote its field for every object in the process.
+  - A path through a response-header value kept by reference, such as a class instance with its own `toJSON()` or a `Date` carrying an own object field (`res.setHeader` stores non-string values as they are), reached a plain object your application owned and overwrote its field in the running app. With `redactPaths: ["responseHeaders.x-meta.inner.token"]`, `inner.token` read `"[REDACTED]"` after the request was logged.
+  - A getter on the path ran (application code during logging), and one that threw escaped the path pass, so the whole request went unlogged.
+  - The walker now steps through and writes into only the containers the package owns (arrays and objects whose prototype is exactly `Object.prototype`), reads only own data properties through their descriptors (never an inherited property, never an accessor), refuses `__proto__`, `constructor` and `prototype` on every segment with literal comparisons, and never throws. Every path that redacted before still redacts the same copy; a path that runs into a value kept by reference now stops there. If such a header's `toJSON()` printed the field the old write overwrote, the log line hid it only by corrupting your object; mask that header as a whole with `maskHeaderKeys` instead. No option or output format changes.
+
 ## [1.2.0] - 2026-09-25
 
 ### Changed

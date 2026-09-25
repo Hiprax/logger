@@ -1452,6 +1452,93 @@ describe("createRequestLogger", () => {
     expect(liveRe.lastIndex).toBe(3);
   });
 
+  it.each([
+    [
+      "a class instance with its own toJSON()",
+      (): { value: unknown; inner: { token: string } } => {
+        class Meta {
+          public inner = { token: "LIVE-TOKEN" };
+          public toJSON(): string {
+            return "meta";
+          }
+        }
+        const value = new Meta();
+        return { value, inner: value.inner };
+      },
+      '{"x-meta":"meta"}',
+    ],
+    [
+      "a Date carrying an own object field",
+      (): { value: unknown; inner: { token: string } } => {
+        const inner = { token: "LIVE-TOKEN" };
+        return { value: Object.assign(new Date(0), { inner }), inner };
+      },
+      '{"x-meta":"1970-01-01T00:00:00.000Z"}',
+    ],
+  ])(
+    "redactPaths never writes through %s shared by a response header into the app's own object",
+    (_label, make, rendered) => {
+      // A header value that defines `toJSON()` is kept by reference (it renders
+      // through that method), so everything reachable from it is the
+      // application's live state. A path must stop at it, not walk through it
+      // into a plain object the application owns and overwrite a field there.
+      const { value, inner } = make();
+
+      const { logger, log } = createMockLogger();
+      const middleware = createRequestLogger({
+        logger,
+        includeHttpContext: true,
+        includeResponseHeaders: true,
+        redactPaths: ["responseHeaders.x-meta.inner.token"],
+      });
+
+      const { res } = runMiddleware(middleware, {}, { getHeaders: () => ({ "x-meta": value }) });
+      res.emit("finish");
+
+      expect(log).toHaveBeenCalledTimes(1);
+      // The application's object keeps its value ...
+      expect(inner).toEqual({ token: "LIVE-TOKEN" });
+      // ... and the header renders exactly as its toJSON() renders it.
+      expect(JSON.stringify(log.mock.calls[0][0].http.responseHeaders)).toBe(rendered);
+    },
+  );
+
+  it("a throwing getter on a shared header value's prototype is never run and cannot drop the entry", () => {
+    // A class instance with no enumerable own keys is kept by reference. A path
+    // into it used to read `detail` through the prototype, running the
+    // application's getter; its throw escaped the path pass and the whole
+    // request went unlogged.
+    let reads = 0;
+    class Lazy {
+      public get detail(): Record<string, unknown> {
+        reads += 1;
+        throw new Error("getter ran");
+      }
+    }
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeResponseHeaders: true,
+      redactPaths: ["responseHeaders.x-lazy.detail.token", "responseHeaders.x-secret"],
+    });
+
+    const { res } = runMiddleware(
+      middleware,
+      {},
+      { getHeaders: () => ({ "x-lazy": new Lazy(), "x-secret": "HEADER-SECRET" }) },
+    );
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    // The other path still applies to the same entry.
+    expect(log.mock.calls[0][0].http.responseHeaders["x-secret"]).toBe("[REDACTED]");
+    expect(reads).toBe(0);
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
   it("copying a header array changes nothing a consumer sees (output equivalence)", () => {
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
@@ -2694,6 +2781,7 @@ describe("request middleware internals", () => {
     resolveMaskQueryKeys,
     DEFAULT_MASKED_HEADER_KEYS,
     DEFAULT_MASKED_QUERY_KEYS,
+    FORBIDDEN_OBJECT_KEYS,
   } = __requestInternals;
 
   it("serializes primitive bodies and truncates strings", () => {
@@ -3335,6 +3423,81 @@ describe("request middleware internals", () => {
     const entry = { context: throwing } as unknown as Record<string, unknown>;
     expect(() => redactEntryPath(entry, "context.token")).not.toThrow();
     expect((throwing as { token: string }).token).toBe("SECRET");
+  });
+
+  it("redactEntryPath never writes into an object reachable only through the prototype chain", () => {
+    // Stand-in for a runtime where something already parked an object on
+    // `Object.prototype` (a polluted process, or a library doing it on purpose).
+    // A walk that reads inherited properties reaches that ONE shared object from
+    // every plain object, so a path through it rewrites state every object in
+    // the process sees. The walk must follow own properties only.
+    Object.defineProperty(Object.prototype, "sharedDefaults", {
+      value: { token: "GLOBAL" },
+      configurable: true,
+      writable: true,
+      enumerable: false,
+    });
+    try {
+      const entry = { context: { own: 1 } } as unknown as Record<string, unknown>;
+      redactEntryPath(entry, "context.sharedDefaults.token");
+      expect(
+        (Object.prototype as unknown as { sharedDefaults: { token: string } }).sharedDefaults,
+      ).toEqual({ token: "GLOBAL" });
+      expect(entry).toEqual({ context: { own: 1 } });
+    } finally {
+      delete (Object.prototype as unknown as Record<string, unknown>).sharedDefaults;
+    }
+  });
+
+  it("redactEntryPath never runs a getter on the path (own data properties only)", () => {
+    let reads = 0;
+    const context = {
+      get nested(): Record<string, unknown> {
+        reads += 1;
+        return { token: "SECRET" };
+      },
+    };
+    const entry = { context } as unknown as Record<string, unknown>;
+    expect(() => redactEntryPath(entry, "context.nested.token")).not.toThrow();
+    expect(reads).toBe(0);
+  });
+
+  it("redactEntryPath swallows a throw while reading the path (Proxy with a throwing descriptor trap)", () => {
+    const nested = { token: "SECRET" };
+    const hostile = new Proxy(
+      { nested },
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error("descriptor trap boom");
+        },
+      },
+    );
+    const entry = { context: hostile } as unknown as Record<string, unknown>;
+    expect(() => redactEntryPath(entry, "context.nested.token")).not.toThrow();
+    // Nothing behind the unreadable step is written.
+    expect(nested).toEqual({ token: "SECRET" });
+  });
+
+  it("redactEntryPath refuses every FORBIDDEN_OBJECT_KEYS member as a middle or final segment, even as an own key", () => {
+    // `JSON.parse` mints each forbidden name as an OWN data property, which an
+    // own-property walk would otherwise follow or overwrite. The walk compares
+    // segments against literal names, so this pins that list to the Set.
+    expect([...FORBIDDEN_OBJECT_KEYS].sort()).toEqual(["__proto__", "constructor", "prototype"]);
+    for (const key of FORBIDDEN_OBJECT_KEYS) {
+      const own = JSON.parse(`{"${key}": {"token": "T"}, "k": {"${key}": "V"}}`) as Record<
+        string,
+        Record<string, unknown>
+      >;
+      const entry = { context: own } as unknown as Record<string, unknown>;
+
+      redactEntryPath(entry, `context.${key}.token`);
+      redactEntryPath(entry, `context.k.${key}`);
+
+      expect(Object.getOwnPropertyDescriptor(own, key)?.value).toEqual({ token: "T" });
+      expect(Object.getOwnPropertyDescriptor(own.k, key)?.value).toBe("V");
+      expect(Object.getPrototypeOf(own.k)).toBe(Object.prototype);
+    }
+    expect(({} as Record<string, unknown>).token).toBeUndefined();
   });
 
   it("resolveMaskHeaderKeys returns undefined when option is false and the default set otherwise", () => {
