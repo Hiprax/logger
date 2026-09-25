@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Security
+
+- **`redactPaths` can no longer write through the prototype chain or into your application's objects** (`src/request-middleware.ts`, `README.md`; tests in `tests/request-middleware.spec.ts`). Resolves the CodeQL `js/prototype-polluting-assignment` finding (CWE-1321) on the path walker. The walker read each path segment as `container[segment]`, which follows inherited properties and runs getters, and it checked only the final target before writing. The `__proto__` / `constructor` / `prototype` deny-list kept it off `Object.prototype` itself, but three real defects remained:
+  - A path through an object parked on `Object.prototype` (by a library, or in an already polluted process) reached that one shared object and overwrote its field for every object in the process.
+  - A path through a response-header value kept by reference, such as a class instance with its own `toJSON()` or a `Date` carrying an own object field (`res.setHeader` stores non-string values as they are), reached a plain object your application owned and overwrote its field in the running app. With `redactPaths: ["responseHeaders.x-meta.inner.token"]`, `inner.token` read `"[REDACTED]"` after the request was logged.
+  - A getter on the path ran (application code during logging), and one that threw escaped the path pass, so the whole request went unlogged.
+  - The walker now steps through and writes into only the containers the package owns (arrays and objects whose prototype is exactly `Object.prototype`), descends from the entry only into the fields it copies (`requestBody`, `requestHeaders`, `responseHeaders`, `context`; a one-segment path such as `url` still redacts that field), reads only own data properties through their descriptors (never an inherited property, never an accessor, and the descriptor's own `value` / `writable`, so a polluted `Object.prototype.value` cannot make an accessor look writable and get its setter called), refuses `__proto__`, `constructor` and `prototype` on every segment with literal comparisons, and never throws, whatever the path holds. Every path that redacted before still redacts the same copy; a path that runs into a value kept by reference now stops there. If such a header's `toJSON()` printed the field the old write overwrote, the log line hid it only by corrupting your object; mask that header as a whole with `maskHeaderKeys` instead.
+  - `includeRequestHeaders` / `includeResponseHeaders` allow-lists now read only headers the request or response actually has. A listed header it lacked picked up a same-named property inherited from a polluted `Object.prototype`, logged it as that header, and passed the shared object to the path pass.
+  - A non-string entry in the `redactPaths` array is ignored. The middleware keeps using your array, so a path added after it was created still applies, but the construction-time check cannot see such an entry, and a non-string one made every request go unlogged.
+  - No option or output format changes.
+
 ## [1.2.0] - 2026-09-25
 
 ### Changed

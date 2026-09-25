@@ -439,12 +439,13 @@ const ownContext = (enriched: Record<string, unknown>): Record<string, unknown> 
 
 /**
  * Property names that must NEVER be assigned through `acc[key] = …` when
- * rebuilding a header bag or walking a `redactPaths` segment. `__proto__`
- * invokes the prototype setter (mutating the local object's prototype chain
- * AND, when the path-walker reaches `Object.prototype`, the global prototype
- * itself). `constructor` / `prototype` are likewise structural fields whose
- * assignment can corrupt instanceof checks. Mirrors the deny-list inside
+ * rebuilding a header bag, nor followed or written by a `redactPaths` segment.
+ * `__proto__` invokes the prototype setter (mutating the local object's
+ * prototype chain). `constructor` / `prototype` are likewise structural fields
+ * whose assignment can corrupt instanceof checks. Mirrors the deny-list inside
  * `src/redact.ts` for a single source of truth across the package.
+ * `redactEntryPath` spells the same three names as literal comparisons (so
+ * static analysis can see the guard); a test keeps that list equal to this Set.
  */
 const FORBIDDEN_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -515,11 +516,12 @@ const applyHeaderMask = (
  * (`Map`, `Set`, `RegExp`) by identity — its documented rule for values owning
  * no key-addressable *string* secret. Those are therefore still shared with the
  * caller by reference. That sharing is safe ONLY because {@link redactEntryPath}
- * refuses to write into any target that is not an owned plain object or array:
- * a `Buffer`'s writable integer indices and a `RegExp`'s writable `lastIndex`
- * DO pass a bare `hasOwnProperty` + writable-descriptor check, so the earlier
- * claim that "such a value exposes none a path would target" was false — the
- * guarantee is enforced at the write site, not by the shape of these values.
+ * refuses to step through or write into anything that is not an owned plain
+ * object or array: a `Buffer`'s writable integer indices and a `RegExp`'s
+ * writable `lastIndex` DO pass a bare `hasOwnProperty` + writable-descriptor
+ * check, and a plain object hanging off a shared `toJSON`-defining value is the
+ * application's own, so the guarantee is enforced by the walk, on every step,
+ * not by the shape of these values.
  */
 const EMPTY_HEADER_MASK = new Set<string>();
 
@@ -581,7 +583,14 @@ const normalizeHeaders = (
     if (FORBIDDEN_OBJECT_KEYS.has(normalizedKey)) {
       return acc;
     }
-    if (normalized[normalizedKey] !== undefined) {
+    // Own keys only: `normalized` is an ordinary object, so a plain read of a
+    // header the request did not send would return whatever an inherited
+    // (polluted) `Object.prototype` property holds, log it as that header, and
+    // hand the shared object to the `redactPaths` pass by reference.
+    if (
+      Object.prototype.hasOwnProperty.call(normalized, normalizedKey) &&
+      normalized[normalizedKey] !== undefined
+    ) {
       acc[normalizedKey] = normalized[normalizedKey];
     }
     return acc;
@@ -727,6 +736,43 @@ const safeRedactedUrl = (
 };
 
 /**
+ * The entry fields a multi-segment `redactPaths` entry may descend into: the
+ * sub-graphs the package copies before the path pass (`requestBody` via
+ * `serializeBody`, the two header bags via `normalizeHeaders`, `context` via
+ * `ownContext`). The other fields (`method`, `url`, `ip`, `userAgent`,
+ * `requestId`, ...) are taken from the request as they are and typed as
+ * primitives; an adapter that breaks those types (a `req.get()` returning its
+ * own live array) would otherwise hand the walk the application's object. A
+ * single-segment path (`url`, `userAgent`) still redacts the field itself.
+ */
+const PATH_ROOT_FIELDS = new Set(["requestBody", "requestHeaders", "responseHeaders", "context"]);
+
+/**
+ * Whether `value` is a container {@link redactEntryPath} may step through or
+ * write into: an array, or an object whose prototype is exactly
+ * `Object.prototype`. Every container the package owns for redaction has one of
+ * these two shapes (JSON round-trip copies, the rebuilt header bag, and
+ * `redactValue`'s copies, which turn even an `Object.create(null)` input into a
+ * fresh `{}`), and every value the entry shares with the caller BY REFERENCE (a
+ * `Date`, a class instance, a `Buffer` / typed array, a `RegExp`, a `Map` /
+ * `Set`) has neither, so this is the ownership test. `Object.prototype` itself
+ * fails it (its prototype is `null`). A Proxy trap that throws here is caught by
+ * the caller's try/catch.
+ *
+ * Boundary: the test is by shape, so it trusts the copies to be fresh. They are
+ * for everything a request can carry (JSON round-trips, and `redactValue`'s
+ * rebuilds of plain objects). An application that builds a header value
+ * itself can still defeat it: an array with its own `map` or a replaced
+ * `constructor` / `Symbol.species` (the copy is made with `value.map` in
+ * `src/redact.ts`), or a Proxy whose `getPrototypeOf` trap answers differently
+ * on each call, can hand the walk an object the application owns.
+ */
+const isOwnedPathContainer = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" &&
+  value !== null &&
+  (Array.isArray(value) || Object.getPrototypeOf(value) === Object.prototype);
+
+/**
  * Surgically redacts a value at the supplied dot-notation path on the entry
  * object. Missing intermediate keys are a no-op (we never create new sub-paths
  * just to write `[REDACTED]`). Mutates the passed object in place — callers
@@ -739,120 +785,102 @@ const safeRedactedUrl = (
  * - `requestBody.user.password` is also accepted as the explicit form.
  * - `context.user.token` → `entry.context.user.token = "[REDACTED]"`.
  *
- * The final assignment is **best-effort and never throws**: an array `length`
- * target, a getter-only / accessor property, a non-writable (frozen) slot, or
- * any other value whose write would raise (a `Proxy` with a throwing `set`
- * trap) is skipped rather than allowed to propagate. This is load-bearing —
- * `finalize()` applies these paths inside the same try block that assembles the
- * whole entry, so a throwing redaction would otherwise drop the ENTIRE log line
- * (method, url, status included) over one path. Callers that must guarantee the
- * caller's own object is never mutated by these in-place writes should pass a
- * fully-owned copy of the target sub-graph (as `finalize()` does for
- * `entry.context` and `serializeBody()` does for `entry.requestBody`).
+ * **The walk only ever passes through, and writes into, containers the package
+ * owns, and it only follows OWN DATA properties.** Each step must be an array or
+ * a plain object whose prototype is exactly `Object.prototype` (see
+ * {@link isOwnedPathContainer}), and each segment is read through
+ * `Object.getOwnPropertyDescriptor`, never `container[segment]`. Four
+ * guarantees follow, each pinned by a test:
+ * 1. **No prototype is ever reached.** An inherited property is not an own
+ *    property, so the walk cannot step onto `Object.prototype` or onto an object
+ *    parked there, and `__proto__` / `constructor` / `prototype` segments are
+ *    refused outright (literal comparisons, below). The earlier walk read
+ *    `cursor[segment]` through the prototype chain and relied on the deny-list
+ *    alone; a path through an object held on `Object.prototype` rewrote that
+ *    one object for the whole process, and CodeQL
+ *    (`js/prototype-polluting-assignment`, CWE-1321) flagged the write.
+ * 2. **The caller's live objects are never written.** Everything the package
+ *    owns for redaction is a plain object or an array (the `ownContext` /
+ *    `serializeBody` JSON round-trips, the `normalizeHeaders` bag and its
+ *    `ownHeaderValue` copies), and from the entry itself a path descends only
+ *    into those copied fields ({@link PATH_ROOT_FIELDS}). Any other value in
+ *    the entry (a `Date`, a class instance with its own `toJSON()`, a
+ *    `Buffer`, a `RegExp`, a `Map`, an adapter's non-string field) was kept BY
+ *    REFERENCE, so everything behind it is the application's state: the walk
+ *    stops there. Checking only the final target was not enough: a path
+ *    through a `toJSON`-defining response-header value reached a plain object
+ *    the application owned and overwrote its field.
+ * 3. **No caller code runs.** An accessor is never invoked, on the path or at
+ *    the target; the earlier walk ran inherited and own getters on the way.
+ *    Descriptor fields are read as the descriptor's OWN properties, so an
+ *    inherited (polluted) `value` / `writable` cannot make an accessor look
+ *    like a writable data slot and get its setter called.
+ * 4. **It never throws**, whatever `path` holds. Anything that throws while
+ *    splitting, reading or writing (a Proxy trap, an exotic host object) turns
+ *    the path into a no-op. This is load-bearing: `finalize()` applies these
+ *    paths inside the same try block that assembles the whole entry, so a
+ *    throw here dropped the ENTIRE log line (method, url, status included)
+ *    over one path.
+ *
+ * Other no-ops: a missing segment, a non-object step, an array `length`
+ * target, and a non-writable (frozen) slot.
  */
 const redactEntryPath = (entry: Record<string, unknown>, path: string): void => {
-  if (!path) {
+  // A non-string is never split: an object carrying its own `split` method
+  // would otherwise run caller code here.
+  if (typeof path !== "string" || path === "") {
     return;
   }
-  const segments = path.split(".").filter(Boolean);
-  if (segments.length === 0) {
-    return;
-  }
-  // Prototype-pollution guard, part 1 — INTERMEDIATE segments. A path like
-  // `body.__proto__.toString` would otherwise walk
-  // `cursor[segments[i]]` into `Object.prototype` and then assign on the
-  // (legitimate) final segment, mutating the global prototype. The deny-list
-  // mirrors the FORBIDDEN_OBJECT_KEYS set used by the header accumulators and
-  // the `redactValue` rebuild — single source of truth for prototype-pollution
-  // hardening across the package. (Part 2, the final-segment check, lives
-  // just above the assignment below.)
-  for (let i = 0; i < segments.length - 1; i += 1) {
-    if (FORBIDDEN_OBJECT_KEYS.has(segments[i])) {
-      return;
-    }
-  }
-  // Map the user-facing `body` alias to the on-entry `requestBody` field.
-  if (segments[0] === "body") {
-    segments[0] = "requestBody";
-  }
-
-  let cursor: unknown = entry;
-  for (let i = 0; i < segments.length - 1; i += 1) {
-    if (!cursor || typeof cursor !== "object") {
-      return;
-    }
-    cursor = (cursor as Record<string, unknown>)[segments[i]];
-  }
-  if (!cursor || typeof cursor !== "object") {
-    return;
-  }
-  const finalKey = segments[segments.length - 1];
-  // Prototype-pollution guard, part 2 — FINAL segment. Blocks an assignment
-  // of the form `target.__proto__ = "[REDACTED]"` (which would invoke the
-  // setter and clobber `target`'s prototype chain). This guard runs BEFORE
-  // the `hasOwnProperty` filter so CodeQL's taint flow for
-  // `js/prototype-polluting-assignment` (CWE-1321) can statically prove the
-  // assignment cannot reach a prototype slot.
-  if (FORBIDDEN_OBJECT_KEYS.has(finalKey)) {
-    return;
-  }
-  const target = cursor as Record<string, unknown>;
-  if (!Object.prototype.hasOwnProperty.call(target, finalKey)) {
-    return;
-  }
-  // Never overwrite an array's `length`. `hasOwnProperty(arr, "length")` is
-  // `true`, but assigning a non-numeric value throws
-  // `RangeError: Invalid array length`; without this guard
-  // `redactPaths:["body.tags.length"]` would throw and `finalize()`'s catch
-  // would drop the ENTIRE log entry over a single path.
-  if (Array.isArray(target) && finalKey === "length") {
-    return;
-  }
-  // Only ever write into a container the package FULLY OWNS: a plain object
-  // (produced by the `ownContext` / `serializeBody` JSON round-trips or the
-  // `normalizeHeaders` bag rebuild) or an array (an owned header/body array).
-  // Every other reachable target is a value that `redactValue` handed back BY
-  // IDENTITY — a `Date`, a `Buffer` / typed-array, a `RegExp`, a bare `Error`,
-  // a `Map` / `Set` — i.e. STILL SHARED with the caller. Those are pass-through
-  // precisely because they own no key-addressable *string* secret, but that is
-  // not the same as owning no writable own key a numeric/reserved path could
-  // hit: a binary view exposes writable integer-index data properties
-  // (`Object.keys(Buffer.from([1,2,3]))` → `["0","1","2"]`) and a `RegExp` a
-  // writable `lastIndex`, both of which pass the `hasOwnProperty` + writable-
-  // descriptor guards below. Without this check
-  // `redactPaths:["responseHeaders.x-buf.0"]` over a `Buffer`-valued response
-  // header — reachable in plain Node, since `res.setHeader` stores non-string
-  // values unmodified and `res.getHeaders()` hands the same reference back —
-  // would coerce and zero a byte of the application's LIVE Buffer, the exact
-  // caller-mutation `ownHeaderValue` exists to prevent. Restricting the write
-  // to owned plain containers closes that whole class centrally and excludes
-  // nothing legitimate: every value the package owns for redaction (after the
-  // round-trips and the `forceCopy` header rebuild) is a plain object or an
-  // array, never one of these pass-through built-ins. (`redactValue` rebuilds
-  // every plain object into a fresh `{}` with `Object.prototype`, even an
-  // `Object.create(null)` input, so a null-prototype target is unreachable here
-  // and is not admitted — that keeps the guard's branches exactly the reachable
-  // ones: array, `Object.prototype`, or skip.)
-  if (!Array.isArray(target) && Object.getPrototypeOf(target) !== Object.prototype) {
-    return;
-  }
-  // Only overwrite a writable data property. A frozen target
-  // (`writable === false`), a getter-only / accessor property (`get` / `set`),
-  // or any other non-assignable slot cannot be written — in strict mode the
-  // assignment throws, and that throw would propagate to `finalize()`'s catch
-  // and drop the whole entry. Logging is best-effort, so a redaction that
-  // cannot be applied degrades to a no-op on that path instead.
-  const descriptor = Object.getOwnPropertyDescriptor(target, finalKey);
-  if (!descriptor || descriptor.get || descriptor.set || descriptor.writable === false) {
-    return;
-  }
-  // Defense-in-depth: even a writable data property can throw on assignment
-  // (an exotic host object, or a `Proxy` with a throwing `set` trap). A failed
-  // redaction must never take the log line down with it.
   try {
-    target[finalKey] = REDACTED;
+    const segments = path.split(".").filter(Boolean);
+    if (segments.length === 0) {
+      return;
+    }
+    // Map the user-facing `body` alias to the on-entry `requestBody` field.
+    if (segments[0] === "body") {
+      segments[0] = "requestBody";
+    }
+    const lastIndex = segments.length - 1;
+    let container: unknown = entry;
+    for (let i = 0; i <= lastIndex; i += 1) {
+      const key = segments[i];
+      // Prototype-pollution guard, checked on every segment at the point of
+      // use. Same names as FORBIDDEN_OBJECT_KEYS, written as the literal
+      // comparisons CodeQL's documentation recommends (it does not treat
+      // `Set.prototype.has` as a guard). The CodeQL finding itself is closed by
+      // the walk having no `container[key]` read at all. A test iterates
+      // FORBIDDEN_OBJECT_KEYS against this walk, so the two lists cannot drift
+      // apart.
+      if (key === "__proto__" || key === "constructor" || key === "prototype") {
+        return;
+      }
+      // From the entry itself, descend only into a sub-graph the package copied.
+      if (i === 0 && i < lastIndex && !PATH_ROOT_FIELDS.has(key)) {
+        return;
+      }
+      if (!isOwnedPathContainer(container)) {
+        return;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(container, key);
+      // Own data properties only: an absent (possibly inherited) property or an
+      // accessor ends the walk without reading it. The descriptor is an
+      // ordinary object, so `value` is tested as its OWN field: `"value" in`
+      // would also see an inherited (polluted) `Object.prototype.value` and
+      // take an accessor for a data property. A data descriptor always owns
+      // `writable` too, so reading it below cannot reach the prototype.
+      if (descriptor === undefined || !Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+        return;
+      }
+      if (i < lastIndex) {
+        container = descriptor.value;
+      } else if (descriptor.writable === true && !(Array.isArray(container) && key === "length")) {
+        // Never an array's `length`: it is an own writable data property, but
+        // assigning a non-numeric value throws `RangeError: Invalid array length`.
+        container[key] = REDACTED;
+      }
+    }
   } catch {
-    // best-effort: leave the value in place rather than dropping the entry
+    // Best-effort: leave the value in place rather than dropping the entry.
   }
 };
 
@@ -1021,6 +1049,10 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
     Array.isArray(maskBodyKeys) && maskBodyKeys.length > 0
       ? new Set(maskBodyKeys.map((key) => key.toLowerCase()))
       : undefined;
+  // The caller's LIVE array, deliberately not a copy: a path an application
+  // adds after creating the middleware keeps applying (a copy would silently
+  // drop it and log what it was meant to hide). Validation above cannot see a
+  // value added later, so `redactEntryPath` ignores any non-string itself.
   const resolvedRedactPaths = Array.isArray(redactPaths) ? redactPaths : [];
 
   return (req: LoggableRequest, res: LoggableResponse, next: LoggableNext) => {
@@ -1230,10 +1262,11 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
         // leaves `Date` / `Buffer` / `RegExp` / `Map`-shaped values shared by
         // identity — `redactValue`'s own rule for values owning no key-
         // addressable string secret. That is safe because `redactEntryPath`
-        // writes ONLY into an owned plain object or array and refuses every
-        // other target, so a path aimed at a shared `Buffer`'s writable integer
-        // index (or a `RegExp`'s `lastIndex`) is a no-op instead of a write into
-        // the caller's live value.
+        // steps through and writes into ONLY owned plain objects and arrays,
+        // following own data properties, so a path aimed at a shared `Buffer`'s
+        // writable integer index, a `RegExp`'s `lastIndex`, or a plain object
+        // behind a shared `toJSON`-defining value is a no-op instead of a write
+        // into the caller's live value.
         if (resolvedRedactPaths.length > 0) {
           resolvedRedactPaths.forEach((path) =>
             redactEntryPath(entry as unknown as Record<string, unknown>, path),
@@ -1311,4 +1344,5 @@ export const __requestInternals = {
   VALID_LOG_LEVELS,
   DEFAULT_MASKED_HEADER_KEYS,
   DEFAULT_MASKED_QUERY_KEYS,
+  FORBIDDEN_OBJECT_KEYS,
 };
