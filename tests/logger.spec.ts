@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import util from "node:util";
+import vm from "node:vm";
 import fc from "fast-check";
 import winston from "winston";
 import Transport from "winston-transport";
@@ -26,7 +27,12 @@ import {
   acquireSharedGlobalFile,
   flushSharedFileTransportsForExit,
 } from "../src/shared-file-transport";
-import { MAX_REDACT_DEPTH, redactValue } from "../src/redact";
+import { FORBIDDEN_KEYS, MAX_REDACT_DEPTH, redactValue } from "../src/redact";
+import {
+  FORBIDDEN_KEYS as SERIALIZE_FORBIDDEN_KEYS,
+  errorToPlain,
+  isErrorLike,
+} from "../src/serialize";
 import { InvalidTimezoneError, LoggerOptionError } from "../src/errors";
 import type { LoggerOptions } from "../src/types";
 import { captureConsole, createTempDir, teardownLogger } from "./_helpers";
@@ -11195,5 +11201,515 @@ describe("a payload whose keys or prototype cannot be read", () => {
       `{"level":"info","message":"hi","module":"hostile-control","timestamp":"${STAMP}","user":"bob"}\n`,
     );
     expect(out.fileOut).not.toContain("_unserializable");
+  });
+});
+
+describe("serialize: FORBIDDEN_KEYS, isErrorLike, errorToPlain", () => {
+  /** An Error with a deterministic stack (the pins below never depend on this file's line numbers). */
+  const fixedError = (
+    message: string,
+    stack = `Error: ${message}\n    at fixed (fixed.js:1:1)`,
+  ) => {
+    const err = new Error(message);
+    err.stack = stack;
+    return err;
+  };
+
+  describe("FORBIDDEN_KEYS", () => {
+    it("lives in serialize.ts and redact.ts re-exports the SAME deny-list", () => {
+      expect(FORBIDDEN_KEYS).toBe(SERIALIZE_FORBIDDEN_KEYS);
+      expect([...SERIALIZE_FORBIDDEN_KEYS]).toEqual(["__proto__", "constructor", "prototype"]);
+      expect(SERIALIZE_FORBIDDEN_KEYS.has("message")).toBe(false);
+    });
+  });
+
+  describe("isErrorLike", () => {
+    it("is true for a native Error, a built-in subclass, and a user subclass", () => {
+      class PaymentError extends Error {}
+      expect(isErrorLike(new Error("x"))).toBe(true);
+      expect(isErrorLike(new TypeError("x"))).toBe(true);
+      expect(isErrorLike(new AggregateError([], "x"))).toBe(true);
+      expect(isErrorLike(new PaymentError("x"))).toBe(true);
+    });
+
+    it("is true for an Error created in another realm, where instanceof Error is false", () => {
+      const foreign = vm.runInNewContext("new Error('x')") as unknown;
+      const foreignAggregate = vm.runInNewContext("new AggregateError([], 'agg')") as unknown;
+
+      expect(foreign instanceof Error).toBe(false);
+      expect(isErrorLike(foreign)).toBe(true);
+      expect(isErrorLike(foreignAggregate)).toBe(true);
+    });
+
+    it("is false for a plain object that merely has name / message / stack keys", () => {
+      expect(isErrorLike({ name: "Error", message: "x" })).toBe(false);
+      expect(isErrorLike({ name: "Error", message: "x", stack: "Error: x" })).toBe(false);
+      expect(isErrorLike(Object.assign(Object.create(null), { name: "Error", message: "x" }))).toBe(
+        false,
+      );
+    });
+
+    it("is false for primitives, null, arrays, and non-Error objects", () => {
+      for (const value of [undefined, null, "Error", 0, 1n, true, Symbol("e"), [], new Date(0)]) {
+        expect(isErrorLike(value)).toBe(false);
+      }
+      expect(isErrorLike(() => undefined)).toBe(false);
+    });
+
+    it("never throws: a value whose prototype or tag cannot be read is not error-like", () => {
+      const refusing = new Proxy(
+        {},
+        {
+          getPrototypeOf: () => {
+            throw new Error("getPrototypeOf refused");
+          },
+        },
+      );
+      class HostileTag {
+        get [Symbol.toStringTag](): string {
+          throw new Error("tag refused");
+        }
+      }
+
+      expect(() => isErrorLike(refusing)).not.toThrow();
+      expect(isErrorLike(refusing)).toBe(false);
+      expect(isErrorLike(new HostileTag())).toBe(false);
+    });
+  });
+
+  describe("errorToPlain", () => {
+    it("a plain Error: name, message, stack, in that order, as a fresh plain object", () => {
+      const err = fixedError("boom");
+      const plain = errorToPlain(err);
+
+      expect(Object.keys(plain)).toEqual(["name", "message", "stack"]);
+      expect(plain).toEqual({
+        name: "Error",
+        message: "boom",
+        stack: "Error: boom\n    at fixed (fixed.js:1:1)",
+      });
+      expect(Object.getPrototypeOf(plain)).toBe(Object.prototype);
+      expect(plain).not.toBe(err);
+      expect(plain instanceof Error).toBe(false);
+      expect(JSON.stringify(plain)).toBe(
+        '{"name":"Error","message":"boom","stack":"Error: boom\\n    at fixed (fixed.js:1:1)"}',
+      );
+    });
+
+    it("a subclass with an own enumerable code: the standard fields first, then code, name emitted once", () => {
+      class CodedError extends Error {
+        public code: string;
+        constructor(message: string, code: string) {
+          super(message);
+          this.name = "CodedError"; // own enumerable, must keep the FIRST slot
+          this.code = code;
+        }
+      }
+      const err = new CodedError("declined", "E42");
+      err.stack = "CodedError: declined\n    at fixed";
+
+      const plain = errorToPlain(err);
+
+      expect(Object.keys(plain)).toEqual(["name", "message", "stack", "code"]);
+      expect(plain).toEqual({
+        name: "CodedError",
+        message: "declined",
+        stack: "CodedError: declined\n    at fixed",
+        code: "E42",
+      });
+    });
+
+    it("new Error(msg, { cause }): the non-enumerable own cause comes last, by reference", () => {
+      const inner = fixedError("inner");
+      const outer = new Error("outer", { cause: inner });
+      outer.stack = "Error: outer\n    at fixed";
+
+      const plain = errorToPlain(outer);
+
+      expect(Object.keys(plain)).toEqual(["name", "message", "stack", "cause"]);
+      expect(plain.cause).toBe(inner); // not converted: the caller converts nested values
+      expect(Object.keys(outer)).toEqual([]); // the input's own enumerable set is untouched
+    });
+
+    it("an own cause holding undefined is still an own property and is kept", () => {
+      const err = new Error("x", { cause: undefined });
+
+      const plain = errorToPlain(err);
+
+      expect(Object.keys(plain)).toEqual(["name", "message", "stack", "cause"]);
+      expect(plain.cause).toBeUndefined();
+    });
+
+    it("an AggregateError: errors after the standard fields; with a cause, cause then errors", () => {
+      const e1 = fixedError("one");
+      const e2 = fixedError("two");
+      const agg = new AggregateError([e1, e2], "agg");
+      const withCause = new AggregateError([e1], "agg", { cause: "root" });
+
+      const plain = errorToPlain(agg);
+      const plainWithCause = errorToPlain(withCause);
+
+      expect(Object.keys(plain)).toEqual(["name", "message", "stack", "errors"]);
+      expect(plain.name).toBe("AggregateError");
+      expect(plain.message).toBe("agg");
+      expect(plain.errors).toEqual([e1, e2]);
+      expect((plain.errors as unknown[])[0]).toBe(e1);
+      expect(Object.keys(plainWithCause)).toEqual(["name", "message", "stack", "cause", "errors"]);
+      expect(plainWithCause.cause).toBe("root");
+    });
+
+    it("an enumerable assigned cause / errors keeps its own-key position and is not duplicated", () => {
+      const err = fixedError("x") as Error & { cause?: unknown; errors?: unknown; after?: number };
+      err.cause = "assigned";
+      err.errors = ["field"];
+      err.after = 1;
+
+      expect(Object.keys(errorToPlain(err))).toEqual([
+        "name",
+        "message",
+        "stack",
+        "cause",
+        "errors",
+        "after",
+      ]);
+    });
+
+    it("a cross-realm Error converts like a native one", () => {
+      const foreign = vm.runInNewContext(
+        "const e = new Error('far', { cause: 'why' }); e.stack = 'Error: far'; e",
+      ) as object;
+
+      expect(errorToPlain(foreign)).toEqual({
+        name: "Error",
+        message: "far",
+        stack: "Error: far",
+        cause: "why",
+      });
+    });
+
+    it("a throwing own enumerable getter drops ONLY that field, and is invoked once", () => {
+      const err = fixedError("x");
+      const getter = jest.fn(() => {
+        throw new Error("getter refused");
+      });
+      Object.defineProperty(err, "detail", { enumerable: true, get: getter });
+      Object.defineProperty(err, "code", { enumerable: true, value: "E1" });
+
+      let plain: Record<string, unknown> = {};
+      expect(() => {
+        plain = errorToPlain(err);
+      }).not.toThrow();
+
+      expect(Object.keys(plain)).toEqual(["name", "message", "stack", "code"]);
+      expect(plain.code).toBe("E1");
+      expect("detail" in plain).toBe(false);
+      expect(getter).toHaveBeenCalledTimes(1);
+    });
+
+    it("a throwing enumerable cause getter is dropped and never read a second time", () => {
+      const err = fixedError("x");
+      const getter = jest.fn(() => {
+        throw new Error("cause refused");
+      });
+      Object.defineProperty(err, "cause", { enumerable: true, configurable: true, get: getter });
+
+      const plain = errorToPlain(err);
+
+      expect(Object.keys(plain)).toEqual(["name", "message", "stack"]);
+      expect(getter).toHaveBeenCalledTimes(1);
+    });
+
+    it("a throwing message accessor drops only message; name and stack survive", () => {
+      const err = fixedError("x");
+      Object.defineProperty(err, "message", {
+        get: () => {
+          throw new Error("message refused");
+        },
+      });
+
+      expect(errorToPlain(err)).toEqual({
+        name: "Error",
+        stack: "Error: x\n    at fixed (fixed.js:1:1)",
+      });
+    });
+
+    it("skips own keys named __proto__ / constructor / prototype, so the result's prototype cannot be repointed", () => {
+      const err = fixedError("x");
+      for (const key of ["__proto__", "constructor", "prototype"]) {
+        Object.defineProperty(err, key, {
+          value: { polluted: true },
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
+      }
+      Object.defineProperty(err, "kept", { value: 1, enumerable: true });
+
+      const plain = errorToPlain(err);
+
+      expect(Object.keys(plain)).toEqual(["name", "message", "stack", "kept"]);
+      expect(Object.getPrototypeOf(plain)).toBe(Object.prototype);
+      expect((plain as { polluted?: unknown }).polluted).toBeUndefined();
+      expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
+      expect(Object.prototype.hasOwnProperty.call(plain, "constructor")).toBe(false);
+    });
+
+    it("omits an undefined standard field but keeps an own enumerable undefined value; symbols are ignored", () => {
+      const bare = Object.create(Error.prototype) as Error; // no own message / stack
+      const err = fixedError("x") as Error & { extra?: unknown };
+      err.extra = undefined;
+      (err as unknown as Record<symbol, unknown>)[Symbol("hidden")] = "s";
+
+      expect(errorToPlain(bare)).toEqual({ name: "Error", message: "" });
+      expect(Object.keys(errorToPlain(bare))).toEqual(["name", "message"]);
+      expect(Object.keys(errorToPlain(err))).toEqual(["name", "message", "stack", "extra"]);
+      expect(Object.getOwnPropertySymbols(errorToPlain(err))).toEqual([]);
+    });
+
+    it("never throws for a Proxy whose key listing and descriptor lookups throw", () => {
+      const target = fixedError("proxied");
+      const refuse = (): never => {
+        throw new Error("trap refused");
+      };
+      const hostile = new Proxy(target, { ownKeys: refuse, getOwnPropertyDescriptor: refuse });
+
+      let plain: Record<string, unknown> = {};
+      expect(() => {
+        plain = errorToPlain(hostile);
+      }).not.toThrow();
+
+      // V8's own `stack` accessor returns undefined for a Proxy receiver, and an
+      // undefined standard field is omitted; the rest survives.
+      expect(plain).toEqual({ name: "Error", message: "proxied" });
+    });
+
+    it("never mutates its input and returns a new object on every call", () => {
+      const err = new Error("x", { cause: { code: 1 } }) as Error & { code?: string };
+      err.code = "E1";
+      const before = Reflect.ownKeys(err).map((key) => [
+        key,
+        Object.getOwnPropertyDescriptor(err, key),
+      ]);
+
+      const first = errorToPlain(err);
+      const second = errorToPlain(err);
+
+      expect(first).not.toBe(second);
+      expect(first).toEqual(second);
+      expect(
+        Reflect.ownKeys(err).map((key) => [key, Object.getOwnPropertyDescriptor(err, key)]),
+      ).toEqual(before);
+    });
+  });
+});
+
+describe("maskMetaKeys walks nested Errors (own fields, cause chain, AggregateError members)", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const STACK = "Error: fixed\n    at fixed (fixed.js:1:1)";
+  const STACK_JSON = JSON.stringify(STACK);
+
+  /** An Error with a deterministic stack (design rule 8), optionally carrying own properties. */
+  const fixedError = (
+    message: string,
+    own: Record<string, unknown> = {},
+    options?: ErrorOptions,
+  ) => {
+    const err = Object.assign(new Error(message, options), own);
+    err.stack = STACK;
+    return err;
+  };
+
+  const formats: Format[] = ["pretty", "json"];
+
+  describe.each(formats)("format: %s", (format) => {
+    it("an Error with an own masked key keeps its name / message / stack and shows [REDACTED]", async () => {
+      const err = fixedError("card declined", { password: "S1-SECRET" });
+
+      const out = await render(
+        "nested-err-own",
+        format,
+        (logger) => logger.info("Payment failed", { err, orderId: 7 }),
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine(
+              "nested-err-own",
+              [
+                "Payment failed",
+                "{",
+                '  "err": {',
+                '    "name": "Error",',
+                '    "message": "card declined",',
+                `    "stack": ${STACK_JSON},`,
+                '    "password": "[REDACTED]"',
+                "  },",
+                '  "orderId": 7',
+                "}",
+              ].join("\n"),
+            )
+          : `{"err":{"message":"card declined","name":"Error","password":"[REDACTED]","stack":${STACK_JSON}},` +
+              `"level":"info","message":"Payment failed","module":"nested-err-own","orderId":7,"timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+      expect(out.fileOut).not.toContain("S1-SECRET");
+      expect(out.consoleOut).not.toContain("S1-SECRET");
+      // The caller's Error is never rewritten.
+      expect(err.password).toBe("S1-SECRET");
+      expect(err.message).toBe("card declined");
+      expect(Object.keys(err)).toEqual(["password"]);
+    });
+
+    it("a masked key inside a non-enumerable cause is redacted, never written in cleartext", async () => {
+      const cause = { user: "bob", password: "S2-SECRET" };
+      const err = fixedError("outer", {}, { cause });
+
+      const out = await render(
+        "nested-err-cause",
+        format,
+        (logger) => logger.info("Charge failed", { err }),
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine(
+              "nested-err-cause",
+              [
+                "Charge failed",
+                "{",
+                '  "err": {',
+                '    "name": "Error",',
+                '    "message": "outer",',
+                `    "stack": ${STACK_JSON},`,
+                '    "cause": {',
+                '      "user": "bob",',
+                '      "password": "[REDACTED]"',
+                "    }",
+                "  }",
+                "}",
+              ].join("\n"),
+            )
+          : `{"err":{"cause":{"password":"[REDACTED]","user":"bob"},"message":"outer","name":"Error","stack":${STACK_JSON}},` +
+              `"level":"info","message":"Charge failed","module":"nested-err-cause","timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+      expect(out.fileOut).not.toContain("S2-SECRET");
+      expect(cause.password).toBe("S2-SECRET");
+      expect(err.cause).toBe(cause);
+    });
+
+    it("an Error with only primitive fields and nothing to mask renders exactly as it does without a mask", async () => {
+      const make = () => fixedError("plain failure", { code: "E1" }, { cause: "upstream" });
+
+      const masked = await render(
+        "nested-err-parity",
+        format,
+        (logger) => logger.info("m", { err: make(), orderId: 7 }),
+        ["password"],
+      );
+      const unmasked = await render("nested-err-parity", format, (logger) =>
+        logger.info("m", { err: make(), orderId: 7 }),
+      );
+
+      expect(masked.thrown).toBeUndefined();
+      expect(masked.fileOut).toBe(unmasked.fileOut);
+      expect(masked.consoleOut).toBe(unmasked.consoleOut);
+      expect(masked.fileOut).not.toContain("[REDACTED]");
+      expect(masked.fileOut).toContain(format === "json" ? '"orderId":7' : '"orderId": 7');
+    });
+
+    it("a throwing getter inside a walked cause fails closed for that field; the rest of the line still renders", async () => {
+      const cause = {
+        get token(): string {
+          throw new Error("getter refused");
+        },
+      };
+      const err = fixedError("x", {}, { cause });
+
+      const out = await render(
+        "nested-err-throw",
+        format,
+        (logger) => logger.info("m", { err, orderId: 7 }),
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine(
+              "nested-err-throw",
+              [
+                "m",
+                "{",
+                '  "err": {',
+                '    "name": "Error",',
+                '    "message": "x",',
+                `    "stack": ${STACK_JSON},`,
+                '    "cause": "[RedactionFailed]"',
+                "  },",
+                '  "orderId": 7',
+                "}",
+              ].join("\n"),
+            )
+          : `{"err":{"cause":"[RedactionFailed]","message":"x","name":"Error","stack":${STACK_JSON}},` +
+              `"level":"info","message":"m","module":"nested-err-throw","orderId":7,"timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+      expect(out.fileOut).not.toContain("_redactionFailed");
+    });
+
+    it("AggregateError members are masked and keep their own message", async () => {
+      const member = fixedError("member failed", { password: "S3-SECRET" });
+      const agg = new AggregateError([member], "all failed");
+      agg.stack = STACK;
+
+      const out = await render(
+        "nested-err-agg",
+        format,
+        (logger) => logger.info("Batch failed", { err: agg }),
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine(
+              "nested-err-agg",
+              [
+                "Batch failed",
+                "{",
+                '  "err": {',
+                '    "name": "AggregateError",',
+                '    "message": "all failed",',
+                `    "stack": ${STACK_JSON},`,
+                '    "errors": [',
+                "      {",
+                '        "name": "Error",',
+                '        "message": "member failed",',
+                `        "stack": ${STACK_JSON},`,
+                '        "password": "[REDACTED]"',
+                "      }",
+                "    ]",
+                "  }",
+                "}",
+              ].join("\n"),
+            )
+          : `{"err":{"errors":[{"message":"member failed","name":"Error","password":"[REDACTED]","stack":${STACK_JSON}}],` +
+              `"message":"all failed","name":"AggregateError","stack":${STACK_JSON}},` +
+              `"level":"info","message":"Batch failed","module":"nested-err-agg","timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+      expect(out.fileOut).not.toContain("S3-SECRET");
+      expect(out.consoleOut).not.toContain("S3-SECRET");
+      expect(member.password).toBe("S3-SECRET");
+    });
   });
 });

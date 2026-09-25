@@ -2,12 +2,18 @@
  * Shared JSON-serialization primitives used by BOTH the core logger
  * (`src/logger.ts`, for the pretty-mode `safeStringify` pipeline) and the
  * request-logging middleware (`src/request-middleware.ts`, for `serializeBody`
- * and `ownContext`). Lives in its own module — rather than in `src/redact.ts` —
+ * and `ownContext`), plus the structural helpers the redaction walk in
+ * `src/redact.ts` shares with them (`FORBIDDEN_KEYS`, `isErrorLike`,
+ * `errorToPlain`). Lives in its own module, rather than in `src/redact.ts`,
  * because JSON expressibility is a distinct concern from redaction: nothing
  * here decides what is a secret, and `redact.ts`'s contract is entirely about
- * the deep-redaction walk. The two consumers therefore share this without
+ * the deep-redaction walk. The consumers therefore share this without
  * importing each other, matching the one-concern-per-module split the rest of
  * `src/` already follows.
+ *
+ * Dependency direction: this module imports nothing from `src/`. `redact.ts`
+ * imports from it (and re-exports `FORBIDDEN_KEYS` so existing imports keep
+ * working), never the reverse, so there is no import cycle.
  */
 
 /**
@@ -39,3 +45,138 @@
  */
 export const bigintSafeReplacer = (_key: string, value: unknown): unknown =>
   typeof value === "bigint" ? value.toString() : value;
+
+/**
+ * Property names that must NEVER be assigned through `acc[key] = …` during a
+ * rebuild into a fresh object. `__proto__` triggers the prototype setter
+ * (corrupts the local object's prototype chain); `constructor` and `prototype`
+ * are likewise structural fields whose assignment can break `instanceof`
+ * checks and downstream key enumeration. Centralized here so every rebuild in
+ * the package (`redactValue` in `redact.ts`, the per-key rebuilds in
+ * `logger.ts`, and `errorToPlain` below) shares a single deny-list;
+ * `redact.ts` re-exports it.
+ */
+export const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+/**
+ * Reports whether `value` is an `Error`, including one created in another
+ * realm (a `vm` context, a worker's structured clone target, an iframe), where
+ * `instanceof Error` is `false` because each realm has its own `Error`
+ * constructor. `Object.prototype.toString` reports `"[object Error]"` for any
+ * object carrying the `[[ErrorData]]` internal slot, whatever realm made it,
+ * so the two tests together cover same-realm subclasses and cross-realm
+ * errors alike.
+ *
+ * Total: it never throws. Both tests can run caller code (a Proxy's
+ * `getPrototypeOf` trap for `instanceof`, a `Symbol.toStringTag` getter for
+ * `toString`), and the predicate is called from inside the redaction walk and
+ * the serializers, so a throw is answered with `false` (the value is then
+ * treated as an ordinary object, exactly as before this predicate existed).
+ * A plain object that merely has `name` / `message` keys is NOT error-like.
+ */
+export const isErrorLike = (value: unknown): value is Error => {
+  if (value === null || typeof value !== "object") {
+    return false;
+  }
+  try {
+    return value instanceof Error || Object.prototype.toString.call(value) === "[object Error]";
+  } catch {
+    return false;
+  }
+};
+
+/** Marks a property read that threw inside `errorToPlain`. */
+const UNREADABLE = Symbol("unreadable");
+
+const readProperty = (source: object, key: string): unknown => {
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return UNREADABLE;
+  }
+};
+
+const listOwnEnumerableKeys = (source: object): string[] => {
+  try {
+    return Object.keys(source);
+  } catch {
+    return [];
+  }
+};
+
+const hasOwnProperty = (source: object, key: string): boolean => {
+  try {
+    return Object.prototype.hasOwnProperty.call(source, key);
+  } catch {
+    return false;
+  }
+};
+
+/** Standard `Error` fields, read first (own or inherited) in this fixed order. */
+const STANDARD_ERROR_FIELDS = ["name", "message", "stack"] as const;
+
+/** Non-enumerable own slots ES2022 defines on errors: `cause` and `AggregateError`'s `errors`. */
+const OWN_ERROR_SLOTS = ["cause", "errors"] as const;
+
+/**
+ * Converts an `Error` into a fresh plain object that a serializer or the
+ * redaction walk can read by its own enumerable keys. The single converter
+ * both consumers share, so a nested `Error` is masked and rendered through
+ * the SAME view.
+ *
+ * Why it is needed: an `Error`'s `message` and `stack` are own
+ * NON-enumerable properties, `name` is inherited from the prototype, and the
+ * ES2022 `cause` (the `new Error(msg, { cause })` form) and
+ * `AggregateError`'s `errors` are own non-enumerable properties too. Every
+ * key-based walk (`Object.keys`, `JSON.stringify`, `safe-stable-stringify`)
+ * therefore sees none of them, which is why a nested `Error` renders as `{}`.
+ *
+ * Field order is fixed: `name`, `message`, `stack` (each read through the
+ * prototype chain, and omitted when `undefined`), then every own enumerable
+ * string key in `Object.keys` order (an `undefined` value is kept, as the
+ * walk over any other object keeps it), then `cause` and `errors` when they
+ * are OWN properties, enumerable or not. `errors` is gated on being an own
+ * property rather than on `instanceof AggregateError`, so a cross-realm
+ * `AggregateError` is covered; an enumerable `errors` / `cause` (a
+ * validation error's `this.errors = …`) is already listed with the own keys.
+ * Each key is read at most once, even when its read threw: an own
+ * enumerable `name` (set by `this.name = …` in a subclass constructor) keeps
+ * the first slot, and a getter, if any, runs once.
+ *
+ * Getter-safe and total: every read is guarded, and a throwing accessor
+ * (or a Proxy trap) drops ONLY that field. Own keys named in
+ * `FORBIDDEN_KEYS` are skipped, so the result is always an
+ * `Object.prototype`-prototyped object whose prototype no payload can
+ * repoint. Symbol-keyed properties are not included (no serializer emits
+ * them). Values are copied by reference: nothing is walked, so a nested
+ * `cause` stays an `Error` for the caller (the redaction walk or a
+ * serializer's replacer) to convert in turn. The input is never mutated, and
+ * the result is never the input.
+ */
+export const errorToPlain = (err: object): Record<string, unknown> => {
+  const plain: Record<string, unknown> = {};
+  const attempted = new Set<string>();
+  const take = (key: string, keepUndefined: boolean): void => {
+    if (FORBIDDEN_KEYS.has(key) || attempted.has(key)) {
+      return;
+    }
+    attempted.add(key);
+    const value = readProperty(err, key);
+    if (value === UNREADABLE || (value === undefined && !keepUndefined)) {
+      return;
+    }
+    plain[key] = value;
+  };
+  for (const key of STANDARD_ERROR_FIELDS) {
+    take(key, false);
+  }
+  for (const key of listOwnEnumerableKeys(err)) {
+    take(key, true);
+  }
+  for (const key of OWN_ERROR_SLOTS) {
+    if (hasOwnProperty(err, key)) {
+      take(key, true);
+    }
+  }
+  return plain;
+};

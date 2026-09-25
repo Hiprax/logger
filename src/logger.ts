@@ -4,7 +4,7 @@ import winston from "winston";
 import DailyRotateFile from "winston-daily-rotate-file";
 import moment from "moment-timezone";
 import { InvalidTimezoneError, LoggerOptionError } from "./errors";
-import { redactValue, FORBIDDEN_KEYS } from "./redact";
+import { redactValue, FORBIDDEN_KEYS, REDACTION_FAILED } from "./redact";
 import { bigintSafeReplacer } from "./serialize";
 import { registerCrashCapture, deregisterCrashCapture, resetCrashCapture } from "./crash-capture";
 import { acquireSharedGlobalFile, resetSharedFileRegistry } from "./shared-file-transport";
@@ -924,23 +924,9 @@ const buildTimestampCapture = (clock: () => Date) =>
  */
 const RESERVED_INFO_KEYS = new Set(["level", "message", "timestamp", "stack"]);
 
-/**
- * Substituted for a metadata value whose redaction walk threw.
- *
- * The redaction walk is not total: reading an own enumerable key invokes a
- * getter, and a getter is caller code that may throw (as may a `toJSON` on a
- * proxied value). Since winston runs its formats synchronously inside
- * `logger.log()`, an escaping exception would surface as a throw from an
- * ordinary `logger.info()` — the caller's own logging call crashing on account
- * of the data it tried to log.
- *
- * The substitution FAILS CLOSED: it replaces the value with this sentinel
- * rather than falling back to the raw one. Emitting the unredacted value would
- * turn a redaction failure into a secret disclosure — precisely the outcome
- * `maskMetaKeys` exists to prevent — so a value that could not be proven
- * redacted is never written to the log.
- */
-const REDACTION_FAILED = "[RedactionFailed]";
+// `REDACTION_FAILED` (`"[RedactionFailed]"`) is the fail-closed sentinel for a
+// value whose redaction walk threw. It lives in `src/redact.ts`, whose Error
+// walk substitutes it per field too; see its docstring there.
 
 /**
  * Applies `maskMetaKeys` to a caller value the line renders in a RESERVED slot
@@ -1269,11 +1255,11 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
       } catch {
         // Fail closed on this key only — the rest of the line still renders.
         next[key] = REDACTION_FAILED;
-        // The throw unwound out of the walk without running the `seen.delete`
-        // that each branch performs on its way out, so the abandoned subtree's
-        // objects are still recorded as "on the active path". Reusing that
-        // WeakSet would misreport any of them as "[Circular]" if a LATER key
-        // legitimately references one. A fresh set restores the invariant.
+        // Every `redactValue` branch removes its entry in a `finally`, so a
+        // throw out of the walk no longer leaves the abandoned subtree's
+        // objects recorded as "on the active path". The fresh set is kept as
+        // defense in depth: a stale entry would misreport a LATER key that
+        // legitimately references one of those objects as "[Circular]".
         seen = new WeakSet<object>();
       }
     }

@@ -1,9 +1,13 @@
+import { FORBIDDEN_KEYS, errorToPlain, isErrorLike } from "./serialize";
+
 /**
  * Shared deep-redaction primitive used by BOTH the core logger (for
  * `LoggerOptions.maskMetaKeys`) and the request-logging middleware (for
  * `RequestLoggerOptions.maskBodyKeys` / `redactPaths`). Lives in its own
  * module so the two consumers do not have to import each other to share the
- * implementation.
+ * implementation. It imports its structural helpers (`FORBIDDEN_KEYS`,
+ * `isErrorLike`, `errorToPlain`) from `src/serialize.ts`, which imports
+ * nothing from `src/`, so the dependency runs one way only.
  *
  * Behavior:
  * - Returns primitives unchanged.
@@ -23,13 +27,40 @@
  *     - The value is an `ArrayBuffer` view (typed arrays, `DataView`,
  *       `Buffer`) — data lives in the underlying memory, not in enumerable
  *     own keys.
- *     - The value has zero enumerable own string keys (`Map`, `Set`, `RegExp`,
- *       `Promise`, a vanilla `Error` with no extra props) — no key can match.
+ *     - The value has zero enumerable own string keys and is not an `Error`
+ *       (`Map`, `Set`, `RegExp`, `Promise`) — no key can match.
  *     Not adding these to `seen` means built-ins are never subject to cycle
  *     tracking at all — the same built-in referenced by two keys (e.g.
  *     `{ a: date, b: date }`) has always rendered both occurrences fully.
- *   - **Data-bearing instances** (class DTOs, `Error` subclasses with
- *     enumerable props) — walked via their own enumerable string keys. Keys
+ *   - **Errors** (`isErrorLike`: same-realm, subclass, or cross-realm; checked
+ *     AFTER the `toJSON` / binary-view pass-through, so an `Error` subclass
+ *     with its own `toJSON` keeps that path and a rebuild never exposes the
+ *     fields its `toJSON` hides) — data-bearing even with zero enumerable
+ *     keys. The walk reads the `errorToPlain` view (`src/serialize.ts`, the
+ *     same converter the serializers use): `name`, `message`, `stack`, every
+ *     own enumerable property, and the non-enumerable own `cause` /
+ *     `AggregateError` `errors`. Masked keys become `"[REDACTED]"`; every
+ *     other field recurses, so masking reaches the whole `cause` chain and
+ *     every `AggregateError` member BEFORE any serializer makes them visible.
+ *     A throw while walking one field (a throwing getter inside a `cause`)
+ *     replaces THAT field with `REDACTION_FAILED` and counts as a change;
+ *     the rest of the value still renders. Those subtrees were invisible
+ *     before, so failing the whole value there would render a line worse
+ *     than it rendered before the walk reached them.
+ *     Returns the original **by identity** when nothing changed (every view
+ *     field is a primitive or came back by identity, and no own enumerable
+ *     key was left out of the view); otherwise (or under `forceCopy`) a fresh
+ *     plain object in the view's field order, so `name` / `message` /
+ *     `stack` survive the rebuild. An own enumerable key missing from the
+ *     view (a `FORBIDDEN_KEYS` name, or an accessor that threw) counts as a
+ *     change: returning the original would let the serializer read that
+ *     accessor again. Because arrays and plain objects always rebuild, an
+ *     `AggregateError`, or an `Error` whose `cause` / own field is a plain
+ *     object or array, comes back rebuilt even with nothing to mask (same
+ *     view, owned copy), and a self-referencing `cause` renders
+ *     `"[Circular]"`.
+ *   - **Data-bearing instances** (class DTOs) — walked via their own
+ *     enumerable string keys. Keys
  *     whose lowercased form is in `maskKeys` are replaced with `"[REDACTED]"`;
  *     others are recursed into. Returns the **original by identity** when
  *     nothing changed (no key matched and every recursed child is `===` its
@@ -50,10 +81,13 @@
  *     is both mutation-safe and renders built-ins via their `toJSON()`.)
  * - **Cycle detection is active-path tracking, not all-visited tracking.**
  *   The per-call `WeakSet` (`seen`) records only the objects on the CURRENT
- *   recursion path: the array, plain-object, and data-bearing-instance
- *   branches each add their `value` to `seen` on entry and remove it again
- *   immediately before returning, once that value's own subtree has finished
- *   processing. Consequences:
+ *   recursion path: the array, plain-object, Error, and data-bearing-instance
+ *   branches each add their `value` to `seen` on entry and remove it again in
+ *   a `finally` on the way out, once that value's own subtree has finished
+ *   processing, so the entry is removed even when the subtree throws (a
+ *   caught throw, such as the Error walk's per-field one, never leaves a stale
+ *   entry that would misreport a later reference as `"[Circular]"`).
+ *   Consequences:
  *   - A value that is its own ancestor on the active path — a true
  *     self-cycle (`obj.self = obj`) or an indirect/mutual cycle
  *     (`a.b = b; b.a = a`) — still renders as the literal string
@@ -115,13 +149,32 @@ export const REDACTED = "[REDACTED]";
 
 /**
  * Property names that must NEVER be assigned through `acc[key] = …` during a
- * deep rebuild. `__proto__` triggers the prototype setter (corrupts the local
- * object's prototype chain); `constructor` and `prototype` are likewise
- * structural fields whose assignment can break instanceof checks and downstream
- * key enumeration. Centralized here so both this module and `logger.ts`'s
- * `buildMetaRedactor` rebuild loop share a single deny-list.
+ * deep rebuild (see its docstring in `src/serialize.ts`, where it lives so
+ * `errorToPlain` can share it without importing this module). Re-exported
+ * here so existing `import { FORBIDDEN_KEYS } from "./redact"` sites keep
+ * working.
  */
-export const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+export { FORBIDDEN_KEYS };
+
+/**
+ * Substituted for a value whose redaction walk threw: by `logger.ts` for a
+ * metadata value, a message, or a stack, and by `redactValue` itself for one
+ * field of an `Error` (see the Errors entry in the module docstring).
+ *
+ * The redaction walk is not total: reading an own enumerable key invokes a
+ * getter, and a getter is caller code that may throw (as may a `toJSON` on a
+ * proxied value). Since winston runs its formats synchronously inside
+ * `logger.log()`, an escaping exception would surface as a throw from an
+ * ordinary `logger.info()` — the caller's own logging call crashing on account
+ * of the data it tried to log.
+ *
+ * The substitution FAILS CLOSED: it replaces the value with this sentinel
+ * rather than falling back to the raw one. Emitting the unredacted value would
+ * turn a redaction failure into a secret disclosure — precisely the outcome
+ * `maskMetaKeys` exists to prevent — so a value that could not be proven
+ * redacted is never written to the log.
+ */
+export const REDACTION_FAILED = "[RedactionFailed]";
 
 /**
  * Maximum nesting depth `redactValue` will walk before substituting
@@ -154,9 +207,11 @@ export const redactValue = (
   if (Array.isArray(value)) {
     if (seen.has(value as object)) return "[Circular]";
     seen.add(value as object);
-    const mapped = value.map((item) => redactValue(item, maskKeys, seen, forceCopy, depth + 1));
-    seen.delete(value as object);
-    return mapped;
+    try {
+      return value.map((item) => redactValue(item, maskKeys, seen, forceCopy, depth + 1));
+    } finally {
+      seen.delete(value as object);
+    }
   }
 
   const proto = Object.getPrototypeOf(value);
@@ -178,11 +233,58 @@ export const redactValue = (
     // ONLY into an owned plain object or array and treats any other target
     // (these pass-throughs included) as a graceful no-op.
     const hasToJSON = typeof (value as Record<string, unknown>).toJSON === "function";
-    if (hasToJSON || ArrayBuffer.isView(value) || Object.keys(value as object).length === 0) {
+    if (hasToJSON || ArrayBuffer.isView(value)) {
       return value;
     }
 
-    // Data-bearing instance (class DTO, Error subclass with enumerable props).
+    const ownKeys = Object.keys(value as Record<string, unknown>);
+
+    // An Error is data-bearing even with zero enumerable keys: its `message`,
+    // `stack`, `cause`, and `AggregateError` `errors` are non-enumerable, and
+    // a secret inside a `cause` or a member must be masked before a
+    // serializer that renders them ever sees it. Walk the shared
+    // `errorToPlain` view (see the module docstring's "Errors" entry).
+    if (isErrorLike(value)) {
+      if (seen.has(value as object)) return "[Circular]";
+      seen.add(value as object);
+      try {
+        const view = errorToPlain(value as object);
+        // An own enumerable key the view left out (forbidden, or an accessor
+        // that threw) is a structural change: the original must not reach the
+        // serializer, which would read that accessor again.
+        let changed = ownKeys.some((key) => !Object.prototype.hasOwnProperty.call(view, key));
+        const rebuilt: Record<string, unknown> = {};
+        for (const key of Object.keys(view)) {
+          const original = view[key];
+          if (maskKeys.has(key.toLowerCase())) {
+            rebuilt[key] = REDACTED;
+            changed = true;
+            continue;
+          }
+          // The view exposes subtrees no serializer showed before (`cause`,
+          // `errors`), so a throw inside one fails closed for THIS field only
+          // instead of failing the whole value: a line that rendered before
+          // must not render worse now.
+          let recursed: unknown;
+          try {
+            recursed = redactValue(original, maskKeys, seen, forceCopy, depth + 1);
+          } catch {
+            recursed = REDACTION_FAILED;
+          }
+          rebuilt[key] = recursed;
+          if (recursed !== original) changed = true;
+        }
+        return changed || forceCopy ? rebuilt : value;
+      } finally {
+        seen.delete(value as object);
+      }
+    }
+
+    if (ownKeys.length === 0) {
+      return value;
+    }
+
+    // Data-bearing instance (class DTO).
     // Walk own enumerable string keys, redact matched ones, recurse into the
     // rest. Return the original by identity when nothing changed so the
     // documented pass-through for instances holding no masked key is
@@ -195,47 +297,49 @@ export const redactValue = (
     if (seen.has(value as object)) return "[Circular]";
     seen.add(value as object);
 
-    const ownKeys = Object.keys(value as Record<string, unknown>);
-    let changed = false;
-    const result: Record<string, unknown> = {};
-    for (const key of ownKeys) {
-      if (FORBIDDEN_KEYS.has(key)) {
-        changed = true; // dropping a forbidden key is a structural change
-        continue;
+    try {
+      let changed = false;
+      const result: Record<string, unknown> = {};
+      for (const key of ownKeys) {
+        if (FORBIDDEN_KEYS.has(key)) {
+          changed = true; // dropping a forbidden key is a structural change
+          continue;
+        }
+        const original = (value as Record<string, unknown>)[key];
+        if (maskKeys.has(key.toLowerCase())) {
+          result[key] = REDACTED;
+          changed = true;
+        } else {
+          const recursed = redactValue(original, maskKeys, seen, forceCopy, depth + 1);
+          result[key] = recursed;
+          if (recursed !== original) changed = true;
+        }
       }
-      const original = (value as Record<string, unknown>)[key];
-      if (maskKeys.has(key.toLowerCase())) {
-        result[key] = REDACTED;
-        changed = true;
-      } else {
-        const recursed = redactValue(original, maskKeys, seen, forceCopy, depth + 1);
-        result[key] = recursed;
-        if (recursed !== original) changed = true;
-      }
+      return changed || forceCopy ? result : value;
+    } finally {
+      seen.delete(value as object);
     }
-
-    seen.delete(value as object);
-    return changed || forceCopy ? result : value;
   }
 
   // Plain object branch — always rebuilds a fresh plain object so callers that
   // rely on `out !== input` identity continue to work.
   if (seen.has(value as object)) return "[Circular]";
   seen.add(value as object);
-
-  const rebuilt = Object.entries(value as Record<string, unknown>).reduce<Record<string, unknown>>(
-    (acc, [key, val]) => {
-      // Skip prototype-pollution vectors. See FORBIDDEN_KEYS docstring.
-      if (FORBIDDEN_KEYS.has(key)) {
+  try {
+    return Object.entries(value as Record<string, unknown>).reduce<Record<string, unknown>>(
+      (acc, [key, val]) => {
+        // Skip prototype-pollution vectors. See FORBIDDEN_KEYS docstring.
+        if (FORBIDDEN_KEYS.has(key)) {
+          return acc;
+        }
+        acc[key] = maskKeys.has(key.toLowerCase())
+          ? REDACTED
+          : redactValue(val, maskKeys, seen, forceCopy, depth + 1);
         return acc;
-      }
-      acc[key] = maskKeys.has(key.toLowerCase())
-        ? REDACTED
-        : redactValue(val, maskKeys, seen, forceCopy, depth + 1);
-      return acc;
-    },
-    {},
-  );
-  seen.delete(value as object);
-  return rebuilt;
+      },
+      {},
+    );
+  } finally {
+    seen.delete(value as object);
+  }
 };
