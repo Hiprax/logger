@@ -696,6 +696,48 @@ const resolveColorizeFlags = (
 };
 
 /**
+ * True when `value`'s prototype is `Object.prototype` or `null`, i.e. a genuine
+ * plain bag rather than an array, an `Error`, or a class instance. The format
+ * chain rebuilds only such infos into a fresh object: a plain copy of anything
+ * else would drop its prototype (and with it a `toJSON` the serializer calls)
+ * or turn an array into an index-keyed object.
+ */
+const hasPlainPrototype = (value: object): boolean => {
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+};
+
+/**
+ * Copies every own property of `source` (string and Symbol keys, enumerable or
+ * not) onto a fresh `Object.prototype` object BY DESCRIPTOR, optionally leaving
+ * out `skipKey`. No getter or setter is invoked: an accessor is carried across
+ * as the same accessor, so a throwing or side-effecting caller getter stays lazy
+ * until a guarded downstream read. The Symbol slots winston writes (`LEVEL`,
+ * `SPLAT`, `MESSAGE`) come across with the rest. A caller-supplied own
+ * `__proto__` key is defined as an own data property, which never invokes the
+ * prototype setter, so the copy's prototype stays `Object.prototype`.
+ *
+ * The one getter-safe copy of a caller's info, shared by
+ * {@link buildTimestampCapture} and {@link buildSafeErrorsFormat}.
+ */
+const copyOwnPropertiesByDescriptor = (
+  source: object,
+  skipKey?: PropertyKey,
+): Record<string | symbol, unknown> => {
+  const next: Record<string | symbol, unknown> = {};
+  for (const key of Reflect.ownKeys(source)) {
+    if (key === skipKey) {
+      continue;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    if (descriptor) {
+      Object.defineProperty(next, key, descriptor);
+    }
+  }
+  return next;
+};
+
+/**
  * Builds a Winston `format.timestamp()` formatter that captures the event time
  * via the supplied `clock` (or the live `Date` constructor when no clock is
  * provided) and writes the canonical `TIMESTAMP_FORMAT`-formatted UTC string
@@ -718,7 +760,9 @@ const resolveColorizeFlags = (
  * a caller-supplied value is not an option: the log always reflects the captured
  * instant, never a caller-forged one.
  *
- * **Own properties are transplanted by DESCRIPTOR, not by value (getter-safe).**
+ * **Own properties are transplanted by DESCRIPTOR, not by value (getter-safe),**
+ * through the shared {@link copyOwnPropertiesByDescriptor} (the same copy
+ * {@link buildSafeErrorsFormat} makes of a plain `{ message: err }` payload).
  * A plain-object info can carry accessor metadata — `logger.info({ get password()
  * { … } })` — and a getter is caller code that may throw or carry side effects. A
  * value spread (`{ ...info }`) would INVOKE every getter here, letting a throwing
@@ -756,26 +800,20 @@ const resolveColorizeFlags = (
  * (the historical order) a rebuild would instead see the raw `Error` — whose
  * `message` / `stack` are own NON-enumerable — and drop them, defeating
  * `errors.js`'s `instanceof Error` gate. Ordering it after `errors()` removes
- * the need for any `instanceof Error` special-case here. The only remaining
- * writes onto the caller's object are winston's own `level` / `[LEVEL]` (and
- * `defaultMeta`), assigned before ANY format runs — unavoidable and matching
- * bare winston.
+ * the need for any `instanceof Error` special-case here. For a plain info the
+ * only remaining writes onto the caller's object are winston's own `level` /
+ * `[LEVEL]` (and `defaultMeta`), assigned before ANY format runs — unavoidable
+ * and matching bare winston. (A non-plain info still gets this format's own
+ * in-place `timestamp` write described above, and `errors()` still flattens in
+ * place a class instance whose `message` is an `Error`, and a Proxy whose
+ * `message` exists only through its `get` trap; see
+ * {@link buildSafeErrorsFormat}.)
  */
 const buildTimestampCapture = (clock: () => Date) =>
   winston.format((info) => {
     const timestamp = moment.utc(clock()).format(TIMESTAMP_FORMAT);
-    const proto = Object.getPrototypeOf(info);
-    if (proto === Object.prototype || proto === null) {
-      const next: Record<string | symbol, unknown> = {};
-      for (const key of Reflect.ownKeys(info)) {
-        if (key === "timestamp") {
-          continue;
-        }
-        const descriptor = Object.getOwnPropertyDescriptor(info, key);
-        if (descriptor) {
-          Object.defineProperty(next, key, descriptor);
-        }
-      }
+    if (hasPlainPrototype(info)) {
+      const next = copyOwnPropertiesByDescriptor(info, "timestamp");
       next.timestamp = timestamp;
       return next as unknown as winston.Logform.TransformableInfo;
     }
@@ -845,7 +883,8 @@ const buildTimestampCapture = (clock: () => Date) =>
  * WINSTON itself, onto the caller's object, before any format runs
  * (`create-logger.js:79`, `logger.js:237`) — engine-owned and unavoidable. The
  * `timestamp` slot is NO LONGER an in-place overwrite: `buildTimestampCapture`
- * is copy-on-write (`{ ...info, timestamp }`) and sequenced AFTER
+ * is copy-on-write (a getter-safe descriptor copy with `timestamp` written
+ * fresh) for a plain info and sequenced AFTER
  * `errors({ stack: true })`, so a caller-supplied `timestamp` on live state is
  * left intact while the log still renders the captured instant (see that
  * helper's JSDoc). The rendered value is still the captured one, not the
@@ -856,8 +895,14 @@ const buildTimestampCapture = (clock: () => Date) =>
  *
  * So the guarantee is: no caller-supplied METADATA value is destroyed — this
  * format never writes `[REDACTED]`, `REDACTION_FAILED`, or a rebuilt copy onto
- * the caller's object, and neither does the timestamp capture. Only winston's
- * own `level` / `[LEVEL]` write lands on caller state, matching bare winston.
+ * the caller's object, and neither does the timestamp capture. For a plain
+ * payload only winston's own `level` / `[LEVEL]` write lands on caller state,
+ * matching bare winston; `errors()` flattens a plain `{ message: err }` payload
+ * on a copy too (see {@link buildSafeErrorsFormat}). The documented non-plain
+ * exceptions are the in-place `timestamp` write on an array or class instance
+ * and `errors()` flattening a class instance whose `message` is an `Error`; a
+ * Proxy whose `message` exists only through its `get` trap is also still
+ * flattened in place.
  *
  * This format can safely rebuild because it runs AFTER `errors()` has already
  * flattened any logged `Error` into a plain object (`errors.js:15` returns a
@@ -1466,6 +1511,30 @@ const buildSafeJsonFormat = (): winston.Logform.Format => {
   })();
 };
 
+/**
+ * True when `logform/errors.js` may rewrite `info` in place (its `message`
+ * branch, `errors.js:28-40`) and a copy can stand in for it: `info` has a plain
+ * prototype (see {@link hasPlainPrototype}; class instances are the documented
+ * exception in {@link buildSafeErrorsFormat}) and owns a `message` that is an
+ * `Error` data value or an accessor. The decision reads the property
+ * DESCRIPTOR, never the value, so no caller getter runs here. An accessor is
+ * copied whatever it returns: the copy carries the same accessor, so `errors()`
+ * behaves on it exactly as it would have on `info`. The `instanceof Error` test
+ * is the one `errors()` applies, so a cross-realm Error (which `errors()` leaves
+ * alone) is not copied. A `message` the object does not own (a Proxy `get`
+ * trap) is not copied either, because a descriptor copy cannot reproduce it.
+ */
+const errorsMayRewriteCallerInfo = (info: object): boolean => {
+  if (!hasPlainPrototype(info)) {
+    return false;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(info, "message");
+  if (descriptor === undefined) {
+    return false;
+  }
+  return "value" in descriptor ? descriptor.value instanceof Error : true;
+};
+
 /** Marker key stamped on a line whose Error could not be flattened getter-safely. */
 const ERROR_FLATTEN_FAILED = "_errorFlattenFailed";
 
@@ -1496,12 +1565,51 @@ const ERROR_FLATTEN_FAILED = "_errorFlattenFailed";
  * readable; only the hostile own field(s) are dropped, and an
  * `_errorFlattenFailed: true` marker records the degradation. A log call must
  * never take the process down.
+ *
+ * **A plain `{ message: err }` payload is flattened on a copy, never in place.**
+ * For an info whose `message` is an `Error`, `errors()` rewrites the info itself
+ * (`errors.js:32-39`): it copies the Error's own enumerable fields over it,
+ * replaces `message` with the message string, and writes `stack` and the
+ * `MESSAGE` slot. On `logger.error({ message: err })`, `logger.log("error",
+ * { message: err })`, and `logger.log({ level, message: err })` that info IS
+ * the caller's own object (`create-logger.js:78`, `logger.js:237` / `:246`), so
+ * logging used to replace the application's Error with a string and overwrite
+ * its `code` / `stack` fields. When {@link errorsMayRewriteCallerInfo} holds
+ * (a plain prototype and an own `message` that is, or may be, an `Error`),
+ * `errors()` is handed a getter-safe descriptor copy from
+ * {@link copyOwnPropertiesByDescriptor} instead. The rendered line is
+ * unchanged, because `errors()` produces the same fields on the copy; only
+ * winston-core's own `level` / `[LEVEL]` write (made before any format runs)
+ * still lands on the caller's object. Every other info keeps today's exact call
+ * with no allocation: a logged `Error` (which `errors()` already copies), a
+ * string message, and a CLASS INSTANCE whose `message` is an `Error`. The
+ * class instance is a documented exception: a plain copy would drop its
+ * prototype, so `json()` would stop calling its `toJSON` and would print the
+ * fields that `toJSON` withholds, and restoring the prototype on a copy would
+ * break a `toJSON` that reads private `#fields`. So such an instance is still
+ * flattened in place, as bare winston does. A Proxy whose `message` exists only
+ * through its `get` trap is also still flattened in place (through its traps):
+ * a descriptor copy cannot reproduce a property the object does not own.
+ *
+ * The selection runs INSIDE the `try` and never invokes a `message` getter, so
+ * every getter is read exactly as often as before, and a throwing one (or a
+ * throwing Proxy trap) still degrades through the catch below. A getter-only
+ * `message` that returns an `Error` is copied as the same accessor; `errors()`
+ * then throws assigning the string over it and the line degrades as it always
+ * did, but the Error's fields are no longer copied onto the caller's object
+ * first. An accessor keeps running the caller's code on the copy: a `message`
+ * setter is invoked with the copy as `this` when `errors()` assigns the string,
+ * and a getter whose result depends on `this` being the caller's own object
+ * (for example a `WeakMap` lookup keyed by it) now sees the copy instead.
  */
 const buildSafeErrorsFormat = (): winston.Logform.Format => {
   const errorsFormat = winston.format.errors({ stack: true });
   return winston.format((info) => {
     try {
-      return errorsFormat.transform(info, errorsFormat.options);
+      const target = errorsMayRewriteCallerInfo(info)
+        ? (copyOwnPropertiesByDescriptor(info) as unknown as winston.Logform.TransformableInfo)
+        : info;
+      return errorsFormat.transform(target, errorsFormat.options);
     } catch {
       const source = info as unknown as Record<string | symbol, unknown>;
       // Never let the safety net itself throw: every read below is a

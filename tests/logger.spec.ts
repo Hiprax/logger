@@ -10271,3 +10271,418 @@ describe("maskMetaKeys keeps toJSON results without their own toJSON on the seri
     });
   });
 });
+
+describe("caller-safe Error-in-message payloads", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const LEVEL_SLOT = Symbol.for("level");
+  // A fixed stack keeps every byte pin independent of where this test sits in the file.
+  const FIXED_STACK = "Error: boom\n    at fixed (fixed.js:1:1)";
+  const FORMATS: Format[] = ["pretty", "json"];
+  const hasOwn = (value: object, key: string): boolean =>
+    Object.prototype.hasOwnProperty.call(value, key);
+
+  /** An Error the way an application throws it: a fixed stack and one own enumerable field. */
+  const makeError = (): Error & { code: string } => {
+    const err = Object.assign(new Error("boom"), { code: "E42" });
+    err.stack = FIXED_STACK;
+    return err;
+  };
+
+  /** The exact error line both chains wrote before the fix for `{ message: err, requestId }`. */
+  const errorLine = (format: Format, label: string): string =>
+    format === "pretty"
+      ? `UTC: ${STAMP}\n[ERROR] (${label})\nboom\n${FIXED_STACK}\n{\n  "requestId": "r1",\n  "code": "E42"\n}\n\n`
+      : `{"code":"E42","level":"error","message":"boom","module":"${label}","requestId":"r1",` +
+        `"stack":${JSON.stringify(FIXED_STACK)},"timestamp":"${STAMP}"}\n`;
+
+  /** The logged Error itself is never touched either. */
+  const expectErrorUntouched = (err: Error & { code: string }): void => {
+    expect(err.message).toBe("boom");
+    expect(err.stack).toBe(FIXED_STACK);
+    expect(err.code).toBe("E42");
+    expect(Object.keys(err)).toEqual(["code"]);
+  };
+
+  interface PlainForm {
+    title: string;
+    make: (err: Error) => Record<string | symbol, unknown>;
+    emit: (logger: winston.Logger, payload: Record<string | symbol, unknown>) => void;
+    /** Own keys afterwards: the original ones plus winston-core's `level` write. */
+    keysAfter: string[];
+  }
+
+  const plainForms: PlainForm[] = [
+    {
+      title: "logger.error({ message: err, requestId })",
+      make: (err) => ({ message: err, requestId: "r1" }),
+      emit: (logger, payload) => logger.error(payload),
+      keysAfter: ["message", "requestId", "level"],
+    },
+    {
+      title: 'logger.log("error", { message: err, requestId })',
+      make: (err) => ({ message: err, requestId: "r1" }),
+      emit: (logger, payload) => logger.log("error", payload),
+      keysAfter: ["message", "requestId", "level"],
+    },
+    {
+      title: 'logger.log({ level: "error", message: err, requestId })',
+      make: (err) => ({ level: "error", message: err, requestId: "r1" }),
+      emit: (logger, payload) => logger.log(payload as never),
+      keysAfter: ["level", "message", "requestId"],
+    },
+    {
+      title: "logger.error() with a null-prototype { message: err, requestId }",
+      make: (err) =>
+        Object.assign(Object.create(null) as Record<string, unknown>, {
+          message: err,
+          requestId: "r1",
+        }),
+      emit: (logger, payload) => logger.error(payload),
+      keysAfter: ["message", "requestId", "level"],
+    },
+  ];
+
+  describe.each(FORMATS)("%s", (format) => {
+    const label = `err-payload-${format}`;
+
+    it.each(plainForms)(
+      "$title renders the same line and leaves the caller's object and its Error untouched",
+      async ({ make, emit, keysAfter }) => {
+        const err = makeError();
+        const payload = make(err);
+
+        const out = await render(label, format, (logger) => emit(logger, payload));
+
+        expect(out.thrown).toBeUndefined();
+        expect(out.fileOut).toBe(errorLine(format, label));
+        expectConsoleMatchesFile(format, out);
+        // `message` is still the SAME Error instance, not its message string.
+        expect(payload.message).toBe(err);
+        // Only winston-core's own `level` / `[LEVEL]` write lands on the object:
+        // no `stack`, no copied Error field, no `[MESSAGE]` slot.
+        expect(Object.keys(payload)).toEqual(keysAfter);
+        expect(hasOwn(payload, "stack")).toBe(false);
+        expect(hasOwn(payload, "code")).toBe(false);
+        expect(payload.level).toBe("error");
+        expect(Object.getOwnPropertySymbols(payload)).toEqual([LEVEL_SLOT]);
+        expect(payload[LEVEL_SLOT]).toBe("error");
+        expectErrorUntouched(err);
+      },
+    );
+
+    it("keeps the caller's own `code` and `stack` fields while the line still shows the Error's", async () => {
+      // errors() copies the Error's fields over the payload's, so the line shows
+      // the Error's `code` / `stack` (unchanged); the caller's values must survive.
+      const err = makeError();
+      const payload: Record<string, unknown> = {
+        message: err,
+        requestId: "r1",
+        code: "CALLER",
+        stack: "caller stack",
+      };
+
+      const out = await render(label, format, (logger) => logger.error(payload));
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(errorLine(format, label));
+      expectConsoleMatchesFile(format, out);
+      expect(payload).toEqual({
+        message: err,
+        requestId: "r1",
+        code: "CALLER",
+        stack: "caller stack",
+        level: "error",
+        [LEVEL_SLOT]: "error",
+      });
+      expect(payload.message).toBe(err);
+      expectErrorUntouched(err);
+    });
+
+    it("copies a plain payload's accessors by descriptor, never invoking them", async () => {
+      // A value copy would read `audit` once more than today; a descriptor copy
+      // leaves the read count exactly where it was (pretty: the printf and the
+      // console's accessor pass; json: the serializer).
+      const err = makeError();
+      let calls = 0;
+      const payload: Record<string, unknown> = { message: err, requestId: "r1" };
+      Object.defineProperty(payload, "audit", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          calls += 1;
+          return "a1";
+        },
+      });
+
+      const out = await render(label, format, (logger) => logger.error(payload));
+
+      expect(out.thrown).toBeUndefined();
+      expect(calls).toBe(format === "pretty" ? 2 : 1);
+      expect(out.fileOut).toContain(format === "pretty" ? '"audit": "a1"' : '"audit":"a1"');
+      expect(payload.message).toBe(err);
+      expect(hasOwn(payload, "code")).toBe(false);
+      expect(typeof Object.getOwnPropertyDescriptor(payload, "audit")?.get).toBe("function");
+    });
+
+    it("a getter-only `message` returning an Error degrades exactly as before, and writes nothing onto the payload", async () => {
+      // errors() cannot assign the flattened string over a getter-only `message`,
+      // so it throws and the line degrades via `_errorFlattenFailed` (unchanged).
+      // Before the fix its `Object.assign` had already copied `code` onto the
+      // caller's object by then.
+      const err = makeError();
+      let calls = 0;
+      const payload: Record<string, unknown> = { requestId: "r2" };
+      Object.defineProperty(payload, "message", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          calls += 1;
+          return err;
+        },
+      });
+
+      const out = await render(label, format, (logger) => logger.log("error", payload));
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? `UTC: ${STAMP}\n[ERROR] (${label})\nboom\n${FIXED_STACK}\n{\n  "_errorFlattenFailed": true\n}\n\n`
+          : `{"_errorFlattenFailed":true,"level":"error","message":"boom","module":"${label}",` +
+              `"stack":${JSON.stringify(FIXED_STACK)},"timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+      expect(Object.keys(payload)).toEqual(["requestId", "message", "level"]);
+      expect(hasOwn(payload, "code")).toBe(false);
+      expect(hasOwn(payload, "stack")).toBe(false);
+      // Twice by errors() and once by its fail-closed fallback, as before: the
+      // copy is chosen from the property descriptor, so the getter is not read.
+      expect(calls).toBe(3);
+      expectErrorUntouched(err);
+    });
+
+    it("a `message` accessor holding a string is read exactly as often as before", async () => {
+      let calls = 0;
+      const payload: Record<string, unknown> = { requestId: "r3" };
+      Object.defineProperty(payload, "message", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          calls += 1;
+          return "text";
+        },
+      });
+
+      const out = await render(label, format, (logger) => logger.log("error", payload));
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? `UTC: ${STAMP}\n[ERROR] (${label})\ntext\n{\n  "requestId": "r3"\n}\n\n`
+          : `{"level":"error","message":"text","module":"${label}","requestId":"r3","timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+      // The read counts measured before the fix: the getter stays an accessor on
+      // every copy, so each later format and the console re-read it. Choosing the
+      // copy from the descriptor adds no read of its own.
+      expect(calls).toBe(format === "pretty" ? 6 : 2);
+      expect(Object.keys(payload)).toEqual(["requestId", "message", "level"]);
+      expect(typeof Object.getOwnPropertyDescriptor(payload, "message")?.get).toBe("function");
+    });
+
+    it("a Proxy whose `message` exists only through its get trap renders exactly as before", async () => {
+      // A descriptor copy cannot reproduce a property the target does not own,
+      // so such a payload is not copied: errors() flattens it through the
+      // Proxy's traps as before (a documented exception, like a class
+      // instance), and the line keeps the Error's message.
+      const err = makeError();
+      const target: Record<string, unknown> = { requestId: "r1" };
+      const payload = new Proxy(target, {
+        get: (obj, key, receiver) => (key === "message" ? err : Reflect.get(obj, key, receiver)),
+      });
+
+      const out = await render(label, format, (logger) => logger.log("error", payload));
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(errorLine(format, label));
+      expectConsoleMatchesFile(format, out);
+      expect(out.fileOut).not.toContain("undefined");
+      // Still flattened in place through the traps, exactly as before.
+      expect(target).toEqual({
+        requestId: "r1",
+        level: "error",
+        code: "E42",
+        message: "boom",
+        stack: FIXED_STACK,
+        [LEVEL_SLOT]: "error",
+        [Symbol.for("message")]: "boom",
+      });
+      expectErrorUntouched(err);
+    });
+
+    it("a Proxy payload whose getOwnPropertyDescriptor trap throws degrades instead of throwing", async () => {
+      // The copy decision reads the `message` descriptor inside the errors() guard,
+      // so a hostile trap lands on the `_errorFlattenFailed` line. (Before, the
+      // same trap threw out of the log call from the timestamp step's copy.)
+      const target: Record<string, unknown> = { message: "px", requestId: "r1" };
+      const payload = new Proxy(target, {
+        set: (obj, key, value) => Reflect.set(obj, key, value),
+        getOwnPropertyDescriptor: () => {
+          throw new Error("gopd boom");
+        },
+      });
+
+      const out = await render(label, format, (logger) => logger.log("error", payload));
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? `UTC: ${STAMP}\n[ERROR] (${label})\nundefined\n{\n  "_errorFlattenFailed": true\n}\n\n`
+          : `{"_errorFlattenFailed":true,"level":"error","module":"${label}","timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+      expect(out.fileOut).not.toContain("gopd boom");
+      expect(target).toEqual({
+        message: "px",
+        requestId: "r1",
+        level: "error",
+        [LEVEL_SLOT]: "error",
+      });
+    });
+
+    it("with maskMetaKeys, a plain { message: err } payload renders the same masked line and stays untouched", async () => {
+      const err = makeError();
+      const payload: Record<string, unknown> = {
+        message: err,
+        requestId: "r1",
+        password: "secret-P7",
+      };
+
+      const out = await render(label, format, (logger) => logger.error(payload), ["password"]);
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? `UTC: ${STAMP}\n[ERROR] (${label})\nboom\n${FIXED_STACK}\n` +
+              `{\n  "requestId": "r1",\n  "password": "[REDACTED]",\n  "code": "E42"\n}\n\n`
+          : `{"code":"E42","level":"error","message":"boom","module":"${label}",` +
+              `"password":"[REDACTED]","requestId":"r1","stack":${JSON.stringify(FIXED_STACK)},` +
+              `"timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+      expect(out.fileOut).not.toContain("secret-P7");
+      expect(out.consoleOut).not.toContain("secret-P7");
+      expect(payload).toEqual({
+        message: err,
+        requestId: "r1",
+        password: "secret-P7",
+        level: "error",
+        [LEVEL_SLOT]: "error",
+      });
+      expectErrorUntouched(err);
+    });
+
+    it("a throwing `message` getter still degrades via `_errorFlattenFailed`, read no more often than before", async () => {
+      let calls = 0;
+      const payload: Record<string, unknown> = { data: 1 };
+      Object.defineProperty(payload, "message", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          calls += 1;
+          throw new Error("msg boom");
+        },
+      });
+
+      const out = await render(label, format, (logger) => logger.log("error", payload));
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? `UTC: ${STAMP}\n[ERROR] (${label})\nundefined\n{\n  "_errorFlattenFailed": true\n}\n\n`
+          : `{"_errorFlattenFailed":true,"level":"error","module":"${label}","timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+      expect(out.fileOut).not.toContain("msg boom");
+      // Once by the errors() step and once by its fail-closed fallback, as before.
+      expect(calls).toBe(2);
+      expect(Object.keys(payload)).toEqual(["data", "message", "level"]);
+    });
+
+    it("negative control: a top-level logger.error(err) renders exactly as before", async () => {
+      const err = makeError();
+
+      const out = await render(label, format, (logger) => logger.error(err));
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? `UTC: ${STAMP}\n[ERROR] (${label})\nboom\n${FIXED_STACK}\n{\n  "code": "E42"\n}\n\n`
+          : `{"code":"E42","level":"error","message":"boom","module":"${label}",` +
+              `"stack":${JSON.stringify(FIXED_STACK)},"timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+      // winston-core writes `level` onto the logged Error itself (unchanged);
+      // nothing else is added and its message and stack are intact.
+      expect(Object.keys(err)).toEqual(["code", "level"]);
+      expect(err.message).toBe("boom");
+      expect(err.stack).toBe(FIXED_STACK);
+    });
+
+    it("negative control: a plain string-message payload renders exactly as before", async () => {
+      const payload: Record<string, unknown> = { message: "plain", x: 1 };
+
+      const out = await render(label, format, (logger) => logger.info(payload));
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine(label, 'plain\n{\n  "x": 1\n}')
+          : `{"level":"info","message":"plain","module":"${label}","timestamp":"${STAMP}","x":1}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+      expect(payload).toEqual({ message: "plain", x: 1, level: "info", [LEVEL_SLOT]: "info" });
+    });
+
+    it("documented exception: a class-instance payload keeps winston's in-place flattening and its toJSON line", async () => {
+      // A plain copy would drop the prototype, so json() would stop calling the
+      // instance's toJSON and print the fields it withholds. Class instances
+      // therefore stay on errors()' in-place path: the line is unchanged and the
+      // instance's `message` is still replaced by the Error's message string.
+      class ErrorEnvelope {
+        public message: unknown;
+        public requestId: string;
+        constructor(message: unknown) {
+          this.message = message;
+          this.requestId = "r1";
+        }
+        toJSON(): Record<string, unknown> {
+          return { kind: "envelope", requestId: this.requestId };
+        }
+      }
+      const err = makeError();
+      const payload = new ErrorEnvelope(err);
+
+      const out = await render(label, format, (logger) => logger.error(payload));
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty" ? errorLine(format, label) : '{"kind":"envelope","requestId":"r1"}\n',
+      );
+      expectConsoleMatchesFile(format, out);
+      expect(payload.message).toBe("boom");
+      expect(Object.keys(payload)).toEqual([
+        "message",
+        "requestId",
+        "level",
+        "code",
+        "stack",
+        "timestamp",
+      ]);
+      expectErrorUntouched(err);
+    });
+  });
+});
