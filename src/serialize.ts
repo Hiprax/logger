@@ -198,8 +198,10 @@ export const errorToPlain = (err: object): Record<string, unknown> => {
  * renders byte-identically to `bigintSafeReplacer` alone.
  *
  * Both serializers call a value's `toJSON` BEFORE the replacer, so an `Error`
- * subclass defining `toJSON` renders its `toJSON` output as before and never
- * reaches the conversion.
+ * subclass defining `toJSON` renders its `toJSON` output as before; the
+ * conversion applies to that output only when it is itself an Error (an
+ * Error subclass whose `toJSON` returns `this` renders its view). The masking
+ * walk in `src/redact.ts` reads a `toJSON` output the same way.
  *
  * The conversion is memoized per replacer: the same `Error` always maps to
  * the SAME view object. That is what keeps each serializer's own cycle

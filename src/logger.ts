@@ -4,8 +4,19 @@ import winston from "winston";
 import DailyRotateFile from "winston-daily-rotate-file";
 import moment from "moment-timezone";
 import { InvalidTimezoneError, LoggerOptionError } from "./errors";
-import { redactValue, FORBIDDEN_KEYS, REDACTION_FAILED } from "./redact";
-import { bigintSafeReplacer, createErrorAwareReplacer, errorAwareStringify } from "./serialize";
+import {
+  redactValue,
+  redactEntries,
+  redactToJSONOutput,
+  FORBIDDEN_KEYS,
+  REDACTION_FAILED,
+} from "./redact";
+import {
+  bigintSafeReplacer,
+  createErrorAwareReplacer,
+  errorAwareStringify,
+  isErrorLike,
+} from "./serialize";
 import { registerCrashCapture, deregisterCrashCapture, resetCrashCapture } from "./crash-capture";
 import {
   acquireSharedGlobalFile,
@@ -366,6 +377,20 @@ const ROOT_ROUTED_METHODS: ReadonlySet<string> = new Set([
   "close",
   "end",
 ]);
+
+/**
+ * What the logger Proxy returns for a method it forwarded: the Proxy the call
+ * was made on (`receiver`) when the method returned the object it ran on
+ * (`raw`), and any other result unchanged. Winston's level methods, `log()`,
+ * `add()` / `remove()` / `clear()`, `close()` / `end()` and the event-emitter
+ * methods all return `this` so calls can be chained. Returning that raw winston
+ * object would let a chain leave the Proxy: `logger.info("x").success("y")`
+ * would lose the unknown-method fallback, and a child made by
+ * `logger.info("x").child(meta)` would be unknown to `shutdownLogger`, which
+ * would then end the root but leave it cached.
+ */
+const keepOnProxy = (result: unknown, raw: winston.Logger, receiver: unknown): unknown =>
+  result === raw ? receiver : result;
 
 /**
  * Drops a logger's `loggerRegistry` slot the moment it becomes unfit to be
@@ -1109,63 +1134,10 @@ const redactMessagePayload = (
       // ITS `toJSON` too (a `Buffer`), which the no-mask line never does.
       return redacted === produced ? value : redacted;
     }
-    return redactValue(value, maskKeys as Set<string>, new WeakSet<object>());
+    return redactValue(value, maskKeys as Set<string>, new WeakSet<object>(), false, 0, key);
   } catch {
     return REDACTION_FAILED;
   }
-};
-
-/**
- * Masks the OUTPUT of a `toJSON()` the helper above already called, reading it
- * the way the serializer will.
- *
- * `JSON.stringify` and winston's json serializer (`safe-stable-stringify`,
- * "Prevent calling `toJSON` again") call `toJSON` ONCE and then serialize its
- * result by the result's own enumerable keys; a `toJSON` on the result is never
- * called. `redactValue` does not know the result was already resolved: it
- * passes any value defining `toJSON` through by identity, so a
- * `toJSON() { return this; }` instance (or a result wrapping another
- * `toJSON`-bearing object) came back unmasked and the serializer printed its
- * fields, masked keys included. So a non-array result that DEFINES `toJSON`
- * is rebuilt here key by key into a plain object (the same keys, in the same
- * order, the serializer reads), and a function-valued `toJSON` key is dropped:
- * the serializer omits a function value anyway, and on the rebuild it would
- * otherwise be CALLED, printing something the no-mask line never shows. Every
- * other result (an array, a plain object, a class instance, a boxed primitive,
- * a typed array) has no `toJSON` for the serializer to skip, so `redactValue`
- * handles it exactly as it handles metadata. A binary view (a `Buffer`, whose
- * `toJSON` is inherited) is sent there too: it holds no key-addressable
- * secret, and rebuilding it into a plain object would change its key order in
- * json mode. A result handed back by identity makes the caller return the
- * ORIGINAL value, so the serializer reads it the way the no-mask line does.
- * Nested values keep `redactValue`'s rules (their own `toJSON` IS called by
- * the serializer). Throws propagate to the caller's fail-closed catch.
- */
-const redactToJSONOutput = (produced: object, maskKeys: ReadonlySet<string>): unknown => {
-  const seen = new WeakSet<object>();
-  if (
-    Array.isArray(produced) ||
-    ArrayBuffer.isView(produced) ||
-    typeof (produced as Record<string, unknown>).toJSON !== "function"
-  ) {
-    return redactValue(produced, maskKeys as Set<string>, seen);
-  }
-  const rebuilt: Record<string, unknown> = {};
-  for (const key of Object.keys(produced)) {
-    if (FORBIDDEN_KEYS.has(key)) {
-      continue;
-    }
-    if (maskKeys.has(key.toLowerCase())) {
-      rebuilt[key] = "[REDACTED]";
-      continue;
-    }
-    const child = (produced as Record<string, unknown>)[key];
-    if (key === "toJSON" && typeof child === "function") {
-      continue;
-    }
-    rebuilt[key] = redactValue(child, maskKeys as Set<string>, seen, false, 1);
-  }
-  return rebuilt;
 };
 
 const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
@@ -1193,9 +1165,9 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
     // keeps BOTH guarantees at once: a withheld field stays withheld, AND a
     // masked key present in the `toJSON` OUTPUT is still redacted. Pass-through
     // would satisfy the first and silently void the second (a `toJSON` that
-    // surfaces `password` would emit it in cleartext), and unlike `redact.ts`'s
-    // NESTED `toJSON` boundary there is no `redactPaths` escape hatch on
-    // `createLogger` to fall back on — so the two are deliberately asymmetric.
+    // surfaces `password` would emit it in cleartext). `redact.ts` treats a
+    // NESTED `toJSON` the same way under a mask, so the entry and the values
+    // nested in it are masked alike.
     //
     // Never restore the prototype onto the rebuild instead
     // (`Object.create(Object.getPrototypeOf(info))`, `setPrototypeOf`, or
@@ -1239,18 +1211,27 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
     //  - a subject that DEFINES `toJSON` (a `Date` output, a
     //    `toJSON() { return this; }` instance) takes the rebuild, which reads
     //    it the way the serializer does and skips its function-valued `toJSON`
-    //    key. Handing it to `redactValue` would pass it back by identity, and
-    //    the serializer would print its fields, masked keys included.
-    //  - an ARRAY (the info itself, `logger.log("info", ["a","b"])` —
-    //    `logger.js:245` takes the object branch — or a `toJSON` output) is
-    //    delegated to `redactValue`: the rebuild would render
+    //    key. Handing it to `redactValue` would call the result's own `toJSON`,
+    //    which the serializer never does (before the walk resolved `toJSON`
+    //    under a mask, it passed such a result back by identity and the
+    //    serializer printed its fields, masked keys included).
+    //  - an ARRAY is delegated instead: the rebuild would render
     //    `{"0":"a","1":"b"}` plus the `level` / `timestamp` props winston
-    //    assigned onto it, where the no-mask line renders `["a","b"]`.
+    //    assigned onto it, where the no-mask line renders `["a","b"]`. The
+    //    info itself (`logger.log("info", ["a","b"])` — `logger.js:245` takes
+    //    the object branch) goes to `redactValue`; a `toJSON` output goes to
+    //    `redactToJSONOutput`, which walks an array result by its elements and
+    //    never calls a `toJSON` of the result's own (the serializer does not;
+    //    through `redactValue`, such a `toJSON` returning a primitive made this
+    //    format hand `info` back, and `json()` printed the elements unmasked).
+    //  - an error-like `toJSON` OUTPUT is delegated to `redactToJSONOutput`
+    //    too, whether or not it defines `toJSON` itself: the serializer's
+    //    replacer renders it through its field view, which the Error walk masks.
     //  - any other non-plain `toJSON` OUTPUT (a class instance, a boxed
     //    primitive, a typed array, and a `Buffer` despite its inherited
     //    `toJSON`) is delegated too, so the serializer still reads it as the
     //    no-mask line does (a typed array's index order is kept).
-    // A fresh `redactValue` result is package-owned, so the Symbol slots are
+    // A fresh delegated result is package-owned, so the Symbol slots are
     // carried onto it; the SAME value back means nothing was key-addressable.
     // An ordinary non-`toJSON` class instance info (`subject === source`)
     // keeps the rebuild, which preserves the reserved keys and degrades per key.
@@ -1266,11 +1247,17 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
         const delegate =
           Array.isArray(subject) ||
           (subject !== source &&
-            proto !== null &&
-            proto !== Object.prototype &&
-            (ArrayBuffer.isView(subject) || typeof subject.toJSON !== "function"));
+            (isErrorLike(subject) ||
+              (proto !== null &&
+                proto !== Object.prototype &&
+                (ArrayBuffer.isView(subject) || typeof subject.toJSON !== "function"))));
         if (delegate) {
-          const redacted = redactValue(subject, maskMetaKeys as Set<string>, seen);
+          // A `toJSON` output is read the way the serializer reads it, never
+          // through a `toJSON` of its own (an array result included).
+          const redacted =
+            subject === source
+              ? redactValue(subject, maskMetaKeys as Set<string>, seen)
+              : redactToJSONOutput(subject, maskMetaKeys, seen);
           if (redacted === subject) {
             // Nothing key-addressable (a boxed primitive, a typed array, an
             // instance holding no masked key): hand `info` back so `json()`
@@ -1326,7 +1313,13 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
         // already OWNED that key (an own data property shadows the accessor).
         continue;
       }
-      if (RESERVED_INFO_KEYS.has(key)) {
+      // In a `toJSON` OUTPUT (`subject !== source`) a `level` or `timestamp`
+      // key is the caller's data, not the value winston or the capture wrote,
+      // and the line prints it, so it is masked and walked like any other key.
+      if (
+        RESERVED_INFO_KEYS.has(key) &&
+        (subject === source || key === "message" || key === "stack")
+      ) {
         // Reserved slots are copied without a key walk (`message` and
         // `stack` excepted, below) — but the copy READS
         // `subject[key]`, and a caller can supply a throwing accessor on a
@@ -1371,7 +1364,7 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
           // be CALLED, printing what the no-mask line never shows.
           continue;
         }
-        next[key] = redactValue(child, maskMetaKeys as Set<string>, seen);
+        next[key] = redactValue(child, maskMetaKeys as Set<string>, seen, false, 0, key);
       } catch {
         // Fail closed on this key only — the rest of the line still renders.
         next[key] = REDACTION_FAILED;
@@ -2118,10 +2111,7 @@ const formatMessage = (ctx: TimestampContext, options: FormatOptions = {}) =>
         return metadata;
       }
       try {
-        return redactValue(metadata, maskMetaKeys as Set<string>, new WeakSet()) as Record<
-          string,
-          unknown
-        >;
+        return redactEntries(metadata, maskMetaKeys as Set<string>, new WeakSet());
       } catch {
         return { _redactionFailed: true };
       }
@@ -3148,7 +3138,7 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
             baseLogger as unknown as Record<string, (...inner: unknown[]) => unknown>
           )[prop];
           const result = Reflect.apply(method, baseLogger, routedArgs);
-          return result === baseLogger ? receiver : result;
+          return keepOnProxy(result, baseLogger, receiver);
         };
       }
 
@@ -3168,8 +3158,10 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
       }
 
       // 4. Pass-through to the wrapped logger for any prop that already exists
-      //    on it (own or inherited). Methods are bound to `target`, so a child's
-      //    level methods reach the child's own `write`. The one exception is an
+      //    on it (own or inherited). Methods run with `target` as `this`, so a
+      //    child's level methods reach the child's own `write`, and a method
+      //    that returns `target` (a level method, `log()`, `on()`, ...) returns
+      //    this Proxy instead (`keepOnProxy`). The one exception is an
       //    own non-writable, non-configurable data property: the Proxy `get`
       //    invariant requires the trap to return exactly that value, and a
       //    winston child's own `write` is one (`Object.create(base, { write:
@@ -3182,7 +3174,13 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
           if (own?.configurable === false && own.writable === false) {
             return value;
           }
-          return value.bind(target);
+          // `constructor` stays a bound function: an arrow wrapper cannot be
+          // called with `new`, and a constructor never returns `target` anyway.
+          if (prop === "constructor") {
+            return value.bind(target);
+          }
+          return (...args: unknown[]): unknown =>
+            keepOnProxy(Reflect.apply(value, target, args), target, receiver);
         }
         return value;
       }
@@ -3211,10 +3209,11 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
       // 8. Existing fallback warning behavior for legitimate typos like
       //    `logger.success("ok")` — emit the one-time warning (one per method
       //    name for the root and all its children) and route the call to
-      //    `info()` on the logger it was made on, so a child keeps its metadata.
+      //    `info()` on the logger it was made on, so a child keeps its metadata
+      //    and the call returns this Proxy, as the method it stands in for would.
       return (...args: unknown[]) => {
         emitUnknownMethodWarning(prop);
-        return invokeInfoFallback(target, args);
+        return keepOnProxy(invokeInfoFallback(target, args), target, receiver);
       };
     },
     has(target, prop) {

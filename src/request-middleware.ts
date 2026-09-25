@@ -307,8 +307,9 @@ const serializeBody = (
     : ((maskKeys as Set<string> | undefined) ?? new Set<string>());
 
   // Apply the keyword-based `maskBodyKeys` redaction. Returns a fresh object
-  // for plain/data-bearing shapes but passes built-ins and `toJSON`-defining
-  // instances through by identity (the documented redaction boundary — see
+  // for plain/data-bearing shapes; built-ins pass through by identity, and so
+  // do `toJSON`-defining values when `maskBodyKeys` is empty, while with a
+  // mask such a value is replaced by its masked `toJSON` output (see
   // `src/redact.ts`).
   let masked = redactValue(body, maskSet, new WeakSet());
 
@@ -323,8 +324,8 @@ const serializeBody = (
   //      inside `_preview`. Applying paths here, pre-truncation, closes that.
   //   2. Caller-object mutation — `redactEntryPath` writes in place, so it must
   //      never touch a node the caller still owns. `redactValue` shares
-  //      built-ins and `toJSON`-defining instances (e.g. a DTO or a `moment`)
-  //      by identity, so mutating them directly would corrupt the live
+  //      built-ins, and without a mask `toJSON`-defining instances (e.g. a DTO
+  //      or a `moment`), by identity, so mutating them directly would corrupt the live
   //      `req.body`. Round-tripping through `JSON.parse(JSON.stringify(...))`
   //      first yields a graph that is (a) entirely fresh — nothing shared with
   //      the caller — and (b) shaped exactly as the final log serializer will

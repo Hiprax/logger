@@ -391,21 +391,32 @@ export interface LoggerOptions {
    * leak via one transport but not the other. Circular references are handled
    * gracefully (replaced with `"[Circular]"`).
    *
-   * **Redaction boundary.** Deep redaction covers plain objects, arrays, and
-   * the enumerable own fields of class/Error instances. NESTED values that
-   * define their own `toJSON()` (such as `Date`, `URL`, and custom
-   * serializable classes) or that carry no enumerable own keys (`Map`, `Set`,
-   * `RegExp`, etc.) are serialized via their built-in method and are **not**
-   * key-redacted — use `redactPaths` or normalize to a plain object for those.
-   * Three top-level values are the exception, and their `toJSON()` is resolved
-   * first so the resulting fields ARE key-redacted: a `toJSON`-defining message
-   * (any format), a `toJSON`-defining object passed as the log call's own
-   * subject (`logger.info(dto)` in `format: "json"`), and, in the default
-   * pretty format, a metadata object with its own `toJSON()` method, which is
-   * called on the masked copy. A field such a `toJSON()` withholds is never
-   * printed because a mask is on. The one exception is a mask that names
-   * `toJSON` itself: in pretty mode it replaces a metadata object's method with
-   * the placeholder, so that object's own keys are printed instead.
+   * **Values with their own `toJSON()`.** Deep redaction covers plain objects,
+   * arrays, the enumerable own fields of class instances, `Error`s (their own
+   * fields, `cause` chain and `AggregateError` members), and the OUTPUT of a
+   * nested value's own `toJSON()` (a DTO, a database document, an HTTP client
+   * error, also inside an error's `cause`): the serializer prints that output,
+   * so the masking walk calls the method the same way and masks what it
+   * returns by its own keys. A class instance's `toJSON()` runs on the
+   * instance (so `#private` fields work), a nested plain object's on the masked
+   * copy.
+   * The log entry's own top-level `toJSON()` is resolved first as well: a
+   * `toJSON`-defining message (any format), a `toJSON`-defining object passed
+   * as the log call's own subject (`logger.info(dto)` in `format: "json"`,
+   * called on the real object), and, in the default pretty format, a metadata
+   * object with its own `toJSON()` method, which is called on the masked copy.
+   * A field such a `toJSON()` withholds is never printed because a mask is on.
+   * The one exception is a mask that names `toJSON` itself: it replaces a plain
+   * object's own method with the placeholder, so that object's own keys are
+   * printed instead.
+   *
+   * **What masking cannot reach.** Masking matches keys, never text: a
+   * `toJSON()` that returns a string (`Date`, `URL`) renders unchanged, a value
+   * a class instance's `toJSON()` copies from a masked field under another key
+   * name (or returns as a string) is printed, and an error `message` built from
+   * the error's own fields prints as built. Values with no enumerable own keys
+   * (`Map`, `Set`, `RegExp`) and binary values (`Buffer`, typed arrays) render
+   * as their serializer renders them — normalize those to a plain object.
    *
    * **Console/file parity (`format: "json"`).** The json-mode Console transport
    * carries no per-transport format, so `winston-transport` writes the
@@ -677,12 +688,14 @@ export interface RequestLoggerOptions {
    * Matched **case-insensitively** and applied **deeply** (including arrays
    * and nested objects).
    *
-   * **Redaction boundary.** Deep redaction covers plain objects, arrays, and
-   * the enumerable own fields of class/Error instances. Values that define
-   * their own `toJSON()` (such as `Date`, `URL`, and custom serializable
-   * classes) or that carry no enumerable own keys (`Map`, `Set`, `RegExp`,
-   * etc.) are serialized via their built-in method and are **not** key-
-   * redacted — use `redactPaths` or normalize to a plain object for those.
+   * **Redaction boundary.** Deep redaction covers plain objects, arrays, the
+   * enumerable own fields of class/Error instances, and the output of a
+   * value's own `toJSON()` (a DTO, an HTTP client error, also inside an
+   * error's `cause`), masked the way the serializer reads it. A `toJSON()`
+   * returning a string (such as `Date` and `URL`) and values that carry no
+   * enumerable own keys (`Map`, `Set`, `RegExp`, etc.) are serialized via their
+   * built-in method and are **not** key-redacted — use `redactPaths` or
+   * normalize to a plain object for those.
    */
   maskBodyKeys?: string[];
   /**
@@ -728,11 +741,11 @@ export interface RequestLoggerOptions {
    *
    * Defaults to `[]`.
    *
-   * **Redaction boundary note.** Deep redaction (via `maskBodyKeys`) covers
-   * plain objects, arrays, and the enumerable own fields of class/Error
-   * instances but does **not** key-redact values that define their own
-   * `toJSON()`. Use `redactPaths` for surgical path-based replacement of such
-   * values (e.g. `["body.user.createdAt"]` to blank a `Date` field).
+   * **Redaction boundary note.** Deep redaction (via `maskBodyKeys`) masks
+   * keys, including those in the output of a value's own `toJSON()`, but a
+   * `toJSON()` that returns a string (a `Date`) has no key to mask. Use
+   * `redactPaths` for surgical path-based replacement of such values (e.g.
+   * `["body.user.createdAt"]` to blank a `Date` field).
    */
   redactPaths?: string[];
   /**

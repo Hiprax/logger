@@ -11,7 +11,7 @@ import * as loggerModule from "../src/logger";
 import { resetLoggerRegistry } from "../src/logger";
 import { RequestLoggerOptionError } from "../src/errors";
 import { MAX_REDACT_DEPTH } from "../src/redact";
-import { errorToPlain } from "../src/serialize";
+import { createErrorAwareReplacer, errorToPlain } from "../src/serialize";
 import type { LoggableRequest, LoggableResponse, LoggableNext, LogLevel } from "../src/types";
 import { createMockLogger, MockRequest, runMiddleware, withEnv } from "./_helpers";
 
@@ -3806,19 +3806,54 @@ describe("request middleware internals", () => {
       expect(out).toBe(input);
     });
 
-    it("passes through a class instance that defines toJSON even when a key matches (documented limitation)", () => {
+    it("masks the toJSON() output of a class instance that defines toJSON, leaving the instance untouched", () => {
       class Timestamped {
         public readonly password = "secret";
         toJSON() {
-          return { customized: true };
+          return { customized: true, password: this.password };
         }
       }
       const input = new Timestamped();
       const mask = new Set(["password"]);
       const out = redactValue(input, mask, new WeakSet());
-      // hasToJSON === true → pass-through, no key walk; this is the documented
-      // limitation: use `redactPaths` or normalize to a plain object instead.
-      expect(out).toBe(input);
+      // With a mask, toJSON is resolved on the instance and its output is
+      // masked by its own keys, the way the serializer reads it.
+      expect(out).toEqual({ customized: true, password: "[REDACTED]" });
+      expect(out).not.toBe(input);
+      expect(input.password).toBe("secret");
+    });
+
+    it("without a mask, a value that defines toJSON passes through by identity and toJSON is never called", () => {
+      const toJSON = jest.fn(() => ({ password: "secret" }));
+      const input = { nested: { toJSON } };
+
+      const out = redactValue(input, new Set<string>(), new WeakSet()) as typeof input;
+
+      expect(out).not.toBe(input);
+      expect(out.nested.toJSON).toBe(toJSON);
+      expect(toJSON).not.toHaveBeenCalled();
+      class Dated {
+        toJSON() {
+          return "2026-01-02";
+        }
+      }
+      const dated = new Dated();
+      expect(redactValue(dated, new Set<string>(), new WeakSet())).toBe(dated);
+    });
+
+    it("a throwing toJSON getter fails closed with a mask and throws as before without one", () => {
+      class HostileGetter {
+        get toJSON(): never {
+          throw new Error("getter refused");
+        }
+      }
+
+      expect(redactValue({ h: new HostileGetter() }, new Set(["password"]), new WeakSet())).toEqual(
+        { h: "[RedactionFailed]" },
+      );
+      expect(() => redactValue(new HostileGetter(), new Set<string>(), new WeakSet())).toThrow(
+        "getter refused",
+      );
     });
 
     it("serializeBody does not mutate a caller-owned toJSON-defining class-instance body when redactPaths targets its own field", () => {
@@ -4282,7 +4317,7 @@ describe("request middleware internals", () => {
       expect(out.cause).not.toBe(cause);
     });
 
-    it("an Error subclass with its own toJSON stays on the pass-through path (identity, fields untouched)", () => {
+    it("an Error subclass with its own toJSON renders only its toJSON output, masked (fields it hides stay hidden)", () => {
       class SafeError extends Error {
         public password = "S7";
         toJSON(): Record<string, unknown> {
@@ -4291,8 +4326,14 @@ describe("request middleware internals", () => {
       }
       const err = new SafeError("hidden", { cause: { password: "S8" } });
 
-      expect(redactValue(err, mask, new WeakSet())).toBe(err);
-      expect(JSON.stringify(redactValue(err, mask, new WeakSet()))).toBe('{"message":"hidden"}');
+      const out = redactValue(err, mask, new WeakSet());
+
+      // An owned copy of the toJSON output: the same JSON as before, never the
+      // instance's own fields or its cause.
+      expect(out).toEqual({ message: "hidden" });
+      expect(out).not.toBe(err);
+      expect(JSON.stringify(out)).toBe('{"message":"hidden"}');
+      expect(err.password).toBe("S7");
     });
 
     it("forceCopy returns a fully owned copy of an Error, even with nothing to mask", () => {
@@ -4916,5 +4957,131 @@ describe("a child logger as the middleware's logger", () => {
     expect(line.http).toEqual(
       expect.objectContaining({ url: "/report/a%d?q=%s", method: "POST", statusCode: 200 }),
     );
+  });
+});
+
+describe("maskBodyKeys masks what a body value's own toJSON() returns", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const STACK = "Error: fixed\n    at fixed (fixed.js:1:1)";
+
+  /** An HTTP-client-style error whose toJSON() includes the request headers (the axios shape). */
+  class ClientError extends Error {
+    readonly #headers: Record<string, string>;
+
+    public constructor(message: string, headers: Record<string, string>) {
+      super(message);
+      this.#headers = headers;
+    }
+
+    public toJSON(): Record<string, unknown> {
+      return {
+        name: "ClientError",
+        message: this.message,
+        config: { headers: { ...this.#headers } },
+      };
+    }
+  }
+
+  /** A body holding an error whose cause is the client error. */
+  const bodyWithClientError = (extra: Record<string, unknown> = {}): Record<string, unknown> => {
+    const err = new Error("charge failed", {
+      cause: new ClientError("upstream", { authorization: "Bearer S-BODY" }),
+    });
+    err.stack = STACK;
+    return { err, id: 1, ...extra };
+  };
+
+  const maskedErr = {
+    name: "Error",
+    message: "charge failed",
+    stack: STACK,
+    cause: {
+      name: "ClientError",
+      message: "upstream",
+      config: { headers: { authorization: "[REDACTED]" } },
+    },
+  };
+
+  const logOnce = (options: Parameters<typeof createRequestLogger>[0], body: unknown) => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({ logger, includeHttpContext: true, ...options });
+    const { res } = runMiddleware(middleware, { body });
+    res.emit("finish");
+    expect(log).toHaveBeenCalledTimes(1);
+    return log.mock.calls[0][0].http as Record<string, unknown>;
+  };
+
+  it("masks it in an under-limit body", () => {
+    const http = logOnce(
+      { includeRequestBody: true, maskBodyKeys: ["authorization"] },
+      bodyWithClientError(),
+    );
+
+    expect(http.requestBody).toEqual({ err: maskedErr, id: 1 });
+    expect(JSON.stringify(http.requestBody)).not.toContain("S-BODY");
+  });
+
+  it("masks it in the preview of an over-limit body", () => {
+    const http = logOnce(
+      { includeRequestBody: true, maskBodyKeys: ["authorization"], maxBodyLength: 400 },
+      bodyWithClientError({ pad: "x".repeat(500) }),
+    );
+
+    const envelope = http.requestBody as { _truncated: boolean; _preview: string };
+    expect(envelope._truncated).toBe(true);
+    expect(envelope._preview).toContain('"authorization":"[REDACTED]"');
+    expect(envelope._preview).not.toContain("S-BODY");
+  });
+
+  it("masks it when redactPaths also apply", () => {
+    const http = logOnce(
+      { includeRequestBody: true, maskBodyKeys: ["authorization"], redactPaths: ["body.id"] },
+      bodyWithClientError(),
+    );
+
+    expect(http.requestBody).toEqual({ err: maskedErr, id: "[REDACTED]" });
+  });
+
+  it("never prints the own toJSON of an error a body value's toJSON() returns", () => {
+    const body = (): Record<string, unknown> => {
+      const err = Object.assign(new Error("x"), {
+        details: {},
+        toJSON: () => ({ authorization: "S-BODY-ERROR-JSON" }),
+      });
+      err.stack = STACK;
+      return { holder: { toJSON: () => err }, pad: "y".repeat(300) };
+    };
+
+    const underLimit = logOnce(
+      { includeRequestBody: true, maskBodyKeys: ["authorization"] },
+      body(),
+    );
+    const overLimit = logOnce(
+      { includeRequestBody: true, maskBodyKeys: ["authorization"], maxBodyLength: 200 },
+      body(),
+    );
+
+    const rendered = JSON.stringify(underLimit.requestBody, createErrorAwareReplacer());
+    expect(rendered).toContain('"holder":{"name":"Error","message":"x"');
+    expect(rendered).not.toContain("S-BODY-ERROR-JSON");
+    const envelope = overLimit.requestBody as { _truncated: boolean; _preview: string };
+    expect(envelope._truncated).toBe(true);
+    expect(envelope._preview).toContain('"message":"x"');
+    expect(envelope._preview).not.toContain("S-BODY-ERROR-JSON");
+  });
+
+  it("without maskBodyKeys the body is unchanged: the toJSON output renders as it did", () => {
+    const body = bodyWithClientError();
+
+    const http = logOnce({ includeRequestBody: true }, body);
+
+    const rendered = JSON.stringify(http.requestBody, createErrorAwareReplacer());
+    expect(rendered).toContain('"authorization":"Bearer S-BODY"');
+    // The body's Error holds only primitives beside its cause, so it is shared as is.
+    expect((http.requestBody as { err: unknown }).err).toBe(body.err);
   });
 });
