@@ -11648,9 +11648,17 @@ describe("serialize: FORBIDDEN_KEYS, isErrorLike, errorToPlain", () => {
         plain = errorToPlain(hostile);
       }).not.toThrow();
 
-      // V8's own `stack` accessor returns undefined for a Proxy receiver, and an
-      // undefined standard field is omitted; the rest survives.
-      expect(plain).toEqual({ name: "Error", message: "proxied" });
+      // `stack` is read through the Proxy like any standard field, and what that
+      // read returns depends on the engine: the `stack` accessor of Node 22 and
+      // later returns undefined for a Proxy receiver, while Node 18 and 20 return
+      // the assigned string. The field follows that read and is omitted, not
+      // written as `undefined`, when it yields nothing; the rest survives.
+      const stackThroughProxy = (hostile as Error).stack;
+      expect(plain).toStrictEqual(
+        stackThroughProxy === undefined
+          ? { name: "Error", message: "proxied" }
+          : { name: "Error", message: "proxied", stack: target.stack },
+      );
     });
 
     it("never mutates its input and returns a new object on every call", () => {
@@ -13439,7 +13447,10 @@ describe("child loggers", () => {
       captureUncaught: false,
       clock: fixedClock,
       format,
-      additionalTransports: [new winston.transports.Stream({ stream })],
+      // `eol: "\n"` keeps the exact-line assertions platform-independent
+      // (winston's Stream transport otherwise appends `os.EOL`, i.e. CRLF on
+      // Windows). The formatter's own trailing `\n` is unaffected.
+      additionalTransports: [new winston.transports.Stream({ stream, eol: "\n" })],
       ...extra,
     });
     return { logger, output: () => chunks.join("") };

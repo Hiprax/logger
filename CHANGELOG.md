@@ -16,6 +16,9 @@
   - New Jest `globalSetup` / `globalTeardown` hooks snapshot the repository tree (type, size, nanosecond mtime) before and after the run, skipping `.git`, `node_modules`, Jest's coverage and cache directories, and top-level dot entries. Any created, changed or deleted path fails the run with the paths listed; under `--watch` / `--watchAll` (`npm run test:watch`) the same report is printed instead, so the watcher keeps running.
 - **Line endings normalized to LF** in `.gitignore`, `LICENSE`, `jest.config.ts`, `tsconfig.json` and `tsup.config.ts`, matching the repository's `.gitattributes` (`eol=lf`) and Prettier `endOfLine: "lf"`. Content is otherwise unchanged.
 - **`tsconfig.json` now declares `"lib": ["ES2022"]`**, so the source and tests can use the ES2022 `Error` `cause` option and `AggregateError` in type-checked code. Types only: `engines.node >= 18` already provides both at runtime, and the emitted JavaScript and the published declarations (`dist/index.d.ts`, `dist/index.d.cts`) are byte-identical. Contributor-facing only.
+- **The test suite passes on Windows and on Node 18 / 20 again** (`tests/logger.spec.ts`). Contributor-facing only; no source change.
+  - The child-logger tests' output sink now passes `eol: "\n"` to winston's Stream transport, like the suite's other exact-line sinks. It used the platform `os.EOL`, so on Windows every entry ended in `\r\n` and five exact-line assertions failed.
+  - The `errorToPlain` test for a Proxy whose key listing and descriptor lookups throw expected `stack` to be left out. Reading `stack` through a Proxy returns `undefined` on Node 22 and later but the assigned string on Node 18 and 20, and `errorToPlain` keeps whatever that read returns (leaving the field out only when it is `undefined`), so the test now expects the engine's own result on every version.
 
 ### Fixed
 
