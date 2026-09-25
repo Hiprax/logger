@@ -583,7 +583,14 @@ const normalizeHeaders = (
     if (FORBIDDEN_OBJECT_KEYS.has(normalizedKey)) {
       return acc;
     }
-    if (normalized[normalizedKey] !== undefined) {
+    // Own keys only: `normalized` is an ordinary object, so a plain read of a
+    // header the request did not send would return whatever an inherited
+    // (polluted) `Object.prototype` property holds, log it as that header, and
+    // hand the shared object to the `redactPaths` pass by reference.
+    if (
+      Object.prototype.hasOwnProperty.call(normalized, normalizedKey) &&
+      normalized[normalizedKey] !== undefined
+    ) {
       acc[normalizedKey] = normalized[normalizedKey];
     }
     return acc;
@@ -729,6 +736,18 @@ const safeRedactedUrl = (
 };
 
 /**
+ * The entry fields a multi-segment `redactPaths` entry may descend into: the
+ * sub-graphs the package copies before the path pass (`requestBody` via
+ * `serializeBody`, the two header bags via `normalizeHeaders`, `context` via
+ * `ownContext`). The other fields (`method`, `url`, `ip`, `userAgent`,
+ * `requestId`, ...) are taken from the request as they are and typed as
+ * primitives; an adapter that breaks those types (a `req.get()` returning its
+ * own live array) would otherwise hand the walk the application's object. A
+ * single-segment path (`url`, `userAgent`) still redacts the field itself.
+ */
+const PATH_ROOT_FIELDS = new Set(["requestBody", "requestHeaders", "responseHeaders", "context"]);
+
+/**
  * Whether `value` is a container {@link redactEntryPath} may step through or
  * write into: an array, or an object whose prototype is exactly
  * `Object.prototype`. Every container the package owns for redaction has one of
@@ -775,48 +794,58 @@ const isOwnedPathContainer = (value: unknown): value is Record<string, unknown> 
  * 2. **The caller's live objects are never written.** Everything the package
  *    owns for redaction is a plain object or an array (the `ownContext` /
  *    `serializeBody` JSON round-trips, the `normalizeHeaders` bag and its
- *    `ownHeaderValue` copies). Any other value in the entry (a `Date`, a class
- *    instance with its own `toJSON()`, a `Buffer`, a `RegExp`, a `Map`) was
- *    kept BY REFERENCE, so everything behind it is the application's state:
- *    the walk stops there. Checking only the final target was not enough: a
- *    path through a `toJSON`-defining response-header value reached a plain
- *    object the application owned and overwrote its field.
+ *    `ownHeaderValue` copies), and from the entry itself a path descends only
+ *    into those copied fields ({@link PATH_ROOT_FIELDS}). Any other value in
+ *    the entry (a `Date`, a class instance with its own `toJSON()`, a
+ *    `Buffer`, a `RegExp`, a `Map`, an adapter's non-string field) was kept BY
+ *    REFERENCE, so everything behind it is the application's state: the walk
+ *    stops there. Checking only the final target was not enough: a path
+ *    through a `toJSON`-defining response-header value reached a plain object
+ *    the application owned and overwrote its field.
  * 3. **No caller code runs.** An accessor is never invoked, on the path or at
  *    the target; the earlier walk ran inherited and own getters on the way.
- * 4. **It never throws.** Anything that throws while reading or writing (a
- *    Proxy trap, an exotic host object) turns the path into a no-op. This is
- *    load-bearing: `finalize()` applies these paths inside the same try block
- *    that assembles the whole entry, so a throw here dropped the ENTIRE log
- *    line (method, url, status included) over one path.
+ *    Descriptor fields are read as the descriptor's OWN properties, so an
+ *    inherited (polluted) `value` / `writable` cannot make an accessor look
+ *    like a writable data slot and get its setter called.
+ * 4. **It never throws**, whatever `path` holds. Anything that throws while
+ *    splitting, reading or writing (a Proxy trap, an exotic host object) turns
+ *    the path into a no-op. This is load-bearing: `finalize()` applies these
+ *    paths inside the same try block that assembles the whole entry, so a
+ *    throw here dropped the ENTIRE log line (method, url, status included)
+ *    over one path.
  *
  * Other no-ops: a missing segment, a non-object step, an array `length`
  * target, and a non-writable (frozen) slot.
  */
 const redactEntryPath = (entry: Record<string, unknown>, path: string): void => {
-  if (!path) {
-    return;
-  }
-  const segments = path.split(".").filter(Boolean);
-  if (segments.length === 0) {
-    return;
-  }
-  // Map the user-facing `body` alias to the on-entry `requestBody` field.
-  if (segments[0] === "body") {
-    segments[0] = "requestBody";
-  }
-  const lastIndex = segments.length - 1;
   try {
+    if (!path) {
+      return;
+    }
+    const segments = path.split(".").filter(Boolean);
+    if (segments.length === 0) {
+      return;
+    }
+    // Map the user-facing `body` alias to the on-entry `requestBody` field.
+    if (segments[0] === "body") {
+      segments[0] = "requestBody";
+    }
+    const lastIndex = segments.length - 1;
     let container: unknown = entry;
     for (let i = 0; i <= lastIndex; i += 1) {
       const key = segments[i];
-      // Prototype-pollution guard, checked on every segment at the point of use.
-      // Same names as FORBIDDEN_OBJECT_KEYS, written as literal comparisons
-      // because static analysis recognizes them as sanitizers where it does
-      // not recognize `Set.prototype.has` (an earlier CodeQL finding on this
-      // walk could only be dismissed by hand). A test iterates
+      // Prototype-pollution guard, checked on every segment at the point of
+      // use. Same names as FORBIDDEN_OBJECT_KEYS, written as the literal
+      // comparisons CodeQL's documentation recommends (it does not treat
+      // `Set.prototype.has` as a guard). The CodeQL finding itself is closed by
+      // the walk having no `container[key]` read at all. A test iterates
       // FORBIDDEN_OBJECT_KEYS against this walk, so the two lists cannot drift
       // apart.
       if (key === "__proto__" || key === "constructor" || key === "prototype") {
+        return;
+      }
+      // From the entry itself, descend only into a sub-graph the package copied.
+      if (i === 0 && i < lastIndex && !PATH_ROOT_FIELDS.has(key)) {
         return;
       }
       if (!isOwnedPathContainer(container)) {
@@ -824,8 +853,12 @@ const redactEntryPath = (entry: Record<string, unknown>, path: string): void => 
       }
       const descriptor = Object.getOwnPropertyDescriptor(container, key);
       // Own data properties only: an absent (possibly inherited) property or an
-      // accessor ends the walk without reading it.
-      if (descriptor === undefined || !("value" in descriptor)) {
+      // accessor ends the walk without reading it. The descriptor is an
+      // ordinary object, so `value` is tested as its OWN field: `"value" in`
+      // would also see an inherited (polluted) `Object.prototype.value` and
+      // take an accessor for a data property. A data descriptor always owns
+      // `writable` too, so reading it below cannot reach the prototype.
+      if (descriptor === undefined || !Object.prototype.hasOwnProperty.call(descriptor, "value")) {
         return;
       }
       if (i < lastIndex) {
@@ -1006,7 +1039,11 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
     Array.isArray(maskBodyKeys) && maskBodyKeys.length > 0
       ? new Set(maskBodyKeys.map((key) => key.toLowerCase()))
       : undefined;
-  const resolvedRedactPaths = Array.isArray(redactPaths) ? redactPaths : [];
+  // A copy, like `additionalTransports` in `createLogger`: the list was
+  // validated above, and a later change to the caller's array must neither
+  // bypass that validation nor let the body pass and the entry pass (with
+  // `enrich()` running between them) see different lists.
+  const resolvedRedactPaths = Array.isArray(redactPaths) ? [...redactPaths] : [];
 
   return (req: LoggableRequest, res: LoggableResponse, next: LoggableNext) => {
     if (skip?.(req, res)) {

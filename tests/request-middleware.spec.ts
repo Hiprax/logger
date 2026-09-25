@@ -1539,6 +1539,88 @@ describe("createRequestLogger", () => {
     expect(errorSpy).not.toHaveBeenCalled();
   });
 
+  it("an allow-listed header the request lacks never picks up (or writes) a value held on Object.prototype", () => {
+    // In a process where something parked an object on `Object.prototype` under
+    // a lowercase name, the allow-list branch read `normalized[name]` through
+    // the prototype chain: it logged that shared object as a header and handed
+    // it to the path pass by reference, which overwrote its field.
+    Object.defineProperty(Object.prototype, "x-polluted", {
+      value: { token: "GLOBAL" },
+      configurable: true,
+      writable: true,
+      enumerable: false,
+    });
+    try {
+      const { logger, log } = createMockLogger();
+      const middleware = createRequestLogger({
+        logger,
+        includeHttpContext: true,
+        includeRequestHeaders: ["x-polluted", "user-agent"],
+        redactPaths: ["requestHeaders.x-polluted.token"],
+      });
+
+      const { res } = runMiddleware(middleware);
+      res.emit("finish");
+
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls[0][0].http.requestHeaders).toEqual({ "user-agent": "jest" });
+      expect(
+        (Object.prototype as unknown as Record<string, { token: string }>)["x-polluted"],
+      ).toEqual({ token: "GLOBAL" });
+    } finally {
+      delete (Object.prototype as unknown as Record<string, unknown>)["x-polluted"];
+    }
+  });
+
+  it("uses the redactPaths list as validated at construction; later mutation of the caller's array has no effect", () => {
+    const paths = ["body.password"];
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      redactPaths: paths,
+    });
+
+    // Bypasses construction-time validation. It used to make the path pass
+    // throw on every request, so no request was logged at all.
+    paths.push(42 as unknown as string);
+    paths[0] = "body.email";
+
+    const { res } = runMiddleware(middleware);
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0].http.requestBody).toEqual({
+      email: "user@example.com",
+      password: "[REDACTED]",
+    });
+  });
+
+  it("a path never descends into an entry field the package does not copy (an adapter's live array)", () => {
+    // `requestId` / `userAgent` / `method` / `ip` / `url` are typed as strings
+    // and taken from the request as they are. An adapter whose `get()` returns
+    // its own live array must not have that array written through a path.
+    const liveIds = ["REQ-ID-SECRET"];
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      redactPaths: ["requestId.0", "userAgent"],
+    });
+
+    const { res } = runMiddleware(middleware, {
+      get: ((name: string) =>
+        name === "x-request-id" ? liveIds : "agent") as unknown as MockRequest["get"],
+    });
+    res.emit("finish");
+
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(liveIds).toEqual(["REQ-ID-SECRET"]);
+    // A path whose only segment names an entry field still redacts it.
+    expect(log.mock.calls[0][0].http.userAgent).toBe("[REDACTED]");
+  });
+
   it("copying a header array changes nothing a consumer sees (output equivalence)", () => {
     const { logger, log } = createMockLogger();
     const middleware = createRequestLogger({
@@ -3495,9 +3577,59 @@ describe("request middleware internals", () => {
 
       expect(Object.getOwnPropertyDescriptor(own, key)?.value).toEqual({ token: "T" });
       expect(Object.getOwnPropertyDescriptor(own.k, key)?.value).toBe("V");
-      expect(Object.getPrototypeOf(own.k)).toBe(Object.prototype);
     }
-    expect(({} as Record<string, unknown>).token).toBeUndefined();
+  });
+
+  it("redactEntryPath never throws for a path that is not a string", () => {
+    const entry = { context: { token: "SECRET" } } as unknown as Record<string, unknown>;
+    for (const path of [42, {}, ["context", "token"]]) {
+      expect(() => redactEntryPath(entry, path as unknown as string)).not.toThrow();
+    }
+    expect(entry).toEqual({ context: { token: "SECRET" } });
+  });
+
+  it("redactEntryPath reads a descriptor's own fields only (an inherited `value` / `writable` cannot steer it)", () => {
+    // `Object.getOwnPropertyDescriptor` returns an ordinary object, so
+    // `"value" in descriptor` and `descriptor.writable` consult
+    // `Object.prototype`. In a process where those names were polluted, an
+    // accessor on the path looked like a writable data property: the walk
+    // stepped onto the polluted `value` and wrote into it, and a final
+    // accessor had its setter called.
+    let setterCalls = 0;
+    const context = {
+      get nested(): unknown {
+        return undefined;
+      },
+      get secret(): string {
+        return "S";
+      },
+      set secret(_value: string) {
+        setterCalls += 1;
+      },
+    };
+    const entry = { context } as unknown as Record<string, unknown>;
+    const pollutedValue = { token: "GLOBAL" };
+    Object.defineProperty(Object.prototype, "value", {
+      value: pollutedValue,
+      configurable: true,
+      writable: true,
+      enumerable: false,
+    });
+    Object.defineProperty(Object.prototype, "writable", {
+      value: true,
+      configurable: true,
+      writable: true,
+      enumerable: false,
+    });
+    try {
+      redactEntryPath(entry, "context.nested.token");
+      redactEntryPath(entry, "context.secret");
+    } finally {
+      delete (Object.prototype as unknown as Record<string, unknown>).value;
+      delete (Object.prototype as unknown as Record<string, unknown>).writable;
+    }
+    expect(pollutedValue).toEqual({ token: "GLOBAL" });
+    expect(setterCalls).toBe(0);
   });
 
   it("resolveMaskHeaderKeys returns undefined when option is false and the default set otherwise", () => {
@@ -3579,15 +3711,12 @@ describe("request middleware internals", () => {
     });
 
     it("redactEntryPath final-segment guard catches __proto__ as an OWN property on the cursor", () => {
-      // The intermediate-segment guard (part 1) catches forbidden keys at
-      // segments[0..length-2]. This test exercises the FINAL-segment guard
-      // (part 2, the inline check right before the assignment) by feeding a
-      // path whose intermediate segments are all clean and whose final segment
-      // is `__proto__` — AND mounting the assignment target as a
-      // `JSON.parse('{"__proto__": ...}')` object that owns the key directly,
-      // so the `hasOwnProperty` filter would NOT short-circuit on its own.
-      // Without the inline guard the bracket-assignment would invoke the
-      // prototype setter and corrupt the chain.
+      // The walk refuses `__proto__` on every segment, the final one included.
+      // Here the path's other segments are clean and the target is a
+      // `JSON.parse('{"__proto__": ...}')` object that OWNS the key as a data
+      // property, so an own-property walk would otherwise overwrite it (an
+      // assignment to an own data property does not reach the prototype
+      // setter, but the refusal keeps every `__proto__` name out of the walk).
       const evil = JSON.parse('{"__proto__": "real"}') as Record<string, unknown>;
       const entry = { requestBody: { user: evil } } as unknown as Record<string, unknown>;
       const originalProto = Object.getPrototypeOf(evil);
