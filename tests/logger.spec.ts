@@ -5531,6 +5531,38 @@ describe("createLogger", () => {
         expect(rendered).toContain("Error: boom-err-ts");
         expect(rendered).not.toContain("2024-01-01T00:00:00Z");
       });
+
+      it("documented exception: an array or class-instance entry gets `timestamp` written in place", () => {
+        // Branch: non-plain info. A plain copy would strip an array's arrayness
+        // or a class instance's prototype (and its toJSON), so the capture
+        // writes `timestamp` onto the logged object itself. The README states
+        // this exception; the copy-on-write branches above cover plain objects.
+        class LoginEvent {
+          public message = "login";
+          public id = 3;
+        }
+        const entries = ["a", "b"];
+        const event = new LoginEvent();
+
+        renderTo(`reserved-nonplain-${format}`, format, (logger) => {
+          logger.log("info", entries as never);
+          logger.info(event);
+        });
+
+        const stamp = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+        // The array stays an array with its elements untouched; winston's own
+        // `level` and the captured `timestamp` are the only keys added.
+        expect(Array.isArray(entries)).toBe(true);
+        expect([entries[0], entries[1]]).toEqual(["a", "b"]);
+        expect(Object.keys(entries)).toEqual(["0", "1", "level", "timestamp"]);
+        expect((entries as unknown as Record<string, unknown>).timestamp).toMatch(stamp);
+        // The instance keeps its prototype and its own values.
+        expect(event).toBeInstanceOf(LoginEvent);
+        expect(event.message).toBe("login");
+        expect(event.id).toBe(3);
+        expect(Object.keys(event)).toEqual(["message", "id", "level", "timestamp"]);
+        expect((event as unknown as Record<string, unknown>).timestamp).toMatch(stamp);
+      });
     });
 
     it("bare winston's own format.timestamp({ format }) still mutates in place (canary the fix diverges from)", () => {
@@ -10831,6 +10863,120 @@ describe("maskMetaKeys masks the output of a metadata object's own toJSON in pre
     expect(out.fileOut).not.toContain("secret-T7");
   });
 
+  it("json: documented boundary, the entry's toJSON runs on the original, so a renamed `this` field is not masked", async () => {
+    // JSON mode calls a top-level toJSON on the real object (a copy would break
+    // a toJSON reading #private fields) and masks its OUTPUT by its own keys.
+    // A masked field copied under another name therefore prints; the README
+    // documents this difference from pretty mode, and this test pins it.
+    const out = await render(
+      "mtj-this-json",
+      "json",
+      (logger) => {
+        logger.info("login", {
+          password: "secret-T8",
+          toJSON() {
+            return { pw: this.password, password: this.password };
+          },
+        });
+      },
+      ["password"],
+    );
+
+    expect(out.thrown).toBeUndefined();
+    // The output's own `password` key is masked; the renamed `pw` is not.
+    expect(out.fileOut).toBe('{"password":"[REDACTED]","pw":"secret-T8"}\n');
+    expect(out.consoleOut).toBe(out.fileOut);
+    expect(out.fileOut).not.toContain('"password":"secret-T8"');
+  });
+
+  it.each(["pretty", "json"] as const)(
+    "%s: a class-inherited toJSON that throws fails closed in json and is never called in pretty",
+    async (format) => {
+      class HostileDto {
+        public message = "hostile";
+        public password = "secret-T9";
+        public toJSON(): never {
+          throw new Error("toJSON refused");
+        }
+      }
+
+      const out = await render(
+        `mtj-class-throw-${format}`,
+        format,
+        (logger) => logger.info(new HostileDto()),
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? // The metadata block holds the instance's own fields, masked by key;
+            // pretty mode only resolves a toJSON the block owns.
+            `UTC: ${STAMP}\n[INFO] (mtj-class-throw-pretty)\nhostile\n{\n  "password": "[REDACTED]"\n}\n\n`
+          : '{"_redactionFailed":true,"level":"info","message":"hostile"}\n',
+      );
+      expect(out.fileOut).not.toContain("secret-T9");
+      expect(out.fileOut).not.toContain("[UNSERIALIZABLE]");
+      expectConsoleMatchesFile(format, out);
+    },
+  );
+
+  it("pretty: a throwing metadata getter fails the file block closed while the console drops only that field", async () => {
+    const out = await render(
+      "mtj-getter-console",
+      "pretty",
+      (logger) => {
+        logger.info({
+          message: "m",
+          password: "secret-T10",
+          keep: 1,
+          get bad(): string {
+            throw new Error("getter refused");
+          },
+        });
+      },
+      ["password"],
+    );
+
+    expect(out.thrown).toBeUndefined();
+    expect(out.fileOut).toBe(
+      prettyLine("mtj-getter-console", 'm\n{\n  "_redactionFailed": true\n}'),
+    );
+    // The console copy resolves the throwing accessor to undefined before it
+    // renders, so the rest of the block prints, still masked.
+    expect(stripAnsi(out.consoleOut)).toBe(
+      '[INFO] (mtj-getter-console)\nm\n{\n  "password": "[REDACTED]",\n  "keep": 1\n}\n\n',
+    );
+    expect(out.fileOut + out.consoleOut).not.toContain("secret-T10");
+  });
+
+  it("pretty: a throwing getter nested inside a metadata value fails the file and console blocks closed alike", async () => {
+    // Only top-level accessors are resolved before the console copy, so a
+    // nested one still throws inside the console's own masking walk.
+    const out = await render(
+      "mtj-nested-getter",
+      "pretty",
+      (logger) => {
+        logger.info("m", {
+          password: "secret-T11",
+          user: {
+            get bad(): string {
+              throw new Error("getter refused");
+            },
+          },
+        });
+      },
+      ["password"],
+    );
+
+    expect(out.thrown).toBeUndefined();
+    expect(out.fileOut).toBe(
+      prettyLine("mtj-nested-getter", 'm\n{\n  "_redactionFailed": true\n}'),
+    );
+    expectConsoleMatchesFile("pretty", out);
+    expect(out.fileOut + out.consoleOut).not.toContain("secret-T11");
+  });
+
   it("pretty: a toJSON that returns the bag itself is read by its own keys, not called again", async () => {
     let calls = 0;
     const emit = (logger: winston.Logger): void => {
@@ -12054,6 +12200,78 @@ describe("nested Error serialization", () => {
       expect(err.cause).toBe(err);
     });
 
+    it("a top-level logged Error omits a cause set through the options bag (winston's errors() copies own enumerable fields)", async () => {
+      // The README states this boundary: only an Error nested in metadata is
+      // rendered through the shared view. A top-level Error is flattened by
+      // winston's errors(), which never reads the non-enumerable `cause`.
+      const err = fixedError("outer", {}, { cause: fixedError("inner") });
+
+      const out = await render("nested-ser-top-cause", format, (logger) => logger.info(err));
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine("nested-ser-top-cause", `outer\n${STACK}`)
+          : `{"level":"info","message":"outer","module":"nested-ser-top-cause","stack":${STACK_JSON},"timestamp":"${STAMP}"}\n`,
+      );
+      expect(out.fileOut).not.toContain("inner");
+      expectConsoleMatchesFile(format, out);
+    });
+
+    it("a top-level logged Error renders a cause assigned afterwards (an own enumerable field) as metadata", async () => {
+      const err = fixedError("outer");
+      (err as Error & { cause?: unknown }).cause = fixedError("inner");
+
+      const out = await render("nested-ser-top-enum-cause", format, (logger) => logger.info(err));
+
+      const cause = { name: "Error", message: "inner", stack: STACK };
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine(
+              "nested-ser-top-enum-cause",
+              `outer\n${STACK}\n${JSON.stringify({ cause }, null, 2)}`,
+            )
+          : `{"cause":{"message":"inner","name":"Error","stack":${STACK_JSON}},"level":"info","message":"outer",` +
+              `"module":"nested-ser-top-enum-cause","stack":${STACK_JSON},"timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+      // Only winston-core's own `level` write lands on the logged Error.
+      expect(Object.keys(err)).toEqual(["cause", "level"]);
+    });
+
+    it("with maskMetaKeys, a NON-enumerable self-referencing cause renders the error's fields and [Circular]", async () => {
+      // The mask walk reads the cause through the shared view and meets the
+      // error on its own active path, so both formats print the fields with a
+      // "[Circular]" back-reference (the README states this) instead of the
+      // no-mask pretty fallback `"err": {}`.
+      const err = selfCausedError("loop");
+
+      const out = await render(
+        "nested-ser-selfcause-mask",
+        format,
+        (logger) => logger.info("m", { err, orderId: 7 }),
+        ["password"],
+      );
+
+      const meta = {
+        err: { name: "Error", message: "loop", stack: STACK, cause: "[Circular]" },
+        orderId: 7,
+      };
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine("nested-ser-selfcause-mask", `m\n${JSON.stringify(meta, null, 2)}`)
+          : `{"err":{"cause":"[Circular]","message":"loop","name":"Error","stack":${STACK_JSON}},` +
+              `"level":"info","message":"m","module":"nested-ser-selfcause-mask","orderId":7,"timestamp":"${STAMP}"}\n`,
+      );
+      expect(out.fileOut).not.toContain('"err": {}');
+      expect(out.fileOut).not.toContain("[UNSERIALIZABLE]");
+      expectConsoleMatchesFile(format, out);
+      expect(err.cause).toBe(err);
+      expect(Object.keys(err)).toEqual([]);
+    });
+
     it("an own enumerable cycle (err.self = err) keeps the pretty sentinel and renders [Circular] in json", async () => {
       const err = fixedError("self");
       (err as unknown as { self: unknown }).self = err;
@@ -12069,6 +12287,29 @@ describe("nested Error serialization", () => {
           : `{"err":{"message":"self","name":"Error","self":"[Circular]","stack":${STACK_JSON}},` +
               `"level":"info","message":"m","module":"nested-ser-selfenum","orderId":7,"timestamp":"${STAMP}"}\n`,
       );
+      expectConsoleMatchesFile(format, out);
+    });
+
+    it("an ENUMERABLE self-cause (err.cause = err, no cause option) behaves like err.self = err", async () => {
+      // Assigned after construction on an error created without the option,
+      // `cause` is an own enumerable key, so the retry is still cyclic (the
+      // README states this next to the non-enumerable options-bag shape).
+      const err = fixedError("loop");
+      (err as Error & { cause?: unknown }).cause = err;
+      expect(Object.getOwnPropertyDescriptor(err, "cause")?.enumerable).toBe(true);
+
+      const out = await render("nested-ser-selfenum-cause", format, (logger) =>
+        logger.info("m", { err, orderId: 7 }),
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine("nested-ser-selfenum-cause", "m\n[UNSERIALIZABLE]")
+          : `{"err":{"cause":"[Circular]","message":"loop","name":"Error","stack":${STACK_JSON}},` +
+              `"level":"info","message":"m","module":"nested-ser-selfenum-cause","orderId":7,"timestamp":"${STAMP}"}\n`,
+      );
+      expect(out.fileOut).not.toContain('"err": {}');
       expectConsoleMatchesFile(format, out);
     });
 
@@ -13751,6 +13992,27 @@ describe("child loggers", () => {
       expect(() => logger.info(payload)).not.toThrow();
       expect(() => logger.child({ requestId: "r1" }).info(payload)).toThrow("getter failed");
       expect(jsonLines(output())).toHaveLength(1);
+      teardownLogger(logger);
+    });
+
+    it("a Proxy payload whose ownKeys trap throws degrades on the root but throws through a child", () => {
+      const { logger, output } = sinkLogger("json");
+      const payload = new Proxy(
+        { message: "hi" },
+        {
+          ownKeys: () => {
+            throw new Error("ownKeys refused");
+          },
+        },
+      );
+
+      expect(() => logger.info(payload)).not.toThrow();
+      expect(() => logger.child({ requestId: "r1" }).info(payload)).toThrow("ownKeys refused");
+      // Only the root's degraded line was written; the child wrote nothing.
+      const lines = jsonLines(output());
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ level: "info", message: "hi", _unserializable: true });
+      expect(lines[0]).not.toHaveProperty("requestId");
       teardownLogger(logger);
     });
 
