@@ -1,4 +1,7 @@
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import vm from "node:vm";
+import winston from "winston";
 import {
   createRequestLogger,
   REQUEST_START_SYMBOL,
@@ -7,6 +10,8 @@ import {
 import * as loggerModule from "../src/logger";
 import { resetLoggerRegistry } from "../src/logger";
 import { RequestLoggerOptionError } from "../src/errors";
+import { MAX_REDACT_DEPTH } from "../src/redact";
+import { createErrorAwareReplacer, errorToPlain } from "../src/serialize";
 import type { LoggableRequest, LoggableResponse, LoggableNext, LogLevel } from "../src/types";
 import { createMockLogger, MockRequest, runMiddleware, withEnv } from "./_helpers";
 
@@ -1589,7 +1594,7 @@ describe("createRequestLogger", () => {
     expect(context.token).toBe("REALSECRET");
   });
 
-  it("redacts a toJSON-defining context that carries a BigInt without mutating the caller (judge regression)", () => {
+  it("redacts a toJSON-defining context that carries a BigInt without mutating the caller (regression)", () => {
     // Composite case: a class instance that defines toJSON AND whose serialized
     // form is not JSON-expressible (a BigInt field). redactValue's forceCopy
     // would pass such an instance through BY IDENTITY (toJSON boundary), so the
@@ -1998,12 +2003,71 @@ describe("createRequestLogger", () => {
       expect((caught as RequestLoggerOptionError).message).toContain("false");
     });
 
-    it("accepts maskHeaderKeys: false (opt-out for safe-defaults masking)", () => {
-      expect(() => createRequestLogger({ maskHeaderKeys: false })).not.toThrow();
+    // Both opt-out cases go through the DEFAULT-logger branch (no `logger`
+    // option) on purpose, so the spy stands in for the auto-created `http`
+    // logger: a real one would open rotating files under `<cwd>/logs`.
+    it("accepts maskHeaderKeys: false and logs safe-default headers unmasked through the default logger", () => {
+      const { logger, log } = createMockLogger();
+      const spy = jest.spyOn(loggerModule, "createLogger").mockReturnValue(logger);
+
+      const middleware = createRequestLogger({
+        maskHeaderKeys: false,
+        includeHttpContext: true,
+        includeRequestHeaders: ["authorization", "cookie"],
+      });
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith({ moduleName: "http" });
+
+      const { res, next } = runMiddleware(middleware, {
+        originalUrl: "/auth/login?token=abc&keep=me",
+        headers: { authorization: "Bearer top-secret", cookie: "session=abc" },
+      });
+      res.emit("finish");
+
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledTimes(1);
+      const payload = log.mock.calls[0][0];
+      // The opt-out's observable effect: both safe-default header keys survive verbatim.
+      expect(payload.http.requestHeaders).toEqual({
+        authorization: "Bearer top-secret",
+        cookie: "session=abc",
+      });
+      // The opt-out is scoped to headers: query masking still runs.
+      expect(payload.http.url).toBe("/auth/login?token=[REDACTED]&keep=me");
+      expect(payload.message).not.toContain("token=abc");
     });
 
-    it("accepts maskQueryKeys: false (opt-out for safe-defaults query masking)", () => {
-      expect(() => createRequestLogger({ maskQueryKeys: false })).not.toThrow();
+    it("accepts maskQueryKeys: false and logs safe-default query keys unmasked through the default logger", () => {
+      const { logger, log } = createMockLogger();
+      const spy = jest.spyOn(loggerModule, "createLogger").mockReturnValue(logger);
+
+      const middleware = createRequestLogger({
+        maskQueryKeys: false,
+        includeHttpContext: true,
+        includeRequestHeaders: ["authorization"],
+      });
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith({ moduleName: "http" });
+
+      const { res, next } = runMiddleware(middleware, {
+        originalUrl: "/auth/login?token=abc&code=xyz&keep=me",
+        headers: { authorization: "Bearer top-secret" },
+      });
+      res.emit("finish");
+
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledTimes(1);
+      const payload = log.mock.calls[0][0];
+      // The opt-out's observable effect: `token` and `code` are both in the
+      // safe-default query list, yet the URL (and the default message built
+      // from it) keeps them verbatim.
+      expect(payload.http.url).toBe("/auth/login?token=abc&code=xyz&keep=me");
+      expect(payload.message).toMatch(/^POST \/auth\/login\?token=abc&code=xyz&keep=me 200 /);
+      expect(payload.http.url).not.toContain("[REDACTED]");
+      // The opt-out is scoped to the query string: header masking still runs.
+      expect(payload.http.requestHeaders).toEqual({ authorization: "[REDACTED]" });
     });
 
     it("throws RequestLoggerOptionError({ code: 'INVALID_MASK' }) when maskQueryKeys is the wrong type", () => {
@@ -3742,19 +3806,54 @@ describe("request middleware internals", () => {
       expect(out).toBe(input);
     });
 
-    it("passes through a class instance that defines toJSON even when a key matches (documented limitation)", () => {
+    it("masks the toJSON() output of a class instance that defines toJSON, leaving the instance untouched", () => {
       class Timestamped {
         public readonly password = "secret";
         toJSON() {
-          return { customized: true };
+          return { customized: true, password: this.password };
         }
       }
       const input = new Timestamped();
       const mask = new Set(["password"]);
       const out = redactValue(input, mask, new WeakSet());
-      // hasToJSON === true → pass-through, no key walk; this is the documented
-      // limitation: use `redactPaths` or normalize to a plain object instead.
-      expect(out).toBe(input);
+      // With a mask, toJSON is resolved on the instance and its output is
+      // masked by its own keys, the way the serializer reads it.
+      expect(out).toEqual({ customized: true, password: "[REDACTED]" });
+      expect(out).not.toBe(input);
+      expect(input.password).toBe("secret");
+    });
+
+    it("without a mask, a value that defines toJSON passes through by identity and toJSON is never called", () => {
+      const toJSON = jest.fn(() => ({ password: "secret" }));
+      const input = { nested: { toJSON } };
+
+      const out = redactValue(input, new Set<string>(), new WeakSet()) as typeof input;
+
+      expect(out).not.toBe(input);
+      expect(out.nested.toJSON).toBe(toJSON);
+      expect(toJSON).not.toHaveBeenCalled();
+      class Dated {
+        toJSON() {
+          return "2026-01-02";
+        }
+      }
+      const dated = new Dated();
+      expect(redactValue(dated, new Set<string>(), new WeakSet())).toBe(dated);
+    });
+
+    it("a throwing toJSON getter fails closed with a mask and throws as before without one", () => {
+      class HostileGetter {
+        get toJSON(): never {
+          throw new Error("getter refused");
+        }
+      }
+
+      expect(redactValue({ h: new HostileGetter() }, new Set(["password"]), new WeakSet())).toEqual(
+        { h: "[RedactionFailed]" },
+      );
+      expect(() => redactValue(new HostileGetter(), new Set<string>(), new WeakSet())).toThrow(
+        "getter refused",
+      );
     });
 
     it("serializeBody does not mutate a caller-owned toJSON-defining class-instance body when redactPaths targets its own field", () => {
@@ -4086,6 +4185,379 @@ describe("request middleware internals", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Errors are data-bearing: masking walks the errorToPlain view (own fields,
+  // the cause chain, AggregateError members) before any serializer shows them.
+  // ---------------------------------------------------------------------------
+  describe("redactValue walks Errors through the errorToPlain view", () => {
+    const { redactValue } = __requestInternals;
+    const mask = new Set(["password"]);
+    const empty = new Set<string>();
+    const STACK = "Error: fixed\n    at fixed (fixed.js:1:1)";
+
+    /** An Error with a deterministic stack, optionally carrying extra own properties. */
+    const fixedError = (
+      message: string,
+      own: Record<string, unknown> = {},
+      options?: ErrorOptions,
+    ) => {
+      const err = Object.assign(new Error(message, options), own);
+      err.stack = STACK;
+      return err;
+    };
+
+    it("an own enumerable masked key is redacted and name / message / stack are KEPT", () => {
+      const err = fixedError("card declined", { password: "S1", orderId: 7 });
+
+      const out = redactValue(err, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out).not.toBe(err);
+      expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+      expect(Object.keys(out)).toEqual(["name", "message", "stack", "password", "orderId"]);
+      expect(out).toEqual({
+        name: "Error",
+        message: "card declined",
+        stack: STACK,
+        password: "[REDACTED]",
+        orderId: 7,
+      });
+      expect(JSON.stringify(out)).not.toContain("S1");
+      // The caller's Error is untouched.
+      expect(err.password).toBe("S1");
+      expect(Object.keys(err)).toEqual(["password", "orderId"]);
+    });
+
+    it("a masked key inside a non-enumerable cause is redacted (the cause chain is walked)", () => {
+      const cause = { user: "bob", password: "S2" };
+      const err = fixedError("outer", {}, { cause });
+
+      const out = redactValue(err, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out).not.toBe(err);
+      expect(out).toEqual({
+        name: "Error",
+        message: "outer",
+        stack: STACK,
+        cause: { user: "bob", password: "[REDACTED]" },
+      });
+      expect(JSON.stringify(out)).not.toContain("S2");
+      expect(cause.password).toBe("S2"); // the caller's cause object is not mutated
+    });
+
+    it("a nested Error cause is walked recursively", () => {
+      const inner = fixedError("inner", { password: "S3" });
+      const outer = fixedError("outer", {}, { cause: inner });
+
+      const out = redactValue(outer, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out.cause).toEqual({
+        name: "Error",
+        message: "inner",
+        stack: STACK,
+        password: "[REDACTED]",
+      });
+      expect(JSON.stringify(out)).not.toContain("S3");
+      expect(outer.cause).toBe(inner);
+    });
+
+    it("AggregateError members are walked: a member Error and a member object both lose the masked key", () => {
+      const member = fixedError("member", { password: "S4" });
+      const agg = new AggregateError([member, { password: "S5", ok: 1 }], "agg");
+      agg.stack = STACK;
+
+      const out = redactValue(agg, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out).not.toBe(agg);
+      expect(Object.keys(out)).toEqual(["name", "message", "stack", "errors"]);
+      expect(out.name).toBe("AggregateError");
+      expect(out.message).toBe("agg");
+      expect(out.errors).toEqual([
+        { name: "Error", message: "member", stack: STACK, password: "[REDACTED]" },
+        { password: "[REDACTED]", ok: 1 },
+      ]);
+      const text = JSON.stringify(out);
+      expect(text).not.toContain("S4");
+      expect(text).not.toContain("S5");
+    });
+
+    it("a cross-realm Error (vm) whose cause carries the masked key is walked and masked", () => {
+      const foreign = vm.runInNewContext(
+        "const e = new Error('far', { cause: { password: 'S6' } }); e.stack = 'Error: far'; e",
+      ) as object;
+
+      const out = redactValue(foreign, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out).not.toBe(foreign);
+      expect(out).toEqual({
+        name: "Error",
+        message: "far",
+        stack: "Error: far",
+        cause: { password: "[REDACTED]" },
+      });
+      expect(JSON.stringify(out)).not.toContain("S6");
+    });
+
+    it("an Error whose view holds only primitives and nothing to mask comes back BY IDENTITY", () => {
+      const err = fixedError("plain", { code: "E1" }, { cause: "why" });
+
+      expect(redactValue(err, mask, new WeakSet())).toBe(err);
+      expect(redactValue(err, empty, new WeakSet())).toBe(err);
+    });
+
+    it("an Error with a plain-object cause and nothing to mask is rebuilt, with the same view as errorToPlain", () => {
+      const cause = { code: 1 };
+      const err = fixedError("x", {}, { cause });
+
+      const out = redactValue(err, mask, new WeakSet()) as Record<string, unknown>;
+
+      // Plain objects always rebuild, so the parent is rebuilt too; the output
+      // is the converter's view with an owned copy of the cause.
+      expect(out).not.toBe(err);
+      expect(out).toEqual(errorToPlain(err));
+      expect(out).toEqual({ name: "Error", message: "x", stack: STACK, cause: { code: 1 } });
+      expect(out.cause).not.toBe(cause);
+    });
+
+    it("an Error subclass with its own toJSON renders only its toJSON output, masked (fields it hides stay hidden)", () => {
+      class SafeError extends Error {
+        public password = "S7";
+        toJSON(): Record<string, unknown> {
+          return { message: this.message };
+        }
+      }
+      const err = new SafeError("hidden", { cause: { password: "S8" } });
+
+      const out = redactValue(err, mask, new WeakSet());
+
+      // An owned copy of the toJSON output: the same JSON as before, never the
+      // instance's own fields or its cause.
+      expect(out).toEqual({ message: "hidden" });
+      expect(out).not.toBe(err);
+      expect(JSON.stringify(out)).toBe('{"message":"hidden"}');
+      expect(err.password).toBe("S7");
+    });
+
+    it("forceCopy returns a fully owned copy of an Error, even with nothing to mask", () => {
+      const vanilla = fixedError("v");
+      const cause = { nested: { code: 1 } };
+      const withCause = fixedError("c", {}, { cause });
+
+      const copy = redactValue(vanilla, empty, new WeakSet(), true) as Record<string, unknown>;
+      const deep = redactValue(withCause, empty, new WeakSet(), true) as Record<string, unknown>;
+
+      expect(copy).not.toBe(vanilla);
+      expect(copy).toEqual({ name: "Error", message: "v", stack: STACK });
+      expect(deep.cause).toEqual(cause);
+      expect(deep.cause).not.toBe(cause);
+      expect((deep.cause as { nested: unknown }).nested).not.toBe(cause.nested);
+    });
+
+    it("a self-referencing non-enumerable cause renders [Circular] and never throws", () => {
+      const err = fixedError("loop");
+      Object.defineProperty(err, "cause", { value: err, writable: true, configurable: true });
+
+      const out = redactValue(err, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect(out).toEqual({ name: "Error", message: "loop", stack: STACK, cause: "[Circular]" });
+    });
+
+    it("the same Error shared by two sibling keys is walked in full on both (active-path tracking)", () => {
+      const shared = fixedError("shared", { password: "S9" });
+
+      const out = redactValue({ a: shared, b: shared }, mask, new WeakSet()) as Record<
+        string,
+        Record<string, unknown>
+      >;
+
+      const expected = { name: "Error", message: "shared", stack: STACK, password: "[REDACTED]" };
+      expect(out.a).toEqual(expected);
+      expect(out.b).toEqual(expected);
+      expect(JSON.stringify(out)).not.toContain("[Circular]");
+    });
+
+    it("a cause chain deeper than MAX_REDACT_DEPTH terminates with [MaxDepth] instead of overflowing", () => {
+      let head: Error = fixedError("leaf", { password: "deep" });
+      for (let i = 0; i < MAX_REDACT_DEPTH + 10; i += 1) {
+        head = new Error(`level ${i}`, { cause: head });
+      }
+
+      let out: unknown;
+      expect(() => {
+        out = redactValue(head, mask, new WeakSet());
+      }).not.toThrow();
+
+      let cursor = out as Record<string, unknown> | string;
+      let depth = 0;
+      while (typeof cursor === "object") {
+        cursor = cursor.cause as Record<string, unknown> | string;
+        depth += 1;
+      }
+      expect(cursor).toBe("[MaxDepth]");
+      expect(depth).toBe(MAX_REDACT_DEPTH + 1);
+      expect(JSON.stringify(out)).not.toContain("deep");
+    });
+
+    it("an own __proto__ key on an Error is dropped and forces a rebuild", () => {
+      const err = fixedError("x");
+      Object.defineProperty(err, "__proto__", {
+        value: { polluted: true },
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+
+      const out = redactValue(err, empty, new WeakSet()) as Record<string, unknown>;
+
+      expect(out).not.toBe(err);
+      expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+      expect(out).toEqual({ name: "Error", message: "x", stack: STACK });
+      expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
+    });
+
+    it("a throwing own enumerable getter drops only that field and forces a rebuild (never re-read by a serializer)", () => {
+      const err = fixedError("x", { code: "E1" });
+      const getter = jest.fn(() => {
+        throw new Error("getter refused");
+      });
+      Object.defineProperty(err, "password", { enumerable: true, get: getter });
+
+      let out: unknown;
+      expect(() => {
+        out = redactValue(err, mask, new WeakSet());
+      }).not.toThrow();
+
+      // Compared as a boolean first: a failure diff of the original Error would
+      // invoke its throwing getter inside the test runner.
+      expect(out === err).toBe(false);
+      expect(out).toEqual({ name: "Error", message: "x", stack: STACK, code: "E1" });
+      expect(getter).toHaveBeenCalledTimes(1);
+      expect(() => JSON.stringify(out)).not.toThrow();
+    });
+
+    it("a throw inside a newly walked cause fails closed for that field only; siblings still render", () => {
+      const cause = {
+        get token(): string {
+          throw new Error("getter refused");
+        },
+      };
+      const err = fixedError("x", {}, { cause });
+
+      let out: unknown;
+      expect(() => {
+        out = redactValue({ err, orderId: 7 }, mask, new WeakSet());
+      }).not.toThrow();
+
+      expect(out).toEqual({
+        err: { name: "Error", message: "x", stack: STACK, cause: "[RedactionFailed]" },
+        orderId: 7,
+      });
+      expect(err.cause).toBe(cause); // the caller's Error is untouched
+    });
+
+    it("a caught throw leaves no stale active-path entry: a later reference to the same object is walked, not [Circular]", () => {
+      let refused = false;
+      const flaky = {
+        get boom(): string {
+          if (!refused) {
+            refused = true;
+            throw new Error("refused once");
+          }
+          return "ok";
+        },
+      };
+      const err = fixedError("x", {}, { cause: flaky });
+
+      const out = redactValue({ err, later: flaky }, mask, new WeakSet()) as Record<
+        string,
+        unknown
+      >;
+
+      expect((out.err as Record<string, unknown>).cause).toBe("[RedactionFailed]");
+      expect(out.later).toEqual({ boom: "ok" });
+      expect(JSON.stringify(out)).not.toContain("[Circular]");
+    });
+
+    it("a caught throw inside an array under a cause leaves no stale entry for that array", () => {
+      let refused = false;
+      const list: unknown[] = [];
+      Object.defineProperty(list, 0, {
+        enumerable: true,
+        get: () => {
+          if (!refused) {
+            refused = true;
+            throw new Error("refused once");
+          }
+          return "ok";
+        },
+      });
+      const err = fixedError("x", {}, { cause: list });
+
+      const out = redactValue({ err, later: list }, mask, new WeakSet()) as Record<string, unknown>;
+
+      expect((out.err as Record<string, unknown>).cause).toBe("[RedactionFailed]");
+      expect(out.later).toEqual(["ok"]);
+      expect(JSON.stringify(out)).not.toContain("[Circular]");
+    });
+
+    it("an AggregateError with one hostile member fails closed for its errors field only", () => {
+      const benign = fixedError("benign");
+      const hostile = {
+        get detail(): string {
+          throw new Error("getter refused");
+        },
+      };
+      const agg = new AggregateError([benign, hostile], "agg");
+      agg.stack = STACK;
+
+      let out: unknown;
+      expect(() => {
+        out = redactValue(agg, mask, new WeakSet());
+      }).not.toThrow();
+
+      // The member walk is one view field, so the whole `errors` field takes
+      // the sentinel; the AggregateError's own fields still render.
+      expect(out).toEqual({
+        name: "AggregateError",
+        message: "agg",
+        stack: STACK,
+        errors: "[RedactionFailed]",
+      });
+    });
+
+    it("serializeBody without a mask keeps the body when a body Error's cause holds a throwing getter", () => {
+      const { serializeBody } = __requestInternals;
+      const cause = {
+        get token(): string {
+          throw new Error("getter refused");
+        },
+      };
+      const body = { err: fixedError("boom", {}, { cause }), id: 1 };
+
+      const out = serializeBody(body) as Record<string, unknown>;
+
+      expect(out).not.toBe("[UNSERIALIZABLE]");
+      expect(out).toEqual({
+        err: { name: "Error", message: "boom", stack: STACK, cause: "[RedactionFailed]" },
+        id: 1,
+      });
+    });
+
+    it("serializeBody masks a secret held in a body Error's cause", () => {
+      const { serializeBody } = __requestInternals;
+      const body = { err: fixedError("boom", {}, { cause: { password: "S10" } }) };
+
+      const out = serializeBody(body, ["password"]) as { err: Record<string, unknown> };
+
+      expect(out.err).toEqual({
+        name: "Error",
+        message: "boom",
+        stack: STACK,
+        cause: { password: "[REDACTED]" },
+      });
+      expect(JSON.stringify(out)).not.toContain("S10");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // Phase 1 (redact.ts DAG/diamond fix) — active-path cycle detection
   //
   // Before this fix, the `seen` WeakSet tracked "every object visited
@@ -4224,5 +4696,392 @@ describe("request middleware internals", () => {
       expect(payload.http.statusCode).toBe(200);
       expect(payload.http.responseTimeMs).toEqual(expect.any(Number));
     });
+  });
+});
+
+describe("nested Errors in the request-log context and body", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const STACK = "Error: fixed\n    at fixed (fixed.js:1:1)";
+
+  /** An Error with a deterministic stack, optionally carrying own properties. */
+  const fixedError = (
+    message: string,
+    own: Record<string, unknown> = {},
+    options?: ErrorOptions,
+  ) => {
+    const err = Object.assign(new Error(message, options), own);
+    err.stack = STACK;
+    return err;
+  };
+
+  /** A self-referencing cause in the ES2022 options shape: own, NON-enumerable. */
+  const selfCausedError = (message: string): Error => {
+    const err = fixedError(message);
+    Object.defineProperty(err, "cause", { value: err, writable: true, configurable: true });
+    return err;
+  };
+
+  const logOnce = (options: Parameters<typeof createRequestLogger>[0], body?: unknown) => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({ logger, includeHttpContext: true, ...options });
+    const { res } = runMiddleware(middleware, body === undefined ? {} : { body });
+    res.emit("finish");
+    expect(log).toHaveBeenCalledTimes(1);
+    return log.mock.calls[0][0].http as Record<string, unknown>;
+  };
+
+  describe("context (enrich)", () => {
+    it("copies a nested Error by its fields instead of as {}", () => {
+      const err = fixedError("boom", { code: "E1" });
+
+      const http = logOnce({ enrich: () => ({ err, orderId: 7 }) });
+
+      expect(http.context).toEqual({
+        err: { name: "Error", message: "boom", stack: STACK, code: "E1" },
+        orderId: 7,
+      });
+      const context = http.context as { err: unknown };
+      // An owned plain copy, never the caller's Error.
+      expect(context.err).not.toBe(err);
+      expect(context.err instanceof Error).toBe(false);
+      expect(Object.keys(err)).toEqual(["code"]);
+      expect(err.message).toBe("boom");
+    });
+
+    it("renders a cause chain and a BigInt in the same context", () => {
+      const err = fixedError("outer", {}, { cause: fixedError("inner") });
+
+      const http = logOnce({ enrich: () => ({ id: 5n, err }) });
+
+      expect(http.context).toEqual({
+        id: "5",
+        err: {
+          name: "Error",
+          message: "outer",
+          stack: STACK,
+          cause: { name: "Error", message: "inner", stack: STACK },
+        },
+      });
+    });
+
+    it("lets redactPaths target a nested Error's field", () => {
+      const err = fixedError("boom");
+
+      const http = logOnce({
+        enrich: () => ({ err }),
+        redactPaths: ["context.err.stack"],
+      });
+
+      expect(http.context).toEqual({
+        err: { name: "Error", message: "boom", stack: "[REDACTED]" },
+      });
+      // The caller's Error is never written.
+      expect(err.stack).toBe(STACK);
+    });
+
+    it("a NON-enumerable self-referencing cause is no worse than today: the retry keeps the pre-fix copy", () => {
+      const err = selfCausedError("loop");
+
+      const http = logOnce({ enrich: () => ({ err, orderId: 7 }) });
+
+      expect(http.context).toEqual({ err: {}, orderId: 7 });
+      expect(http.context).not.toEqual({ _unserializable: true });
+      expect(err.cause).toBe(err);
+    });
+
+    it("a context no round-trip can express still degrades to the owned sentinel", () => {
+      const circular: Record<string, unknown> = { err: fixedError("x") };
+      circular.self = circular;
+
+      const http = logOnce({ enrich: () => circular });
+
+      expect(http.context).toEqual({ _unserializable: true });
+    });
+  });
+
+  describe("body (includeRequestBody)", () => {
+    it("an under-limit body Error renders its fields through a real logger", async () => {
+      const sink = new PassThrough();
+      const chunks: string[] = [];
+      sink.on("data", (chunk: Buffer | string) => chunks.push(String(chunk)));
+      const logger = loggerModule.createLogger({
+        moduleName: "nested-body-json",
+        format: "json",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        captureUncaught: false,
+        additionalTransports: [new winston.transports.Stream({ stream: sink, eol: "\n" })],
+      });
+      const err = fixedError("boom");
+      const middleware = createRequestLogger({
+        logger,
+        includeHttpContext: true,
+        includeRequestBody: true,
+      });
+
+      const { res } = runMiddleware(middleware, { body: { err, id: 1 } });
+      res.emit("finish");
+      await loggerModule.shutdownLogger(logger);
+
+      const line = JSON.parse(chunks.join("")) as { http: { requestBody: unknown } };
+      expect(line.http.requestBody).toEqual({
+        err: { name: "Error", message: "boom", stack: STACK },
+        id: 1,
+      });
+      expect(chunks.join("")).not.toContain('"err":{}');
+      expect(Object.keys(err)).toEqual([]);
+    });
+
+    it("an over-limit body previews and measures a body Error by its fields", () => {
+      const err = fixedError("boom");
+      const body = { err, pad: "x".repeat(100) };
+      const expectedSerialized = JSON.stringify({
+        err: { name: "Error", message: "boom", stack: STACK },
+        pad: body.pad,
+      });
+
+      const http = logOnce({ includeRequestBody: true, maxBodyLength: 60 }, body);
+
+      expect(http.requestBody).toEqual({
+        _truncated: true,
+        _originalLength: expectedSerialized.length,
+        _preview: __requestInternals.truncateString(expectedSerialized, 60),
+      });
+      expect((http.requestBody as { _preview: string })._preview).toContain('"message":"boom"');
+      expect((http.requestBody as { _preview: string })._preview).not.toContain('"err":{}');
+    });
+
+    it("lets a body-scoped redactPaths entry target a body Error's field", () => {
+      const err = fixedError("boom");
+
+      const http = logOnce(
+        { includeRequestBody: true, redactPaths: ["body.err.stack"] },
+        { err, id: 1 },
+      );
+
+      expect(http.requestBody).toEqual({
+        err: { name: "Error", message: "boom", stack: "[REDACTED]" },
+        id: 1,
+      });
+      expect(err.stack).toBe(STACK);
+    });
+
+    it("a body Error with a NON-enumerable self-referencing cause renders [Circular], never the sentinel", () => {
+      const err = selfCausedError("loop");
+
+      for (const redactPaths of [undefined, ["body.id"]]) {
+        const http = logOnce({ includeRequestBody: true, redactPaths }, { err, id: 1 });
+
+        expect(http.requestBody).toEqual({
+          err: { name: "Error", message: "loop", stack: STACK, cause: "[Circular]" },
+          id: redactPaths ? "[REDACTED]" : 1,
+        });
+      }
+      expect(err.cause).toBe(err);
+    });
+
+    it("a body whose mandated redactPaths cannot be applied still fails closed", () => {
+      const body = {
+        err: fixedError("x"),
+        toJSON() {
+          throw new Error("toJSON refused");
+        },
+      };
+
+      const http = logOnce({ includeRequestBody: true, redactPaths: ["body.err"] }, body);
+
+      expect(http.requestBody).toBe("[UNSERIALIZABLE]");
+    });
+
+    it("an Error-free body with a BigInt renders exactly as before", () => {
+      const { serializeBody } = __requestInternals;
+
+      expect(
+        serializeBody({ id: 5n, nested: { a: [1, 2] } }, [], 3000, ["body.nested.a.0"]),
+      ).toEqual({
+        id: "5",
+        nested: { a: ["[REDACTED]", 2] },
+      });
+      expect(serializeBody({ id: 5n, pad: "y".repeat(40) }, [], 20)).toEqual({
+        _truncated: true,
+        _originalLength: JSON.stringify({ id: "5", pad: "y".repeat(40) }).length,
+        _preview: __requestInternals.truncateString(
+          JSON.stringify({ id: "5", pad: "y".repeat(40) }),
+          20,
+        ),
+      });
+    });
+  });
+});
+
+describe("a child logger as the middleware's logger", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+  });
+
+  it("writes the child's metadata on each entry, the entry winning on a shared key", async () => {
+    const sink = new PassThrough();
+    const chunks: string[] = [];
+    sink.on("data", (chunk: Buffer | string) => chunks.push(String(chunk)));
+    const root = loggerModule.createLogger({
+      moduleName: "child-middleware",
+      format: "json",
+      includeConsole: false,
+      includeFile: false,
+      includeGlobalFile: false,
+      captureUncaught: false,
+      additionalTransports: [new winston.transports.Stream({ stream: sink, eol: "\n" })],
+    });
+    const child = root.child({ service: "billing", http: "child-value" });
+    const middleware = createRequestLogger({ logger: child, includeHttpContext: true });
+
+    const { res } = runMiddleware(middleware, {
+      url: "/report/a%d?q=%s",
+      originalUrl: "/report/a%d?q=%s",
+    });
+    res.emit("finish");
+    // A shutdown through the child drains the root it was derived from.
+    await loggerModule.shutdownLogger(child);
+
+    const lines = chunks.join("").trim().split("\n");
+    expect(lines).toHaveLength(1);
+    const line = JSON.parse(lines[0]) as { service: string; message: string; http: unknown };
+    expect(line.service).toBe("billing");
+    // The single-object form keeps the printf tokens verbatim and the context intact.
+    expect(line.message).toContain("/report/a%d?q=%s");
+    expect(line.http).toEqual(
+      expect.objectContaining({ url: "/report/a%d?q=%s", method: "POST", statusCode: 200 }),
+    );
+  });
+});
+
+describe("maskBodyKeys masks what a body value's own toJSON() returns", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const STACK = "Error: fixed\n    at fixed (fixed.js:1:1)";
+
+  /** An HTTP-client-style error whose toJSON() includes the request headers (the axios shape). */
+  class ClientError extends Error {
+    readonly #headers: Record<string, string>;
+
+    public constructor(message: string, headers: Record<string, string>) {
+      super(message);
+      this.#headers = headers;
+    }
+
+    public toJSON(): Record<string, unknown> {
+      return {
+        name: "ClientError",
+        message: this.message,
+        config: { headers: { ...this.#headers } },
+      };
+    }
+  }
+
+  /** A body holding an error whose cause is the client error. */
+  const bodyWithClientError = (extra: Record<string, unknown> = {}): Record<string, unknown> => {
+    const err = new Error("charge failed", {
+      cause: new ClientError("upstream", { authorization: "Bearer S-BODY" }),
+    });
+    err.stack = STACK;
+    return { err, id: 1, ...extra };
+  };
+
+  const maskedErr = {
+    name: "Error",
+    message: "charge failed",
+    stack: STACK,
+    cause: {
+      name: "ClientError",
+      message: "upstream",
+      config: { headers: { authorization: "[REDACTED]" } },
+    },
+  };
+
+  const logOnce = (options: Parameters<typeof createRequestLogger>[0], body: unknown) => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({ logger, includeHttpContext: true, ...options });
+    const { res } = runMiddleware(middleware, { body });
+    res.emit("finish");
+    expect(log).toHaveBeenCalledTimes(1);
+    return log.mock.calls[0][0].http as Record<string, unknown>;
+  };
+
+  it("masks it in an under-limit body", () => {
+    const http = logOnce(
+      { includeRequestBody: true, maskBodyKeys: ["authorization"] },
+      bodyWithClientError(),
+    );
+
+    expect(http.requestBody).toEqual({ err: maskedErr, id: 1 });
+    expect(JSON.stringify(http.requestBody)).not.toContain("S-BODY");
+  });
+
+  it("masks it in the preview of an over-limit body", () => {
+    const http = logOnce(
+      { includeRequestBody: true, maskBodyKeys: ["authorization"], maxBodyLength: 400 },
+      bodyWithClientError({ pad: "x".repeat(500) }),
+    );
+
+    const envelope = http.requestBody as { _truncated: boolean; _preview: string };
+    expect(envelope._truncated).toBe(true);
+    expect(envelope._preview).toContain('"authorization":"[REDACTED]"');
+    expect(envelope._preview).not.toContain("S-BODY");
+  });
+
+  it("masks it when redactPaths also apply", () => {
+    const http = logOnce(
+      { includeRequestBody: true, maskBodyKeys: ["authorization"], redactPaths: ["body.id"] },
+      bodyWithClientError(),
+    );
+
+    expect(http.requestBody).toEqual({ err: maskedErr, id: "[REDACTED]" });
+  });
+
+  it("never prints the own toJSON of an error a body value's toJSON() returns", () => {
+    const body = (): Record<string, unknown> => {
+      const err = Object.assign(new Error("x"), {
+        details: {},
+        toJSON: () => ({ authorization: "S-BODY-ERROR-JSON" }),
+      });
+      err.stack = STACK;
+      return { holder: { toJSON: () => err }, pad: "y".repeat(300) };
+    };
+
+    const underLimit = logOnce(
+      { includeRequestBody: true, maskBodyKeys: ["authorization"] },
+      body(),
+    );
+    const overLimit = logOnce(
+      { includeRequestBody: true, maskBodyKeys: ["authorization"], maxBodyLength: 200 },
+      body(),
+    );
+
+    const rendered = JSON.stringify(underLimit.requestBody, createErrorAwareReplacer());
+    expect(rendered).toContain('"holder":{"name":"Error","message":"x"');
+    expect(rendered).not.toContain("S-BODY-ERROR-JSON");
+    const envelope = overLimit.requestBody as { _truncated: boolean; _preview: string };
+    expect(envelope._truncated).toBe(true);
+    expect(envelope._preview).toContain('"message":"x"');
+    expect(envelope._preview).not.toContain("S-BODY-ERROR-JSON");
+  });
+
+  it("without maskBodyKeys the body is unchanged: the toJSON output renders as it did", () => {
+    const body = bodyWithClientError();
+
+    const http = logOnce({ includeRequestBody: true }, body);
+
+    const rendered = JSON.stringify(http.requestBody, createErrorAwareReplacer());
+    expect(rendered).toContain('"authorization":"Bearer S-BODY"');
+    // The body's Error holds only primitives beside its cause, so it is shared as is.
+    expect((http.requestBody as { err: unknown }).err).toBe(body.err);
   });
 });

@@ -99,8 +99,17 @@
     "typescript-eslint": "^8.59.3"
   },
   "overrides": {
-    "js-yaml@3": "^3.15.0",
+    "js-yaml@3": "^3.15.2",
     "@babel/core": "^7.29.7",
-    "esbuild": "^0.28.1"
+    "esbuild": "^0.28.1",
+    "test-exclude@7": {
+      "glob": "^13.0.6"
+    }
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "unrs-resolver@1.12.2": true,
+    "@parcel/watcher@2.6.0": true,
+    "fsevents@2.3.3": true
   }
 }

@@ -11,7 +11,7 @@ import type {
 } from "./types";
 import { createLogger } from "./logger";
 import { redactValue, REDACTED } from "./redact";
-import { bigintSafeReplacer } from "./serialize";
+import { errorAwareStringify } from "./serialize";
 import { RequestLoggerOptionError } from "./errors";
 import type { LogLevel } from "./types";
 
@@ -307,8 +307,9 @@ const serializeBody = (
     : ((maskKeys as Set<string> | undefined) ?? new Set<string>());
 
   // Apply the keyword-based `maskBodyKeys` redaction. Returns a fresh object
-  // for plain/data-bearing shapes but passes built-ins and `toJSON`-defining
-  // instances through by identity (the documented redaction boundary — see
+  // for plain/data-bearing shapes; built-ins pass through by identity, and so
+  // do `toJSON`-defining values when `maskBodyKeys` is empty, while with a
+  // mask such a value is replaced by its masked `toJSON` output (see
   // `src/redact.ts`).
   let masked = redactValue(body, maskSet, new WeakSet());
 
@@ -323,8 +324,8 @@ const serializeBody = (
   //      inside `_preview`. Applying paths here, pre-truncation, closes that.
   //   2. Caller-object mutation — `redactEntryPath` writes in place, so it must
   //      never touch a node the caller still owns. `redactValue` shares
-  //      built-ins and `toJSON`-defining instances (e.g. a DTO or a `moment`)
-  //      by identity, so mutating them directly would corrupt the live
+  //      built-ins, and without a mask `toJSON`-defining instances (e.g. a DTO
+  //      or a `moment`), by identity, so mutating them directly would corrupt the live
   //      `req.body`. Round-tripping through `JSON.parse(JSON.stringify(...))`
   //      first yields a graph that is (a) entirely fresh — nothing shared with
   //      the caller — and (b) shaped exactly as the final log serializer will
@@ -336,14 +337,17 @@ const serializeBody = (
   // The throw-away `{ requestBody: owned }` wrapper reuses `redactEntryPath`'s
   // `body.` → `requestBody.` alias and prototype-pollution guards; non-body
   // paths (`context.*`, header paths) no-op here and are applied by the
-  // post-assembly loop in `finalize()`. `bigintSafeReplacer` is what keeps a
-  // `BigInt` anywhere in the body from throwing here: without it a single
-  // `BigInt` (an `express.json({ reviver })` product, a protobuf/gRPC adapter,
-  // a 64-bit DB id) failed the round-trip, which — before the fail-closed
-  // return below — meant the operator's mandated paths were silently skipped.
+  // post-assembly loop in `finalize()`. `errorAwareStringify` renders a body
+  // `Error` by its fields (so a path can target them, and the copy is not
+  // `{}`), and falls back to the BigInt-only replacer, the pre-existing call,
+  // when that pass throws. Its BigInt handling is what keeps a `BigInt`
+  // anywhere in the body from throwing here: without it a single `BigInt` (an
+  // `express.json({ reviver })` product, a protobuf/gRPC adapter, a 64-bit DB
+  // id) failed the round-trip, which — before the fail-closed return below —
+  // meant the operator's mandated paths were silently skipped.
   if (bodyRedactPaths && bodyRedactPaths.length > 0 && masked && typeof masked === "object") {
     try {
-      const owned: unknown = JSON.parse(JSON.stringify(masked, bigintSafeReplacer));
+      const owned: unknown = JSON.parse(errorAwareStringify(masked) as string);
       const wrapper: Record<string, unknown> = { requestBody: owned };
       for (const path of bodyRedactPaths) {
         redactEntryPath(wrapper, path);
@@ -373,14 +377,16 @@ const serializeBody = (
   }
 
   try {
-    // `bigintSafeReplacer` mirrors the pretty-mode formatter's `safeStringify`
-    // and `logform/json.js`'s built-in replacer, so a BigInt renders as its
+    // `errorAwareStringify` mirrors the logger's serializers (pretty
+    // `safeStringify` and the json format), so a BigInt renders as its
     // decimal string here instead of throwing and collapsing the whole body
-    // into the `String(masked)` fallback (`"[object Object]"`). Note this
-    // serialization is used for the length decision and the `_preview` text;
-    // an under-limit body is returned as the live `masked` object, whose
-    // BigInts the downstream logger renders through the same convention.
-    const serialized = JSON.stringify(masked, bigintSafeReplacer);
+    // into the `String(masked)` fallback (`"[object Object]"`), and a body
+    // `Error` counts and previews by its fields, as the logger will render
+    // it. Note this serialization is used for the length decision and the
+    // `_preview` text; an under-limit body is returned as the live `masked`
+    // object, whose BigInts and Errors the downstream logger renders through
+    // the same conventions.
+    const serialized = errorAwareStringify(masked) as string;
     if (serialized.length > maxLength) {
       return buildTruncatedEnvelope(serialized, maxLength);
     }
@@ -407,9 +413,13 @@ const serializeBody = (
  * serializer renders it, so a context that defines `toJSON` (a Mongoose
  * document, a class DTO, `req.user`) is copied BY VALUE — its fields stay
  * redactable by `redactPaths` instead of being passed through by identity and
- * mutated. A context carrying a `BigInt` (a snowflake id, a monetary amount)
- * makes the plain round-trip throw, so it is retried through a BigInt-coercing
- * replacer — still a fully-owned, `toJSON`-resolved copy. A context that
+ * mutated. The round-trip goes through `errorAwareStringify`, so a `BigInt`
+ * (a snowflake id, a monetary amount) is coerced to its decimal string and a
+ * nested `Error` is copied by its fields (`name`, `message`, `stack`, `cause`)
+ * instead of as `{}`. When that pass throws (a cycle through a non-enumerable
+ * `cause`, or a throwing getter inside one), it is retried with the BigInt-only
+ * replacer, which reproduces the pre-existing copy (an `Error` as `{}`); both
+ * are fully-owned, `toJSON`-resolved copies. A context that
  * neither round-trip can express (a circular reference, or a value whose getter
  * / `toJSON` throws) degrades to a fresh owned `{ _unserializable: true }`
  * sentinel rather than sharing the caller's live graph or letting the failure
@@ -420,12 +430,7 @@ const serializeBody = (
  */
 const ownContext = (enriched: Record<string, unknown>): Record<string, unknown> => {
   try {
-    return JSON.parse(JSON.stringify(enriched)) as Record<string, unknown>;
-  } catch {
-    // Fall through: a value is not JSON-expressible as-is (commonly a BigInt).
-  }
-  try {
-    return JSON.parse(JSON.stringify(enriched, bigintSafeReplacer)) as Record<string, unknown>;
+    return JSON.parse(errorAwareStringify(enriched) as string) as Record<string, unknown>;
   } catch {
     // A circular reference, or a value whose getter / `toJSON` throws.
     return { _unserializable: true };

@@ -141,7 +141,8 @@ export interface LoggerOptions {
    */
   logDirectory?: string;
   /**
-   * Logging level for all transports. Defaults to `"info"`.
+   * Initial level of the logger, which its built-in transports follow unless
+   * `consoleLevel` pins the console. Defaults to `"info"`.
    *
    * Winston uses the npm log-level hierarchy where lower numbers are more
    * severe and a level only emits messages whose severity is `<=` the
@@ -163,12 +164,45 @@ export interface LoggerOptions {
    * - `"info"` — default; standard production verbosity.
    * - `"http"` — include HTTP request/response logs from the middleware.
    * - `"debug"` / `"silly"` — development / deep diagnostics only.
+   *
+   * **Runtime changes:** this is the logger's initial level. Assigning
+   * `logger.level = "debug"` later takes effect on the console (unless
+   * `consoleLevel` pins it), the module file, and the global file, because
+   * those built-in transports carry no level of their own and inherit the
+   * logger's current level on every write (winston's documented transport
+   * level inheritance). `logger.isLevelEnabled()` agrees with what is
+   * emitted, for every level in the hierarchy.
+   * An `additionalTransports` entry constructed with its own `level` keeps
+   * that level. As a consequence, `transport.level` reads `undefined` on the
+   * built-in module-file and global-file transports, and on the console unless
+   * `consoleLevel` was passed (then it reads that value).
+   *
+   * The assigned value is not validated, and two kinds of invalid value
+   * behave in opposite ways:
+   * - A non-empty string outside the hierarchy (for example `"silent"`)
+   *   matches no level, so every inheriting transport drops EVERY entry,
+   *   errors and crash records included.
+   * - An empty or missing value (`""`, `undefined`, `null`, e.g. an unset
+   *   environment variable) leaves the transports with no level at all, so
+   *   they accept EVERY entry, `debug` and `silly` included, while
+   *   `logger.isLevelEnabled()` reports `false` for every level.
+   *
+   * Validate a level read from configuration before assigning it. To silence
+   * a logger, set `logger.silent = true` instead.
    */
   level?: LogLevel;
   /**
-   * Logging level used specifically for the console transport. Defaults to
-   * the value of `level`. Same npm-level semantics as `level` — see that
-   * option's docs for the full hierarchy.
+   * Logging level used specifically for the console transport. Same
+   * npm-level semantics as `level`; see that option's docs for the full
+   * hierarchy.
+   *
+   * When omitted, the console follows the logger's level, including runtime
+   * `logger.level` changes. When passed (even with the same value as
+   * `level`), it pins the console to this level: runtime `logger.level`
+   * changes then reach the files but not the console, and the console
+   * transport's `level` reads this value. Adding or removing the pin on a
+   * second `createLogger()` call for a cached logger is reported by the
+   * conflict warning as `consoleLevelPinned`.
    */
   consoleLevel?: LogLevel;
   /**
@@ -176,7 +210,11 @@ export interface LoggerOptions {
    */
   includeConsole?: boolean;
   /**
-   * Enables or disables the module specific rotating file transport.
+   * Enables or disables the module specific rotating file transport. When
+   * `includeGlobalFile` is on and the module files are the global files (the
+   * same path and the same effective `datePattern`, see
+   * {@link LoggerOptions.globalModuleName}), no separate transport is built:
+   * they are written once, through the shared global transport.
    */
   includeFile?: boolean;
   /**
@@ -184,7 +222,14 @@ export interface LoggerOptions {
    */
   includeGlobalFile?: boolean;
   /**
-   * Name used for the aggregated log file.
+   * Name used for the aggregated log file. With `includeGlobalFile` on, a
+   * logger whose `moduleName` resolves to the same path writes it once, through the shared transport and with its
+   * rotation settings (those of the first logger that opened it), unless its
+   * module `datePattern` differs from that transport's: different date patterns
+   * name different files, so both are kept. When one logger's private module
+   * file is another logger's global file (same path and `datePattern`),
+   * `createLogger()` warns once per path; the two keep separate rotators, so
+   * give them distinct names.
    */
   globalModuleName?: string;
   /**
@@ -306,16 +351,22 @@ export interface LoggerOptions {
    *   prefix; `message` colorizes the message body; `all` overrides both
    *   flags and colorizes everything when `true`.
    *
+   * The message body is colorized AFTER it is rendered, so the console shows
+   * the same message text as the file line (an `undefined` message reads
+   * `undefined`, a BigInt its digits, an object or array its full-depth JSON);
+   * only the color codes differ. A level with no configured color is rendered
+   * without color.
+   *
    * File transports are NEVER colorized regardless of this option.
    */
   colorize?: boolean | { message?: boolean; level?: boolean; all?: boolean };
   /**
-   * Metadata keys whose values should be replaced with `"[REDACTED]"` in the
+   * Keys whose values should be replaced with `"[REDACTED]"` in the
    * serialized log output. Matched **case-insensitively** and applied
-   * **deeply** (including arrays and nested objects) before the metadata is
-   * `JSON.stringify`'d into the log line.
+   * **deeply** (including arrays and nested objects) before the value is
+   * serialized into the log line.
    *
-   * Targets the metadata object passed as the second-or-later argument to
+   * Covers the metadata object passed as the second-or-later argument to
    * `logger.info(...)` / `logger.warn(...)` / etc. — for example:
    *
    * ```ts
@@ -324,21 +375,48 @@ export interface LoggerOptions {
    * // Logged metadata: { email: "u@example.com", password: "[REDACTED]" }
    * ```
    *
+   * It also covers **object and array messages**. Winston puts a
+   * single-argument payload without a truthy `message` into the message slot,
+   * so `logger.info({ user, password })`, `logger.info([{ password }])`, and
+   * `logger.info({ message: { password } })` are masked the same way, as is a
+   * non-string `stack` (a real `Error` stack is a string). A `toJSON()` on the
+   * message value is called first, and its result is masked the way the
+   * serializer reads it (by its own keys). String and BigInt messages and
+   * string stacks are never changed. If walking a message or stack throws (a
+   * throwing getter or `toJSON()`), it renders as the string
+   * `"[RedactionFailed]"`, never the raw value, and the log call does not throw.
+   *
    * Defaults to `[]` (no redaction) for backward compatibility. The redaction
    * runs in BOTH the file pipeline and the console pipeline, so a key cannot
    * leak via one transport but not the other. Circular references are handled
    * gracefully (replaced with `"[Circular]"`).
    *
-   * **Redaction boundary.** Deep redaction covers plain objects, arrays, and
-   * the enumerable own fields of class/Error instances. NESTED values that
-   * define their own `toJSON()` (such as `Date`, `URL`, and custom
-   * serializable classes) or that carry no enumerable own keys (`Map`, `Set`,
-   * `RegExp`, etc.) are serialized via their built-in method and are **not**
-   * key-redacted — use `redactPaths` or normalize to a plain object for those.
-   * A `toJSON`-defining object passed as the log call's own subject
-   * (`logger.info(dto)` in `format: "json"`) is the exception: its `toJSON()`
-   * is resolved first and the resulting fields ARE key-redacted, so enabling
-   * the mask never emits more than logging the same object without it would.
+   * **Values with their own `toJSON()`.** Deep redaction covers plain objects,
+   * arrays, the enumerable own fields of class instances, `Error`s (their own
+   * fields, `cause` chain and `AggregateError` members), and the OUTPUT of a
+   * nested value's own `toJSON()` (a DTO, a database document, an HTTP client
+   * error, also inside an error's `cause`): the serializer prints that output,
+   * so the masking walk calls the method the same way and masks what it
+   * returns by its own keys. A class instance's `toJSON()` runs on the
+   * instance (so `#private` fields work), a nested plain object's on the masked
+   * copy.
+   * The log entry's own top-level `toJSON()` is resolved first as well: a
+   * `toJSON`-defining message (any format), a `toJSON`-defining object passed
+   * as the log call's own subject (`logger.info(dto)` in `format: "json"`,
+   * called on the real object), and, in the default pretty format, a metadata
+   * object with its own `toJSON()` method, which is called on the masked copy.
+   * A field such a `toJSON()` withholds is never printed because a mask is on.
+   * The one exception is a mask that names `toJSON` itself: it replaces a plain
+   * object's own method with the placeholder, so that object's own keys are
+   * printed instead.
+   *
+   * **What masking cannot reach.** Masking matches keys, never text: a
+   * `toJSON()` that returns a string (`Date`, `URL`) renders unchanged, a value
+   * a class instance's `toJSON()` copies from a masked field under another key
+   * name (or returns as a string) is printed, and an error `message` built from
+   * the error's own fields prints as built. Values with no enumerable own keys
+   * (`Map`, `Set`, `RegExp`) and binary values (`Buffer`, typed arrays) render
+   * as their serializer renders them — normalize those to a plain object.
    *
    * **Console/file parity (`format: "json"`).** The json-mode Console transport
    * carries no per-transport format, so `winston-transport` writes the
@@ -418,7 +496,10 @@ export interface LoggerOptions {
    * pipeline depends on multi-line stack rendering should leave the option at
    * its `false` default, in which both the message and the stack render exactly
    * as they always have. Values that are not strings on either branch are
-   * serialized through `JSON.stringify`, which escapes newlines regardless.
+   * serialized through `JSON.stringify`, which escapes newlines inside
+   * strings. The exception is a message JSON cannot express at all (a
+   * function, a symbol, a `toJSON()` returning `undefined`): it is rendered
+   * with `String()` and is not escaped, since the option covers string values.
    *
    * Mature production loggers (pino, bunyan, application-log shippers) ship
    * the equivalent of this option enabled by default; this package keeps it
@@ -607,12 +688,14 @@ export interface RequestLoggerOptions {
    * Matched **case-insensitively** and applied **deeply** (including arrays
    * and nested objects).
    *
-   * **Redaction boundary.** Deep redaction covers plain objects, arrays, and
-   * the enumerable own fields of class/Error instances. Values that define
-   * their own `toJSON()` (such as `Date`, `URL`, and custom serializable
-   * classes) or that carry no enumerable own keys (`Map`, `Set`, `RegExp`,
-   * etc.) are serialized via their built-in method and are **not** key-
-   * redacted — use `redactPaths` or normalize to a plain object for those.
+   * **Redaction boundary.** Deep redaction covers plain objects, arrays, the
+   * enumerable own fields of class/Error instances, and the output of a
+   * value's own `toJSON()` (a DTO, an HTTP client error, also inside an
+   * error's `cause`), masked the way the serializer reads it. A `toJSON()`
+   * returning a string (such as `Date` and `URL`) and values that carry no
+   * enumerable own keys (`Map`, `Set`, `RegExp`, etc.) are serialized via their
+   * built-in method and are **not** key-redacted — use `redactPaths` or
+   * normalize to a plain object for those.
    */
   maskBodyKeys?: string[];
   /**
@@ -658,11 +741,11 @@ export interface RequestLoggerOptions {
    *
    * Defaults to `[]`.
    *
-   * **Redaction boundary note.** Deep redaction (via `maskBodyKeys`) covers
-   * plain objects, arrays, and the enumerable own fields of class/Error
-   * instances but does **not** key-redact values that define their own
-   * `toJSON()`. Use `redactPaths` for surgical path-based replacement of such
-   * values (e.g. `["body.user.createdAt"]` to blank a `Date` field).
+   * **Redaction boundary note.** Deep redaction (via `maskBodyKeys`) masks
+   * keys, including those in the output of a value's own `toJSON()`, but a
+   * `toJSON()` that returns a string (a `Date`) has no key to mask. Use
+   * `redactPaths` for surgical path-based replacement of such values (e.g.
+   * `["body.user.createdAt"]` to blank a `Date` field).
    */
   redactPaths?: string[];
   /**

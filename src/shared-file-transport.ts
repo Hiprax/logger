@@ -70,6 +70,12 @@ interface SharedFileEntry {
   handles: Set<winston.transport>;
   /** Canonical rotation config of the creator, used to detect conflicts. */
   rotationSignature: string;
+  /**
+   * The creator's effective `datePattern`: the pattern `%DATE%` is rendered
+   * with, so the real file names this transport writes. Later acquirers share
+   * the creator's transport whatever their own rotation says.
+   */
+  datePattern: string;
   /** Latches after the first conflicting-rotation warning for this path. */
   warned: boolean;
   /** The single `error` listener attached to {@link transport}. */
@@ -163,22 +169,31 @@ export const flushSharedFileTransportsForExit = (): Promise<void> =>
  * piped into the logger — never the shared transport itself.
  *
  * @param options.key - Resolved absolute global-log-file path (the share key).
- * @param options.level - The acquiring logger's level. Level gating happens on
- *   the handle, so loggers sharing one file keep independent levels.
+ * @param options.level - Optional explicit level for the handle. Level gating
+ *   happens on the handle, never on the shared transport, so loggers sharing
+ *   one file keep independent levels. `logger.ts` omits it: a level-less handle
+ *   resolves `this.level || (this.parent && this.parent.level)` on every write
+ *   (`winston-transport`'s `_write`), and `parent` is the logger it is piped
+ *   into, so it follows that logger's CURRENT level, including a runtime
+ *   `logger.level = x`. A handle given a level keeps that fixed level.
  * @param options.rotationSignature - Canonical JSON of the acquiring logger's
  *   resolved global rotation config. A second acquisition with a different
  *   signature keeps the first logger's config and warns once.
+ * @param options.datePattern - The effective `datePattern` the transport built
+ *   by `createTransport` renders `%DATE%` with. Recorded only by the creating
+ *   acquisition, like the rest of the config.
  * @param options.createTransport - Factory for the real transport. Injected by
  *   the caller so this module does not depend on `logger.ts` (which would be a
  *   cycle) and stays trivially testable.
  */
 export const acquireSharedGlobalFile = (options: {
   key: string;
-  level: string;
+  level?: string;
   rotationSignature: string;
+  datePattern: string;
   createTransport: () => winston.transport;
 }): winston.transport => {
-  const { key, level, rotationSignature, createTransport } = options;
+  const { key, level, rotationSignature, datePattern, createTransport } = options;
 
   let entry = sharedFileRegistry.get(key);
   if (!entry) {
@@ -188,6 +203,7 @@ export const acquireSharedGlobalFile = (options: {
       refCount: 0,
       handles: new Set<winston.transport>(),
       rotationSignature,
+      datePattern,
       warned: false,
       // ONE `error` listener on the shared transport, fanned out to every live
       // handle. Attaching one listener per handle instead would put N
@@ -294,6 +310,21 @@ export const acquireSharedGlobalFile = (options: {
   target.handles.add(handle);
   return handle;
 };
+
+/**
+ * Returns the effective `datePattern` of the live shared transport for `key`
+ * (a key built exactly like the one {@link acquireSharedGlobalFile} receives),
+ * or `undefined` when no transport holds that slot. A slot exists from the
+ * first acquisition until the last handle releases it, or until
+ * {@link resetSharedFileRegistry} drops it.
+ *
+ * `key` names the `%DATE%` file-name pattern; the pattern returned here is what
+ * turns it into real file names. `logger.ts` compares both to decide whether a
+ * module file and this shared file are the SAME files: to write such a file once
+ * instead of through two rotators, and to warn when two loggers collide on it.
+ */
+export const sharedGlobalFileDatePattern = (key: string): string | undefined =>
+  sharedFileRegistry.get(key)?.datePattern;
 
 /**
  * Drops every shared-file registry slot WITHOUT closing the underlying
