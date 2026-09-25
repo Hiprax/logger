@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-25
+
 ### Changed
 
 - **Every logger method that returns the logger now returns the logger it was called on** (`src/logger.ts`, `README.md`; tests in `tests/logger.spec.ts`): the level methods (`info()`, `error()`, ...), `log()`, `close()`, `end()`, `add()`, `remove()`, `clear()`, `unpipe()`, `profile()`, `on()` and the other event-emitter methods, and the unknown-method fallback, on a logger and on a child. They returned the raw winston logger underneath (for a child, winston's raw child object), so a chain left the package's wrapper: `logger.info("x").success("y")` threw `TypeError: ... is not a function`, and `logger.info("x").end()`, `logger.info("x").close()` or `shutdownLogger(logger.info("x").child(meta))` ended the logger but left it cached, so the next `createLogger()` with the same options returned the ended logger and every later line was silently dropped (`close()` through such a chain also left the logger registered for crash capture). Any other return value is unchanged, and so is the logger the methods act on. `logger.constructor` stays a bound, constructible class.
