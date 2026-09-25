@@ -7,7 +7,11 @@ import { InvalidTimezoneError, LoggerOptionError } from "./errors";
 import { redactValue, FORBIDDEN_KEYS, REDACTION_FAILED } from "./redact";
 import { bigintSafeReplacer, createErrorAwareReplacer, errorAwareStringify } from "./serialize";
 import { registerCrashCapture, deregisterCrashCapture, resetCrashCapture } from "./crash-capture";
-import { acquireSharedGlobalFile, resetSharedFileRegistry } from "./shared-file-transport";
+import {
+  acquireSharedGlobalFile,
+  resetSharedFileRegistry,
+  sharedGlobalFileDatePattern,
+} from "./shared-file-transport";
 import type { LoggerOptions, TimestampContext, LogLevel, RotationStrategy } from "./types";
 
 /**
@@ -235,9 +239,55 @@ interface RegistryEntry {
   optionsSignature: string;
   additionalTransportCount: number;
   warned: boolean;
+  /**
+   * `true` only when this logger built its own private module
+   * `DailyRotateFile`. `false` when `includeFile` is off, and when the module
+   * file IS the global file (the logger then writes it once, through the
+   * shared global handle). The cross-logger collision check reads it: a
+   * registry entry only proves the key was computed, not that a file is open.
+   */
+  ownsModuleFile: boolean;
+  /**
+   * The effective `datePattern` of this logger's module rotation
+   * ({@link effectiveDatePattern}): with the registry key (the `%DATE%`
+   * file-name pattern) it identifies the real module files.
+   */
+  moduleDatePattern: string;
 }
 
 const loggerRegistry = new Map<string, RegistryEntry>();
+
+/**
+ * Registry keys of the paths already reported by
+ * {@link warnSharedPathCollision}, so each colliding path warns once. Cleared
+ * by `resetLoggerRegistry()`, like the registries the check reads.
+ */
+const sharedPathCollisionWarned = new Set<string>();
+
+/**
+ * Warns once per path that one logger's private module file and the shared
+ * global file of another logger are the same file (the same `%DATE%` file-name
+ * pattern AND the same effective `datePattern`). The two rotators cannot be
+ * merged after the fact (each logger owns its own lifecycle and rotation
+ * config), so the file gets interleaved writers and two rotation audit files;
+ * the fix is a configuration change the caller has to make.
+ *
+ * @param key - The collision path as a registry key (`buildRegistryKey`).
+ * @param filename - The same path, original case, named in the warning.
+ */
+const warnSharedPathCollision = (key: string, filename: string): void => {
+  if (sharedPathCollisionWarned.has(key)) {
+    return;
+  }
+  sharedPathCollisionWarned.add(key);
+  console.warn(
+    `[@hiprax/logger] Two loggers write to the same log file ${JSON.stringify(filename)}: ` +
+      `one as its module file, another as the shared global file (same name and \`datePattern\`). ` +
+      `Each keeps its own rotator, ` +
+      `so lines interleave and rotation and retention run twice on one file. ` +
+      `Give the loggers distinct \`moduleName\` / \`globalModuleName\` values.`,
+  );
+};
 
 /**
  * Maps each public logger Proxy back to the underlying **base** winston logger
@@ -424,6 +474,24 @@ export const defaultRotation: Readonly<RotationStrategy> = Object.freeze({
   datePattern: "YYYY-MM-DD",
   zippedArchive: false,
 });
+
+/**
+ * The `datePattern` a rotator built from `rotation` actually renders `%DATE%`
+ * with: `winston-daily-rotate-file` falls back to `"YYYY-MM-DD"` for a falsy
+ * one (`options.datePattern ? options.datePattern : "YYYY-MM-DD"`), so an
+ * explicit `undefined` or `""` names the same files as the default.
+ *
+ * FOR COMPARISONS ONLY. Two rotators with the same `%DATE%` file-name pattern
+ * write the same real files exactly when these values are equal (`maxSize`
+ * only adds a `.N` suffix to that name; `maxFiles` and `zippedArchive` never
+ * change it). The value must never be passed to a `DailyRotateFile`: its audit
+ * file name hashes the constructor options, so normalizing them would orphan
+ * the audit file of every install that passes a falsy `datePattern`. Two
+ * different strings that happen to render the same name (`"DD"` / `"D"` on
+ * some days) count as different, which keeps the pre-existing behavior.
+ */
+const effectiveDatePattern = (rotation: RotationStrategy): string =>
+  rotation.datePattern ? rotation.datePattern : "YYYY-MM-DD";
 
 /**
  * Returns a fresh, **mutable** deep copy of {@link defaultRotation}. Useful
@@ -2713,8 +2781,51 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
 
   // `moduleFilename` was computed above (it seeds the registry key); reuse it.
   const globalFilename = buildLogFilePath(resolvedLogDirectory, globalModuleName);
+  const globalRegistryKey = buildRegistryKey(globalFilename);
+  // A real file is identified by its `%DATE%` file-name pattern (the registry
+  // key) plus the `datePattern` that renders it (see `effectiveDatePattern`).
+  // The global file is written by the shared transport, whose config is its
+  // CREATOR's: an existing one keeps its pattern whatever this logger's
+  // `globalRotation` says; otherwise this logger is about to create it.
+  const moduleDatePattern = effectiveDatePattern(resolvedRotation);
+  const globalDatePattern =
+    sharedGlobalFileDatePattern(globalRegistryKey) ?? effectiveDatePattern(resolvedGlobalRotation);
+  // One file, one writer. When the module files ARE the global files (the
+  // default `moduleName: "global"` with `globalModuleName: "global"`,
+  // `moduleName: "all-logs"` with the default global name, or any two names
+  // that sanitize to the same path, with the same effective `datePattern`), a
+  // private rotator next to the shared one wrote every line twice and kept two
+  // audit files for one file. The shared global handle alone writes them: other
+  // loggers on that path stay refcounted, and the files rotate with the shared
+  // transport's settings. A different `datePattern` names different files, so
+  // both rotators stay, exactly as before.
+  const moduleFileIsGlobalFile =
+    includeGlobalFile &&
+    registryKey === globalRegistryKey &&
+    moduleDatePattern === globalDatePattern;
+  const ownsModuleFile = includeFile && !moduleFileIsGlobalFile;
 
-  if (includeFile) {
+  // Across loggers the two kinds of file cannot be merged, so a collision
+  // between one logger's PRIVATE module files and the SHARED global files only
+  // warns. A module file deduplicated above, or never built (`includeFile:
+  // false`), is not a second writer and never warns; neither is one whose
+  // `datePattern` names different files.
+  if (ownsModuleFile && sharedGlobalFileDatePattern(registryKey) === moduleDatePattern) {
+    warnSharedPathCollision(registryKey, moduleFilename);
+  }
+  // This logger is not registered yet, so an entry under the global key is a
+  // DIFFERENT logger (the key cannot be this logger's own: that is the
+  // deduplicated case, which missed the cache above).
+  const globalKeyOwner = loggerRegistry.get(globalRegistryKey);
+  if (
+    includeGlobalFile &&
+    globalKeyOwner?.ownsModuleFile &&
+    globalKeyOwner.moduleDatePattern === globalDatePattern
+  ) {
+    warnSharedPathCollision(globalRegistryKey, globalFilename);
+  }
+
+  if (ownsModuleFile) {
     ensureDirectory(path.dirname(moduleFilename));
     // Built WITH `level`, then cleared. The order is load-bearing:
     // `winston-daily-rotate-file` names the rotation audit file
@@ -2743,9 +2854,10 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     // handle on shutdown, never the shared transport other loggers still use.
     registerTransport(
       acquireSharedGlobalFile({
-        // Normalize the shared-file registry key the SAME way the module
-        // registry key is (`buildRegistryKey` — Windows-only lowercase, POSIX
-        // identity). Without this the shared-file registry keyed on the raw
+        // `globalRegistryKey` is normalized the SAME way the module registry
+        // key is (`buildRegistryKey` — Windows-only lowercase, POSIX
+        // identity), which is also what lets the same-path checks above compare
+        // the two kinds of key directly. Without this the shared-file registry keyed on the raw
         // `globalFilename`, so on a case-insensitive filesystem two loggers
         // whose `globalModuleName` differs only in case ("SharedLog" vs
         // "sharedlog") opened TWO independent `DailyRotateFile` rotators on ONE
@@ -2753,11 +2865,12 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
         // bug the module registry avoids. `createTransport` still receives the
         // original-case `globalFilename` for the actual file path, so only the
         // registry-equality key is folded, never the on-disk name.
-        key: buildRegistryKey(globalFilename),
+        key: globalRegistryKey,
         // No `level`: the handle inherits THIS logger's level through its
         // `parent` (see "Level gating" above), so loggers sharing the file keep
         // independent, runtime-adjustable levels. The handle has no audit file.
         rotationSignature: JSON.stringify(resolvedGlobalRotation),
+        datePattern: effectiveDatePattern(resolvedGlobalRotation),
         createTransport: () =>
           buildRotateTransport({
             filename: globalFilename,
@@ -3015,6 +3128,8 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
     optionsSignature,
     additionalTransportCount: additionalTransportsCopy.length,
     warned: false,
+    ownsModuleFile,
+    moduleDatePattern,
   });
   return proxied;
 };
@@ -3044,6 +3159,10 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
  * contract above); it closes when its last handle is released via
  * `shutdownLogger()` / `logger.close()`.
  *
+ * The one-time warning for a module file that collides with another logger's
+ * shared global file is re-armed too: both registries it compares are empty
+ * again, so a collision among the loggers created afterwards warns once more.
+ *
  * @example
  * ```ts
  * import { createLogger, resetLoggerRegistry } from "@hiprax/logger";
@@ -3064,6 +3183,7 @@ export const resetLoggerRegistry = (): void => {
   resetCrashCapture();
   resetSharedFileRegistry();
   crashFlagStripWarned = false;
+  sharedPathCollisionWarned.clear();
 };
 
 /**

@@ -3481,6 +3481,7 @@ describe("createLogger", () => {
           key,
           level: "info",
           rotationSignature: "{}",
+          datePattern: "YYYY-MM-DD",
           createTransport: () => sink as winston.transport,
         });
 
@@ -12448,6 +12449,695 @@ describe("serialize: createErrorAwareReplacer, errorAwareStringify", () => {
       expect(errorAwareStringify(absent)).toBeUndefined();
       expect(calls).toBe(1);
       expect(errorAwareStringify(() => 1)).toBeUndefined();
+    });
+  });
+});
+
+describe("module and global files on the same path", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    __crashCaptureInternals.restoreExitFn();
+    jest.restoreAllMocks();
+  });
+
+  /** Every `.log` file in `dir` whose name starts with `${prefix}-`, concatenated. */
+  const readLogFiles = (dir: string, prefix: string): string =>
+    fs
+      .readdirSync(dir)
+      .filter((name) => name.startsWith(`${prefix}-`) && name.endsWith(".log"))
+      .map((name) => fs.readFileSync(path.join(dir, name), "utf8"))
+      .join("");
+
+  const logFileNames = (dir: string): string[] =>
+    fs.readdirSync(dir).filter((name) => name.endsWith(".log"));
+
+  /**
+   * The distinct file families (`<name>` of `<name>-<date>[.N].log`) in `dir`.
+   * Counting families rather than files keeps a run that crosses local midnight,
+   * where a rotator opens the next day's file, from changing the result.
+   */
+  const logFileFamilies = (dir: string): string[] =>
+    [
+      ...new Set(
+        logFileNames(dir).map((name) => name.replace(/-\d{4}-\d{2}-\d{2}(\.\d+)?\.log$/, "")),
+      ),
+    ].sort();
+
+  const auditFiles = (dir: string): string[] =>
+    fs.readdirSync(dir).filter((name) => /^\..+-audit\.json$/.test(name));
+
+  const occurrences = (text: string, marker: string): number => text.split(marker).length - 1;
+
+  /** The exact file-name pattern `createLogger` hands to the rotator for `name`. */
+  const rotatedPath = (dir: string, name: string): string =>
+    path.join(fs.realpathSync.native(dir), `${name}-%DATE%.log`);
+
+  describe("one logger whose module file is its global file (deduplicated)", () => {
+    describe.each([
+      ['globalModuleName: "global"', { globalModuleName: "global" }, "global"],
+      ['moduleName: "all-logs"', { moduleName: "all-logs" }, "all-logs"],
+      [
+        'moduleName: "all logs" (sanitizes to the global file)',
+        { moduleName: "all logs" },
+        "all-logs",
+      ],
+    ] as const)("%s", (_title, names, prefix) => {
+      it.each([["pretty"], ["json"]] as const)(
+        "writes each line once through one rotator (%s)",
+        async (format) => {
+          const root = createTempDir();
+          const logger = createLogger({
+            ...names,
+            logDirectory: root,
+            includeConsole: false,
+            captureUncaught: false,
+            format,
+          });
+
+          const privateRotators = moduleRotatingTransports(logger).length;
+          const piped = logger.transports.length;
+
+          logger.info(`SAME-PATH-${format}`);
+          await shutdownLogger(logger);
+
+          expect(logFileFamilies(root)).toEqual([prefix]);
+          expect(occurrences(readLogFiles(root, prefix), `SAME-PATH-${format}`)).toBe(1);
+          // One rotator means one rotation audit file; two rotators wrote two.
+          expect(auditFiles(root)).toHaveLength(1);
+          // Only the shared global handle is piped in: no private rotator on the same file.
+          expect(privateRotators).toBe(0);
+          expect(piped).toBe(1);
+        },
+      );
+    });
+
+    it("keeps following runtime level changes through the shared handle", async () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "all-logs",
+        logDirectory: root,
+        includeConsole: false,
+        captureUncaught: false,
+      });
+
+      logger.debug("SAME-PATH-DEBUG-BEFORE");
+      logger.level = "debug";
+      logger.debug("SAME-PATH-DEBUG-AFTER");
+      await shutdownLogger(logger);
+
+      const file = readLogFiles(root, "all-logs");
+      expect(occurrences(file, "SAME-PATH-DEBUG-AFTER")).toBe(1);
+      expect(file).not.toContain("SAME-PATH-DEBUG-BEFORE");
+    });
+
+    it("records a crash once in the file it would otherwise have written twice", async () => {
+      __crashCaptureInternals.setExitFn(jest.fn());
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "all-logs",
+        logDirectory: root,
+        includeConsole: false,
+        exitOnUncaught: false,
+      });
+
+      __crashCaptureInternals.invokeUncaught(new Error("same-path-crash"));
+      await new Promise((resolve) => setImmediate(resolve));
+      await shutdownLogger(logger);
+
+      const file = readLogFiles(root, "all-logs");
+      expect(occurrences(file, "uncaughtException: same-path-crash")).toBe(1);
+      expect(logFileFamilies(root)).toEqual(["all-logs"]);
+    });
+
+    it("has the crash record on disk once before the process exits", async () => {
+      const root = createTempDir();
+      let fileAtExit: string | undefined;
+      const exited = new Promise<void>((resolve) => {
+        __crashCaptureInternals.setExitFn(() => {
+          fileAtExit = readLogFiles(root, "all-logs");
+          resolve();
+        });
+      });
+      const logger = createLogger({
+        moduleName: "all-logs",
+        logDirectory: root,
+        includeConsole: false,
+      });
+
+      __crashCaptureInternals.invokeUncaught(new Error("same-path-exit"));
+      await exited;
+
+      expect(occurrences(fileAtExit ?? "", "uncaughtException: same-path-exit")).toBe(1);
+      expect(logFileFamilies(root)).toEqual(["all-logs"]);
+      await shutdownLogger(logger);
+    });
+
+    it("rotates the single file with the global rotation settings", () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "all-logs",
+        logDirectory: root,
+        includeConsole: false,
+        captureUncaught: false,
+        rotation: { maxFiles: "3d" },
+        globalRotation: { maxFiles: "30d" },
+      });
+
+      expect(moduleRotatingTransports(logger).length).toBe(0);
+      const shared = sharedGlobalTransports();
+      expect(shared).toHaveLength(1);
+      expect((shared[0] as unknown as { options: { maxFiles: string } }).options.maxFiles).toBe(
+        "30d",
+      );
+
+      teardownLogger(logger);
+    });
+  });
+
+  describe("unchanged when the names differ", () => {
+    it("still writes the module file and the global file, one line each", async () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "api",
+        logDirectory: root,
+        includeConsole: false,
+        captureUncaught: false,
+      });
+
+      expect(moduleRotatingTransports(logger).length).toBe(1);
+      expect(logger.transports.length).toBe(2);
+
+      logger.info("DISTINCT-PATH");
+      await shutdownLogger(logger);
+
+      expect(logFileFamilies(root)).toEqual(["all-logs", "api"]);
+      expect(occurrences(readLogFiles(root, "api"), "DISTINCT-PATH")).toBe(1);
+      expect(occurrences(readLogFiles(root, "all-logs"), "DISTINCT-PATH")).toBe(1);
+      expect(auditFiles(root)).toHaveLength(2);
+    });
+
+    it('keeps a private module file when the global file is off (`moduleName: "all-logs"`)', async () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        moduleName: "all-logs",
+        logDirectory: root,
+        includeConsole: false,
+        includeGlobalFile: false,
+        captureUncaught: false,
+      });
+
+      expect(moduleRotatingTransports(logger).length).toBe(1);
+      expect(__sharedFileInternals.sharedFileRegistry.size).toBe(0);
+
+      logger.info("MODULE-ONLY");
+      await shutdownLogger(logger);
+
+      expect(occurrences(readLogFiles(root, "all-logs"), "MODULE-ONLY")).toBe(1);
+      expect(auditFiles(root)).toHaveLength(1);
+    });
+  });
+
+  it("lets another logger share the deduplicated file, and its shutdown leaves the file open", async () => {
+    const root = createTempDir();
+    const owner = createLogger({
+      moduleName: "all-logs",
+      logDirectory: root,
+      includeConsole: false,
+      captureUncaught: false,
+    });
+    const sharer = createLogger({
+      moduleName: "api",
+      logDirectory: root,
+      includeConsole: false,
+      captureUncaught: false,
+    });
+
+    const entries = Array.from(__sharedFileInternals.sharedFileRegistry.values());
+    expect(entries).toHaveLength(1);
+    expect(entries[0].refCount).toBe(2);
+
+    owner.info("OWNER-FIRST");
+    sharer.info("SHARER-LINE");
+    await shutdownLogger(sharer);
+
+    // The sharer released only its own handle; the owner still holds the file.
+    expect(entries[0].refCount).toBe(1);
+    expect(__sharedFileInternals.sharedFileRegistry.size).toBe(1);
+    owner.info("OWNER-AFTER-SHARER-SHUTDOWN");
+    await shutdownLogger(owner);
+
+    const global = readLogFiles(root, "all-logs");
+    expect(occurrences(global, "OWNER-FIRST")).toBe(1);
+    expect(occurrences(global, "SHARER-LINE")).toBe(1);
+    expect(occurrences(global, "OWNER-AFTER-SHARER-SHUTDOWN")).toBe(1);
+    expect(occurrences(readLogFiles(root, "api"), "SHARER-LINE")).toBe(1);
+    expect(readLogFiles(root, "api")).not.toContain("OWNER-");
+    expect(__sharedFileInternals.sharedFileRegistry.size).toBe(0);
+  });
+
+  describe("collision warning across loggers", () => {
+    const quietOptions = { includeConsole: false, captureUncaught: false } as const;
+
+    const collisionWarnings = (warn: jest.SpyInstance): string[] =>
+      warn.mock.calls.map((call) => String(call[0]));
+
+    it("warns once, naming the path, when a private module file meets a later shared global file", () => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+      const root = createTempDir();
+      const owner = createLogger({
+        ...quietOptions,
+        moduleName: "all-logs",
+        includeGlobalFile: false,
+        logDirectory: root,
+      });
+      expect(warn).not.toHaveBeenCalled();
+
+      const sharer = createLogger({ ...quietOptions, logDirectory: root });
+
+      const messages = collisionWarnings(warn);
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toContain(JSON.stringify(rotatedPath(root, "all-logs")));
+      expect(messages[0]).toContain("moduleName");
+      expect(messages[0]).toContain("globalModuleName");
+
+      [owner, sharer].forEach((logger) => teardownLogger(logger));
+    });
+
+    it("warns once when the shared global file exists before the private module file", () => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+      const root = createTempDir();
+      const sharer = createLogger({ ...quietOptions, logDirectory: root });
+      expect(warn).not.toHaveBeenCalled();
+
+      const owner = createLogger({
+        ...quietOptions,
+        moduleName: "all-logs",
+        includeGlobalFile: false,
+        logDirectory: root,
+      });
+
+      const messages = collisionWarnings(warn);
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toContain(JSON.stringify(rotatedPath(root, "all-logs")));
+
+      [owner, sharer].forEach((logger) => teardownLogger(logger));
+    });
+
+    it("does not warn again for a third logger on the same colliding path", () => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+      const root = createTempDir();
+      const loggers = [
+        createLogger({
+          ...quietOptions,
+          moduleName: "all-logs",
+          includeGlobalFile: false,
+          logDirectory: root,
+        }),
+        createLogger({ ...quietOptions, logDirectory: root }),
+        createLogger({ ...quietOptions, moduleName: "third", logDirectory: root }),
+      ];
+
+      expect(collisionWarnings(warn)).toHaveLength(1);
+
+      loggers.forEach((logger) => teardownLogger(logger));
+    });
+
+    it("warns once per colliding path", () => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+      const roots = [createTempDir(), createTempDir()];
+      const loggers = roots.flatMap((root) => [
+        createLogger({
+          ...quietOptions,
+          moduleName: "all-logs",
+          includeGlobalFile: false,
+          logDirectory: root,
+        }),
+        createLogger({ ...quietOptions, logDirectory: root }),
+      ]);
+
+      const messages = collisionWarnings(warn);
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toContain(JSON.stringify(rotatedPath(roots[0], "all-logs")));
+      expect(messages[1]).toContain(JSON.stringify(rotatedPath(roots[1], "all-logs")));
+
+      loggers.forEach((logger) => teardownLogger(logger));
+    });
+
+    it("warns again after resetLoggerRegistry() clears the latch", () => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+      const root = createTempDir();
+      const build = (): winston.Logger[] => [
+        createLogger({
+          ...quietOptions,
+          moduleName: "all-logs",
+          includeGlobalFile: false,
+          logDirectory: root,
+        }),
+        createLogger({ ...quietOptions, logDirectory: root }),
+      ];
+
+      const first = build();
+      expect(collisionWarnings(warn)).toHaveLength(1);
+      first.forEach((logger) => teardownLogger(logger));
+      resetLoggerRegistry();
+
+      const second = build();
+      expect(collisionWarnings(warn)).toHaveLength(2);
+      second.forEach((logger) => teardownLogger(logger));
+    });
+
+    describe("no warning", () => {
+      const expectNoWarning = (build: (root: string) => winston.Logger[]): void => {
+        const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+        const loggers = build(createTempDir());
+        expect(warn).not.toHaveBeenCalled();
+        loggers.forEach((logger) => teardownLogger(logger));
+      };
+
+      it("for loggers whose module and global paths never meet", () => {
+        expectNoWarning((root) => [
+          createLogger({ ...quietOptions, moduleName: "api", logDirectory: root }),
+          createLogger({ ...quietOptions, moduleName: "jobs", logDirectory: root }),
+          createLogger({ ...quietOptions, logDirectory: root }),
+        ]);
+      });
+
+      it("for the deduplicated logger plus a logger sharing its global file, in either order", () => {
+        expectNoWarning((root) => [
+          createLogger({ ...quietOptions, moduleName: "all-logs", logDirectory: root }),
+          createLogger({ ...quietOptions, moduleName: "api", logDirectory: root }),
+        ]);
+        resetLoggerRegistry();
+        expectNoWarning((root) => [
+          createLogger({ ...quietOptions, moduleName: "api", logDirectory: root }),
+          createLogger({ ...quietOptions, moduleName: "all-logs", logDirectory: root }),
+        ]);
+      });
+
+      it('for `moduleName: "all-logs", includeFile: false` next to a default logger, in either order', () => {
+        expectNoWarning((root) => [
+          createLogger({
+            ...quietOptions,
+            moduleName: "all-logs",
+            includeFile: false,
+            logDirectory: root,
+          }),
+          createLogger({ ...quietOptions, logDirectory: root }),
+        ]);
+        resetLoggerRegistry();
+        expectNoWarning((root) => [
+          createLogger({ ...quietOptions, logDirectory: root }),
+          createLogger({
+            ...quietOptions,
+            moduleName: "all-logs",
+            includeFile: false,
+            logDirectory: root,
+          }),
+        ]);
+      });
+
+      it("for a later logger that opens no global file next to a private module file", () => {
+        expectNoWarning((root) => [
+          createLogger({
+            ...quietOptions,
+            moduleName: "all-logs",
+            includeGlobalFile: false,
+            logDirectory: root,
+          }),
+          createLogger({
+            ...quietOptions,
+            moduleName: "api",
+            includeGlobalFile: false,
+            logDirectory: root,
+          }),
+        ]);
+      });
+
+      it("once the other logger has been shut down, in either order", async () => {
+        const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+        const root = createTempDir();
+        const owner = createLogger({
+          ...quietOptions,
+          moduleName: "all-logs",
+          includeGlobalFile: false,
+          logDirectory: root,
+        });
+        await shutdownLogger(owner);
+        const sharer = createLogger({ ...quietOptions, logDirectory: root });
+        await shutdownLogger(sharer);
+        const lateOwner = createLogger({
+          ...quietOptions,
+          moduleName: "all-logs",
+          includeGlobalFile: false,
+          logDirectory: root,
+        });
+        await shutdownLogger(lateOwner);
+
+        expect(warn).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe("datePattern decides whether same-name rotators share files", () => {
+    const MONTHLY = /^all-logs-\d{4}-\d{2}\.log$/;
+    const DAILY = /^all-logs-\d{4}-\d{2}-\d{2}\.log$/;
+    const quietOptions = { includeConsole: false, captureUncaught: false } as const;
+
+    /** Every `.log` file in `dir` whose name matches `pattern`, concatenated. */
+    const readMatching = (dir: string, pattern: RegExp): string =>
+      fs
+        .readdirSync(dir)
+        .filter((name) => pattern.test(name))
+        .map((name) => fs.readFileSync(path.join(dir, name), "utf8"))
+        .join("");
+
+    const hasMatching = (dir: string, pattern: RegExp): boolean =>
+      fs.readdirSync(dir).some((name) => pattern.test(name));
+
+    const warningsContaining = (warn: jest.SpyInstance, text: string): string[] =>
+      warn.mock.calls.map((call) => String(call[0])).filter((message) => message.includes(text));
+
+    const COLLISION = "Two loggers write to the same log file";
+    const ROTATION_CONFLICT = "Conflicting global-file rotation config";
+
+    it("dedupes a module datePattern the global file inherits (no globalRotation)", async () => {
+      const root = createTempDir();
+      const logger = createLogger({
+        ...quietOptions,
+        moduleName: "all-logs",
+        logDirectory: root,
+        rotation: { datePattern: "YYYY-MM" },
+      });
+      const privateRotators = moduleRotatingTransports(logger).length;
+
+      logger.info("DP-INHERITED");
+      await shutdownLogger(logger);
+
+      expect(occurrences(readMatching(root, MONTHLY), "DP-INHERITED")).toBe(1);
+      expect(hasMatching(root, DAILY)).toBe(false);
+      expect(auditFiles(root)).toHaveLength(1);
+      expect(privateRotators).toBe(0);
+    });
+
+    it.each([
+      ["maxSize", { maxSize: "10m" }, { maxSize: "20m" }],
+      ["zippedArchive", { zippedArchive: true }, { zippedArchive: false }],
+      ["an undefined datePattern", { datePattern: undefined }, {}],
+      ['an empty datePattern ("")', { datePattern: "" }, {}],
+    ] as const)(
+      "dedupes when only %s differs from the global rotation (same real file names)",
+      async (_title, rotation, globalRotation) => {
+        const root = createTempDir();
+        const logger = createLogger({
+          ...quietOptions,
+          moduleName: "all-logs",
+          logDirectory: root,
+          rotation,
+          globalRotation,
+        });
+        const privateRotators = moduleRotatingTransports(logger).length;
+
+        logger.info("DP-SAME-NAMES");
+        await shutdownLogger(logger);
+
+        expect(occurrences(readMatching(root, DAILY), "DP-SAME-NAMES")).toBe(1);
+        expect(auditFiles(root)).toHaveLength(1);
+        expect(privateRotators).toBe(0);
+      },
+    );
+
+    it("keeps both rotators, as before, when rotation and globalRotation name different files", async () => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+      const root = createTempDir();
+      const logger = createLogger({
+        ...quietOptions,
+        moduleName: "all-logs",
+        logDirectory: root,
+        rotation: { datePattern: "YYYY-MM" },
+        globalRotation: { datePattern: "YYYY-MM-DD" },
+      });
+      const privateRotators = moduleRotatingTransports(logger).length;
+      const piped = logger.transports.length;
+
+      logger.info("DP-TWO-SETS");
+      await shutdownLogger(logger);
+
+      expect(occurrences(readMatching(root, MONTHLY), "DP-TWO-SETS")).toBe(1);
+      expect(occurrences(readMatching(root, DAILY), "DP-TWO-SETS")).toBe(1);
+      expect(auditFiles(root)).toHaveLength(2);
+      expect(privateRotators).toBe(1);
+      expect(piped).toBe(2);
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it("compares with the shared file's CREATOR pattern: an existing different one keeps the module files", async () => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+      const root = createTempDir();
+      const creator = createLogger({ ...quietOptions, logDirectory: root });
+      const logger = createLogger({
+        ...quietOptions,
+        moduleName: "all-logs",
+        logDirectory: root,
+        rotation: { datePattern: "YYYY-MM" },
+      });
+      const privateRotators = moduleRotatingTransports(logger).length;
+
+      logger.info("DP-CREATOR-DAILY");
+      await shutdownLogger(logger);
+      await shutdownLogger(creator);
+
+      // Its module files are monthly; its global line goes to the creator's daily file.
+      expect(occurrences(readMatching(root, MONTHLY), "DP-CREATOR-DAILY")).toBe(1);
+      expect(occurrences(readMatching(root, DAILY), "DP-CREATOR-DAILY")).toBe(1);
+      expect(privateRotators).toBe(1);
+      expect(warningsContaining(warn, COLLISION)).toHaveLength(0);
+      expect(warningsContaining(warn, ROTATION_CONFLICT)).toHaveLength(1);
+    });
+
+    it("compares with the shared file's CREATOR pattern: an existing equal one dedupes despite globalRotation", async () => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+      const root = createTempDir();
+      const creator = createLogger({
+        ...quietOptions,
+        moduleName: "api",
+        logDirectory: root,
+        rotation: { datePattern: "YYYY-MM" },
+      });
+      const logger = createLogger({
+        ...quietOptions,
+        moduleName: "all-logs",
+        logDirectory: root,
+        rotation: { datePattern: "YYYY-MM" },
+        globalRotation: { datePattern: "YYYY-MM-DD" },
+      });
+      const privateRotators = moduleRotatingTransports(logger).length;
+
+      logger.info("DP-CREATOR-MONTHLY");
+      await shutdownLogger(logger);
+      await shutdownLogger(creator);
+
+      expect(occurrences(readMatching(root, MONTHLY), "DP-CREATOR-MONTHLY")).toBe(1);
+      expect(hasMatching(root, DAILY)).toBe(false);
+      expect(privateRotators).toBe(0);
+      expect(warningsContaining(warn, COLLISION)).toHaveLength(0);
+      expect(warningsContaining(warn, ROTATION_CONFLICT)).toHaveLength(1);
+    });
+
+    it("compares with the pattern the creator recorded for its GLOBAL files, not its module files", async () => {
+      const root = createTempDir();
+      const creator = createLogger({
+        ...quietOptions,
+        moduleName: "api",
+        logDirectory: root,
+        rotation: { datePattern: "YYYY-MM" },
+        globalRotation: { datePattern: "YYYY-MM-DD" },
+      });
+      const logger = createLogger({ ...quietOptions, moduleName: "all-logs", logDirectory: root });
+      const privateRotators = moduleRotatingTransports(logger).length;
+
+      logger.info("DP-CREATOR-GLOBAL");
+      await shutdownLogger(logger);
+      await shutdownLogger(creator);
+
+      // The creator's global files are daily, like this logger's module files: one writer.
+      expect(occurrences(readMatching(root, DAILY), "DP-CREATOR-GLOBAL")).toBe(1);
+      expect(hasMatching(root, MONTHLY)).toBe(false);
+      expect(privateRotators).toBe(0);
+    });
+
+    describe("collision warning", () => {
+      const monthlyOwner = (root: string, extra: Record<string, unknown> = {}): winston.Logger =>
+        createLogger({
+          ...quietOptions,
+          moduleName: "all-logs",
+          includeGlobalFile: false,
+          logDirectory: root,
+          rotation: { datePattern: "YYYY-MM", ...extra },
+        });
+
+      it("stays silent for a private module file whose datePattern names other files, in either order", () => {
+        const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+        const first = createTempDir();
+        const ownerFirst = [
+          monthlyOwner(first),
+          createLogger({ ...quietOptions, logDirectory: first }),
+        ];
+        const second = createTempDir();
+        const sharerFirst = [
+          createLogger({ ...quietOptions, logDirectory: second }),
+          monthlyOwner(second),
+        ];
+
+        expect(warn).not.toHaveBeenCalled();
+        [...ownerFirst, ...sharerFirst].forEach((logger) => teardownLogger(logger));
+      });
+
+      it("compares an attaching logger with the pattern the shared file really uses", () => {
+        const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+        const root = createTempDir();
+        const loggers = [
+          createLogger({ ...quietOptions, logDirectory: root }),
+          monthlyOwner(root),
+          createLogger({
+            ...quietOptions,
+            moduleName: "late",
+            logDirectory: root,
+            globalRotation: { datePattern: "YYYY-MM" },
+          }),
+        ];
+
+        // The late logger asks for monthly global files but attaches to the daily ones.
+        expect(warningsContaining(warn, COLLISION)).toHaveLength(0);
+        expect(warningsContaining(warn, ROTATION_CONFLICT)).toHaveLength(1);
+        loggers.forEach((logger) => teardownLogger(logger));
+      });
+
+      it.each([
+        ["owner first", true, {}],
+        ["shared file first", false, {}],
+        ["owner first, different maxSize", true, { maxSize: "10m" }],
+        ["shared file first, different maxSize", false, { maxSize: "10m" }],
+      ] as const)(
+        "warns once when both name the same monthly files (%s)",
+        (_title, ownerFirst, extra) => {
+          const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+          const root = createTempDir();
+          const sharer = (): winston.Logger =>
+            createLogger({
+              ...quietOptions,
+              logDirectory: root,
+              rotation: { datePattern: "YYYY-MM" },
+            });
+          const loggers = ownerFirst
+            ? [monthlyOwner(root, extra), sharer()]
+            : [sharer(), monthlyOwner(root, extra)];
+
+          const collisions = warningsContaining(warn, COLLISION);
+          expect(collisions).toHaveLength(1);
+          expect(collisions[0]).toContain(JSON.stringify(rotatedPath(root, "all-logs")));
+          loggers.forEach((logger) => teardownLogger(logger));
+        },
+      );
     });
   });
 });

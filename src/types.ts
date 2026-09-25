@@ -210,7 +210,11 @@ export interface LoggerOptions {
    */
   includeConsole?: boolean;
   /**
-   * Enables or disables the module specific rotating file transport.
+   * Enables or disables the module specific rotating file transport. When
+   * `includeGlobalFile` is on and the module files are the global files (the
+   * same path and the same effective `datePattern`, see
+   * {@link LoggerOptions.globalModuleName}), no separate transport is built:
+   * they are written once, through the shared global transport.
    */
   includeFile?: boolean;
   /**
@@ -218,7 +222,14 @@ export interface LoggerOptions {
    */
   includeGlobalFile?: boolean;
   /**
-   * Name used for the aggregated log file.
+   * Name used for the aggregated log file. With `includeGlobalFile` on, a
+   * logger whose `moduleName` resolves to the same path writes it once, through the shared transport and with its
+   * rotation settings (those of the first logger that opened it), unless its
+   * module `datePattern` differs from that transport's: different date patterns
+   * name different files, so both are kept. When one logger's private module
+   * file is another logger's global file (same path and `datePattern`),
+   * `createLogger()` warns once per path; the two keep separate rotators, so
+   * give them distinct names.
    */
   globalModuleName?: string;
   /**
