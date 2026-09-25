@@ -1,15 +1,18 @@
 /**
  * Shared JSON-serialization primitives used by BOTH the core logger
- * (`src/logger.ts`, for the pretty-mode `safeStringify` pipeline) and the
- * request-logging middleware (`src/request-middleware.ts`, for `serializeBody`
- * and `ownContext`), plus the structural helpers the redaction walk in
- * `src/redact.ts` shares with them (`FORBIDDEN_KEYS`, `isErrorLike`,
- * `errorToPlain`). Lives in its own module, rather than in `src/redact.ts`,
- * because JSON expressibility is a distinct concern from redaction: nothing
- * here decides what is a secret, and `redact.ts`'s contract is entirely about
- * the deep-redaction walk. The consumers therefore share this without
- * importing each other, matching the one-concern-per-module split the rest of
- * `src/` already follows.
+ * (`src/logger.ts`, for the pretty-mode `safeStringify` pipeline and the json
+ * serializer) and the request-logging middleware (`src/request-middleware.ts`,
+ * for `serializeBody` and `ownContext`): `bigintSafeReplacer`, the
+ * `Error`-aware replacer built on it, and the stringify-with-fallback helper
+ * the caller-data stringify sites go through. Also the structural helpers the
+ * redaction walk in `src/redact.ts` shares with them (`FORBIDDEN_KEYS`,
+ * `isErrorLike`, `errorToPlain`), so masking and serialization read an `Error`
+ * through the SAME view. Lives in its own module, rather than in
+ * `src/redact.ts`, because JSON expressibility is a distinct concern from
+ * redaction: nothing here decides what is a secret, and `redact.ts`'s contract
+ * is entirely about the deep-redaction walk. The consumers therefore share
+ * this without importing each other, matching the one-concern-per-module split
+ * the rest of `src/` already follows.
  *
  * Dependency direction: this module imports nothing from `src/`. `redact.ts`
  * imports from it (and re-exports `FORBIDDEN_KEYS` so existing imports keep
@@ -25,7 +28,9 @@
  * BigInts reach a logger from ordinary sources — `express.json({ reviver })`,
  * a protobuf / gRPC adapter, a DB driver returning a 64-bit id, or plain
  * `logger.info("Order", { orderId: 123n })` — so every stringify call in this
- * package that runs over caller data must pass this replacer. Where it is
+ * package that runs over caller data must pass this replacer, directly or
+ * through {@link createErrorAwareReplacer}, which delegates every non-Error
+ * value to it (see {@link errorAwareStringify}). Where it is
  * missing, the failure is never a clean error: in the pretty-mode formatter the
  * `TypeError` surfaces synchronously back at the application's own
  * `logger.info(...)` call, and in the middleware's `serializeBody` it collapses
@@ -179,4 +184,72 @@ export const errorToPlain = (err: object): Record<string, unknown> => {
     }
   }
   return plain;
+};
+
+/**
+ * Builds a `JSON.stringify` / `safe-stable-stringify` replacer that renders
+ * every `Error` it meets (detected with {@link isErrorLike}, so a cross-realm
+ * one too) through {@link errorToPlain}, and hands every other value to
+ * {@link bigintSafeReplacer}. Without it a nested `Error` serializes as `{}`
+ * (its `name`, `message`, `stack`, `cause` and `errors` are all
+ * non-enumerable or inherited); the returned view is then serialized like any
+ * object, so the replacer runs again on its fields and a `cause` chain or an
+ * `AggregateError`'s members are converted in turn. An Error-free payload
+ * renders byte-identically to `bigintSafeReplacer` alone.
+ *
+ * Both serializers call a value's `toJSON` BEFORE the replacer, so an `Error`
+ * subclass defining `toJSON` renders its `toJSON` output as before and never
+ * reaches the conversion.
+ *
+ * The conversion is memoized per replacer: the same `Error` always maps to
+ * the SAME view object. That is what keeps each serializer's own cycle
+ * detection working, because both compare the value the replacer returned
+ * against the objects on the current path: a self-referencing `cause` then
+ * meets its own view again (`JSON.stringify` throws its circular-structure
+ * `TypeError`, `safe-stable-stringify` writes `"[Circular]"`). With a fresh
+ * view per visit the walk would stop only at the stack limit, whose
+ * `RangeError` the total guards in `isErrorLike` / `errorToPlain` absorb, so it
+ * would emit thousands of nested copies instead of failing. The memo lives only
+ * as long as one replacer, so build a FRESH one for every stringify call; a
+ * shared one would keep a view built from an earlier state of an `Error`.
+ */
+export const createErrorAwareReplacer = (): ((key: string, value: unknown) => unknown) => {
+  let views: WeakMap<object, Record<string, unknown>> | undefined;
+  return (key: string, value: unknown): unknown => {
+    if (!isErrorLike(value)) {
+      return bigintSafeReplacer(key, value);
+    }
+    if (views === undefined) {
+      views = new WeakMap();
+    }
+    let view = views.get(value);
+    if (view === undefined) {
+      view = errorToPlain(value);
+      views.set(value, view);
+    }
+    return view;
+  };
+};
+
+/**
+ * `JSON.stringify(value, <fresh error-aware replacer>, space)`, retried as
+ * `JSON.stringify(value, bigintSafeReplacer, space)` when that throws. The
+ * error-aware pass can fail where the plain one succeeds, because it makes
+ * fields visible that were never serialized before: a cycle through a
+ * NON-enumerable `cause`, or a throwing getter / `toJSON` inside one. The
+ * retry reproduces the exact pre-existing rendering (an `Error` as `{}`), so
+ * no value renders worse than it did before nested Errors were converted.
+ * A throw from the retry propagates, exactly as the plain call's did, so
+ * each caller keeps its own last-resort fallback. An `undefined` result (a
+ * function, a symbol, a `toJSON` returning `undefined`) is returned as is
+ * and not retried. Cost of the retry: every getter and `toJSON` the first
+ * pass reached before it threw runs again in the second, so a stateful one
+ * can observe two reads and render its second value.
+ */
+export const errorAwareStringify = (value: unknown, space?: number): string | undefined => {
+  try {
+    return JSON.stringify(value, createErrorAwareReplacer(), space);
+  } catch {
+    return JSON.stringify(value, bigintSafeReplacer, space);
+  }
 };

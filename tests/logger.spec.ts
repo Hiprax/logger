@@ -30,6 +30,9 @@ import {
 import { FORBIDDEN_KEYS, MAX_REDACT_DEPTH, redactValue } from "../src/redact";
 import {
   FORBIDDEN_KEYS as SERIALIZE_FORBIDDEN_KEYS,
+  bigintSafeReplacer,
+  createErrorAwareReplacer,
+  errorAwareStringify,
   errorToPlain,
   isErrorLike,
 } from "../src/serialize";
@@ -507,6 +510,26 @@ describe("createLogger", () => {
     (logger as any).obscure(123n);
 
     expect(logSpy).toHaveBeenCalledWith({ level: "info", message: "123" });
+    teardownLogger(logger);
+  });
+
+  it("renders a nested Error's fields in the info fallback", () => {
+    const logger = createNoopTransportLogger();
+    (logger as any).info = undefined;
+    const logSpy = jest.fn();
+    (logger as any).log = logSpy;
+    const err = new Error("fallback failure");
+    err.stack = "Error: fallback failure\n    at fixed (fixed.js:1:1)";
+
+    (logger as any).obscure({ err });
+
+    expect(logSpy).toHaveBeenCalledWith({
+      level: "info",
+      message: JSON.stringify({
+        err: { name: "Error", message: "fallback failure", stack: err.stack },
+      }),
+    });
+    expect(Object.keys(err)).toEqual([]);
     teardownLogger(logger);
   });
 
@@ -11710,6 +11733,721 @@ describe("maskMetaKeys walks nested Errors (own fields, cause chain, AggregateEr
       expect(out.fileOut).not.toContain("S3-SECRET");
       expect(out.consoleOut).not.toContain("S3-SECRET");
       expect(member.password).toBe("S3-SECRET");
+    });
+  });
+});
+
+describe("nested Error serialization", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const STACK = "Error: fixed\n    at fixed (fixed.js:1:1)";
+  const STACK_JSON = JSON.stringify(STACK);
+
+  /** An Error with a deterministic stack (design rule 8), optionally carrying own properties. */
+  const fixedError = (
+    message: string,
+    own: Record<string, unknown> = {},
+    options?: ErrorOptions,
+  ) => {
+    const err = Object.assign(new Error(message, options), own);
+    err.stack = STACK;
+    return err;
+  };
+
+  /** A self-referencing cause in the ES2022 options shape: own, NON-enumerable. */
+  const selfCausedError = (message: string): Error => {
+    const err = fixedError(message);
+    Object.defineProperty(err, "cause", { value: err, writable: true, configurable: true });
+    return err;
+  };
+
+  /** Parses the metadata block of a pretty line whose message is one line. */
+  const prettyMeta = (fileOut: string): unknown =>
+    JSON.parse(fileOut.split("\n").slice(3).join("\n"));
+
+  /** The metadata of a json line (every field but the logger's own). */
+  const jsonMeta = (fileOut: string): Record<string, unknown> => {
+    const {
+      level: _level,
+      message: _message,
+      module: _module,
+      timestamp: _timestamp,
+      ...meta
+    } = JSON.parse(fileOut) as Record<string, unknown>;
+    return meta;
+  };
+
+  const metaOf = (format: Format, fileOut: string): unknown =>
+    format === "pretty" ? prettyMeta(fileOut) : jsonMeta(fileOut);
+
+  const formats: Format[] = ["pretty", "json"];
+
+  describe.each(formats)("format: %s", (format) => {
+    it("a nested Error renders its name, message, and stack instead of {}", async () => {
+      const err = fixedError("card declined");
+
+      const out = await render("nested-ser-basic", format, (logger) =>
+        logger.info("Payment failed", { err, orderId: 7 }),
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine(
+              "nested-ser-basic",
+              [
+                "Payment failed",
+                "{",
+                '  "err": {',
+                '    "name": "Error",',
+                '    "message": "card declined",',
+                `    "stack": ${STACK_JSON}`,
+                "  },",
+                '  "orderId": 7',
+                "}",
+              ].join("\n"),
+            )
+          : `{"err":{"message":"card declined","name":"Error","stack":${STACK_JSON}},` +
+              `"level":"info","message":"Payment failed","module":"nested-ser-basic","orderId":7,"timestamp":"${STAMP}"}\n`,
+      );
+      expect(out.fileOut).not.toContain(format === "pretty" ? '"err": {}' : '"err":{}');
+      expectConsoleMatchesFile(format, out);
+      // The caller's Error is never rewritten.
+      expect(Object.keys(err)).toEqual([]);
+      expect(err.message).toBe("card declined");
+      expect(err.stack).toBe(STACK);
+    });
+
+    it("renders the cause chain of new Error(msg, { cause })", async () => {
+      const inner = fixedError("inner");
+      const outer = fixedError("outer", {}, { cause: inner });
+
+      const out = await render("nested-ser-cause", format, (logger) =>
+        logger.info("m", { err: outer }),
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine(
+              "nested-ser-cause",
+              [
+                "m",
+                "{",
+                '  "err": {',
+                '    "name": "Error",',
+                '    "message": "outer",',
+                `    "stack": ${STACK_JSON},`,
+                '    "cause": {',
+                '      "name": "Error",',
+                '      "message": "inner",',
+                `      "stack": ${STACK_JSON}`,
+                "    }",
+                "  }",
+                "}",
+              ].join("\n"),
+            )
+          : `{"err":{"cause":{"message":"inner","name":"Error","stack":${STACK_JSON}},"message":"outer",` +
+              `"name":"Error","stack":${STACK_JSON}},"level":"info","message":"m","module":"nested-ser-cause",` +
+              `"timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+      expect(outer.cause).toBe(inner);
+    });
+
+    it("a subclass with an own enumerable code renders code plus the standard fields", async () => {
+      class PaymentError extends Error {
+        constructor(message: string) {
+          super(message);
+          this.name = "PaymentError";
+          Object.assign(this, { code: "E_CARD" });
+        }
+      }
+      const err = new PaymentError("declined");
+      err.stack = STACK;
+
+      const out = await render("nested-ser-subclass", format, (logger) =>
+        logger.info("m", { err }),
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine(
+              "nested-ser-subclass",
+              [
+                "m",
+                "{",
+                '  "err": {',
+                '    "name": "PaymentError",',
+                '    "message": "declined",',
+                `    "stack": ${STACK_JSON},`,
+                '    "code": "E_CARD"',
+                "  }",
+                "}",
+              ].join("\n"),
+            )
+          : `{"err":{"code":"E_CARD","message":"declined","name":"PaymentError","stack":${STACK_JSON}},` +
+              `"level":"info","message":"m","module":"nested-ser-subclass","timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+    });
+
+    it("an AggregateError renders its errors", async () => {
+      const agg = new AggregateError([fixedError("first"), fixedError("second")], "agg");
+      agg.stack = STACK;
+
+      const out = await render("nested-ser-agg", format, (logger) =>
+        logger.info("m", { err: agg }),
+      );
+
+      expect(out.thrown).toBeUndefined();
+      const member = (message: string) => ({ name: "Error", message, stack: STACK });
+      expect(metaOf(format, out.fileOut)).toEqual({
+        err: {
+          name: "AggregateError",
+          message: "agg",
+          stack: STACK,
+          errors: [member("first"), member("second")],
+        },
+      });
+      if (format === "json") {
+        expect(out.fileOut).toBe(
+          `{"err":{"errors":[{"message":"first","name":"Error","stack":${STACK_JSON}},` +
+            `{"message":"second","name":"Error","stack":${STACK_JSON}}],"message":"agg",` +
+            `"name":"AggregateError","stack":${STACK_JSON}},"level":"info","message":"m",` +
+            `"module":"nested-ser-agg","timestamp":"${STAMP}"}\n`,
+        );
+      }
+      expectConsoleMatchesFile(format, out);
+    });
+
+    it("a cross-realm Error (vm context) renders its fields", async () => {
+      const foreign = vm.runInNewContext('new Error("foreign failure")') as Error;
+      foreign.stack = STACK;
+      expect(foreign instanceof Error).toBe(false);
+
+      const out = await render("nested-ser-realm", format, (logger) =>
+        logger.info("m", { err: foreign }),
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(metaOf(format, out.fileOut)).toEqual({
+        err: { name: "Error", message: "foreign failure", stack: STACK },
+      });
+      expectConsoleMatchesFile(format, out);
+    });
+
+    it("with maskMetaKeys, a password in a cause Error or an AggregateError member's cause never appears", async () => {
+      const inner = fixedError("inner", { password: "S1-SECRET" });
+      const outer = fixedError("outer", {}, { cause: inner });
+      const member = fixedError("member", {}, { cause: { user: "bob", password: "S2-SECRET" } });
+      const agg = new AggregateError([member], "agg");
+      agg.stack = STACK;
+
+      const out = await render(
+        "nested-ser-mask",
+        format,
+        (logger) => logger.info("m", { err: outer, batch: agg }),
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      for (const text of [out.fileOut, out.consoleOut]) {
+        expect(text).not.toContain("S1-SECRET");
+        expect(text).not.toContain("S2-SECRET");
+      }
+      expect(metaOf(format, out.fileOut)).toEqual({
+        err: {
+          name: "Error",
+          message: "outer",
+          stack: STACK,
+          cause: { name: "Error", message: "inner", stack: STACK, password: "[REDACTED]" },
+        },
+        batch: {
+          name: "AggregateError",
+          message: "agg",
+          stack: STACK,
+          errors: [
+            {
+              name: "Error",
+              message: "member",
+              stack: STACK,
+              cause: { user: "bob", password: "[REDACTED]" },
+            },
+          ],
+        },
+      });
+      expectConsoleMatchesFile(format, out);
+      // The caller's graph keeps its secrets.
+      expect(inner.password).toBe("S1-SECRET");
+      expect((member.cause as { password: string }).password).toBe("S2-SECRET");
+    });
+
+    it("an Error graph with nothing to mask renders identically with and without maskMetaKeys", async () => {
+      const make = () => ({
+        chained: fixedError("outer", {}, { cause: fixedError("inner") }),
+        objectCause: fixedError("x", {}, { cause: { code: 1 } }),
+        batch: Object.assign(new AggregateError([fixedError("m1")], "agg"), { stack: STACK }),
+        orderId: 7,
+      });
+
+      const masked = await render(
+        "nested-ser-parity",
+        format,
+        (logger) => logger.info("m", make()),
+        ["password"],
+      );
+      const unmasked = await render("nested-ser-parity", format, (logger) =>
+        logger.info("m", make()),
+      );
+
+      expect(masked.thrown).toBeUndefined();
+      expect(unmasked.thrown).toBeUndefined();
+      expect(unmasked.fileOut).toBe(masked.fileOut);
+      expect(unmasked.consoleOut).toBe(masked.consoleOut);
+      expect(unmasked.fileOut).not.toContain("[REDACTED]");
+      expect(metaOf(format, unmasked.fileOut)).toEqual({
+        chained: {
+          name: "Error",
+          message: "outer",
+          stack: STACK,
+          cause: { name: "Error", message: "inner", stack: STACK },
+        },
+        objectCause: { name: "Error", message: "x", stack: STACK, cause: { code: 1 } },
+        batch: {
+          name: "AggregateError",
+          message: "agg",
+          stack: STACK,
+          errors: [{ name: "Error", message: "m1", stack: STACK }],
+        },
+        orderId: 7,
+      });
+    });
+
+    it("a NON-enumerable self-referencing cause terminates and is no worse than today", async () => {
+      const err = selfCausedError("loop");
+
+      const out = await render("nested-ser-selfcause", format, (logger) =>
+        logger.info("m", { err, orderId: 7 }),
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? // The error-aware pass meets the cycle; the retry reproduces the
+            // pre-fix rendering, siblings included, instead of a sentinel.
+            prettyLine(
+              "nested-ser-selfcause",
+              ["m", "{", '  "err": {},', '  "orderId": 7', "}"].join("\n"),
+            )
+          : `{"err":{"cause":"[Circular]","message":"loop","name":"Error","stack":${STACK_JSON}},` +
+              `"level":"info","message":"m","module":"nested-ser-selfcause","orderId":7,"timestamp":"${STAMP}"}\n`,
+      );
+      expect(out.fileOut).not.toContain("[UNSERIALIZABLE]");
+      expect(out.fileOut).not.toContain("_unserializable");
+      expectConsoleMatchesFile(format, out);
+      expect(err.cause).toBe(err);
+    });
+
+    it("an own enumerable cycle (err.self = err) keeps the pretty sentinel and renders [Circular] in json", async () => {
+      const err = fixedError("self");
+      (err as unknown as { self: unknown }).self = err;
+
+      const out = await render("nested-ser-selfenum", format, (logger) =>
+        logger.info("m", { err, orderId: 7 }),
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine("nested-ser-selfenum", "m\n[UNSERIALIZABLE]")
+          : `{"err":{"message":"self","name":"Error","self":"[Circular]","stack":${STACK_JSON}},` +
+              `"level":"info","message":"m","module":"nested-ser-selfenum","orderId":7,"timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+    });
+
+    it("a throwing getter inside a nested cause still renders the rest of the line (retry), not the stub", async () => {
+      let reads = 0;
+      const cause = {
+        get token(): string {
+          reads += 1;
+          throw new Error("getter refused");
+        },
+      };
+      const err = fixedError("outer", {}, { cause });
+
+      const out = await render("nested-ser-throw", format, (logger) =>
+        logger.info("m", { err, orderId: 7 }),
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine(
+              "nested-ser-throw",
+              ["m", "{", '  "err": {},', '  "orderId": 7', "}"].join("\n"),
+            )
+          : `{"err":{},"level":"info","message":"m","module":"nested-ser-throw","orderId":7,"timestamp":"${STAMP}"}\n`,
+      );
+      expect(out.fileOut).not.toContain("_unserializable");
+      expect(out.fileOut).not.toContain("[UNSERIALIZABLE]");
+      expectConsoleMatchesFile(format, out);
+      // The getter runs once per chain in the error-aware pass (json: the file
+      // chain only, its Console is formatless; pretty: the file chain and the
+      // Console's own chain), never in the retry, which cannot see the cause.
+      expect(reads).toBe(format === "json" ? 1 : 2);
+    });
+
+    it("an Error subclass defining toJSON renders its toJSON output, also as a cause", async () => {
+      class Described extends Error {
+        toJSON() {
+          return { kind: "described", text: this.message };
+        }
+      }
+      const described = new Described("dd");
+      described.stack = STACK;
+      const outer = fixedError("outer", {}, { cause: described });
+
+      const out = await render("nested-ser-tojson", format, (logger) =>
+        logger.info("m", { err: described, wrapped: outer }),
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(metaOf(format, out.fileOut)).toEqual({
+        err: { kind: "described", text: "dd" },
+        wrapped: {
+          name: "Error",
+          message: "outer",
+          stack: STACK,
+          cause: { kind: "described", text: "dd" },
+        },
+      });
+      expectConsoleMatchesFile(format, out);
+    });
+
+    it("documented toJSON boundary: a toJSON value inside a cause, and an Error inside a toJSON output, are not key-masked", async () => {
+      // `maskMetaKeys` masks only what `redactValue` walks, and it passes a
+      // value defining its own toJSON through untouched (the README's nested
+      // toJSON boundary). The serializer calls that toJSON first, so its output
+      // prints as is, now also when the value sits in a cause (was `{}`).
+      class ClientError extends Error {
+        toJSON() {
+          return { kind: "client", password: "S-TOJSON" };
+        }
+      }
+      const client = new ClientError("upstream");
+      const wrapped = fixedError("wrap", {}, { cause: client });
+      const inner = fixedError("inner", {}, { cause: { password: "S-INNER" } });
+      const dto = { toJSON: () => ({ err: inner }) };
+
+      const out = await render(
+        "nested-ser-boundary",
+        format,
+        (logger) => logger.info("m", { wrapped, dto, password: "S-TOP" }),
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(metaOf(format, out.fileOut)).toEqual({
+        wrapped: {
+          name: "Error",
+          message: "wrap",
+          stack: STACK,
+          cause: { kind: "client", password: "S-TOJSON" },
+        },
+        dto: {
+          err: { name: "Error", message: "inner", stack: STACK, cause: { password: "S-INNER" } },
+        },
+        password: "[REDACTED]",
+      });
+      // Everything the walk reaches is still masked.
+      expect(out.fileOut).not.toContain("S-TOP");
+      expectConsoleMatchesFile(format, out);
+    });
+
+    it("metadata without Errors (BigInt, Buffer, Date, nested objects) renders byte-identically", async () => {
+      const out = await render("nested-ser-free", format, (logger) =>
+        logger.info("m", {
+          n: 5n,
+          buf: Buffer.from("hi"),
+          d: new Date(0),
+          nested: { a: [1, { b: 2 }] },
+        }),
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        format === "pretty"
+          ? prettyLine(
+              "nested-ser-free",
+              [
+                "m",
+                "{",
+                '  "n": "5",',
+                '  "buf": {',
+                '    "type": "Buffer",',
+                '    "data": [',
+                "      104,",
+                "      105",
+                "    ]",
+                "  },",
+                '  "d": "1970-01-01T00:00:00.000Z",',
+                '  "nested": {',
+                '    "a": [',
+                "      1,",
+                "      {",
+                '        "b": 2',
+                "      }",
+                "    ]",
+                "  }",
+                "}",
+              ].join("\n"),
+            )
+          : `{"buf":{"data":[104,105],"type":"Buffer"},"d":"1970-01-01T00:00:00.000Z","level":"info",` +
+              `"message":"m","module":"nested-ser-free","n":"5","nested":{"a":[1,{"b":2}]},"timestamp":"${STAMP}"}\n`,
+      );
+      expectConsoleMatchesFile(format, out);
+    });
+  });
+
+  describe.each(formats)("crash record, format: %s", (format) => {
+    beforeEach(() => {
+      __crashCaptureInternals.setExitFn(jest.fn());
+    });
+
+    afterEach(() => {
+      __crashCaptureInternals.restoreExitFn();
+    });
+
+    it("the crash record's error field renders name, message, and stack instead of {}", async () => {
+      const sink = new PassThrough();
+      const chunks: string[] = [];
+      sink.on("data", (chunk: Buffer | string) => chunks.push(String(chunk)));
+      const logger = createLogger({
+        moduleName: "nested-ser-crash",
+        format,
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        captureUncaught: true,
+        exitOnUncaught: false,
+        clock: () => FIXED_NOW,
+        additionalTransports: [new winston.transports.Stream({ stream: sink, eol: "\n" })],
+      });
+      const err = fixedError("boom-crash");
+
+      __crashCaptureInternals.invokeUncaught(err);
+      await new Promise((resolve) => setImmediate(resolve));
+      await shutdownLogger(logger);
+      const fileOut = chunks.join("");
+
+      if (format === "json") {
+        const parsed = JSON.parse(fileOut) as Record<string, unknown>;
+        expect(parsed.crash).toBe("uncaughtException");
+        expect(parsed.error).toEqual({ name: "Error", message: "boom-crash", stack: STACK });
+        expect(fileOut).toContain(
+          `"error":{"message":"boom-crash","name":"Error","stack":${STACK_JSON}}`,
+        );
+        expect(fileOut).not.toContain('"error":{}');
+      } else {
+        expect(fileOut).toContain(
+          [
+            '  "error": {',
+            '    "name": "Error",',
+            '    "message": "boom-crash",',
+            `    "stack": ${STACK_JSON}`,
+            "  },",
+          ].join("\n"),
+        );
+        expect(fileOut).toContain('"crash": "uncaughtException"');
+        expect(fileOut).not.toContain('"error": {}');
+      }
+      expect(Object.keys(err)).toEqual([]);
+    });
+  });
+});
+
+describe("serialize: createErrorAwareReplacer, errorAwareStringify", () => {
+  const STACK = "Error: fixed\n    at fixed (fixed.js:1:1)";
+
+  const fixedError = (message: string, options?: ErrorOptions): Error => {
+    const err = new Error(message, options);
+    err.stack = STACK;
+    return err;
+  };
+
+  const selfCausedError = (message: string): Error => {
+    const err = fixedError(message);
+    Object.defineProperty(err, "cause", { value: err, writable: true, configurable: true });
+    return err;
+  };
+
+  describe("createErrorAwareReplacer", () => {
+    it("maps an Error to its errorToPlain view, the SAME view on every visit of one replacer", () => {
+      const err = fixedError("boom");
+      const replacer = createErrorAwareReplacer();
+
+      const first = replacer("err", err);
+      const second = replacer("again", err);
+
+      expect(first).toEqual({ name: "Error", message: "boom", stack: STACK });
+      expect(first).toEqual(errorToPlain(err));
+      expect(second).toBe(first);
+      expect(first).not.toBe(err);
+      // A fresh replacer has its own memo: an equal view, never the same object.
+      const fresh = createErrorAwareReplacer()("err", err);
+      expect(fresh).toEqual(first);
+      expect(fresh).not.toBe(first);
+      // The caller's Error is untouched.
+      expect(Object.keys(err)).toEqual([]);
+    });
+
+    it("hands every non-Error value to bigintSafeReplacer unchanged", () => {
+      const replacer = createErrorAwareReplacer();
+      const plain = { a: 1 };
+      const list = [1, 2];
+      const date = new Date(0);
+      const lookAlike = { name: "Error", message: "not an error" };
+
+      expect(replacer("n", 123n)).toBe("123");
+      expect(replacer("n", 123n)).toBe(bigintSafeReplacer("n", 123n));
+      expect(replacer("o", plain)).toBe(plain);
+      expect(replacer("l", list)).toBe(list);
+      expect(replacer("d", date)).toBe(date);
+      expect(replacer("e", lookAlike)).toBe(lookAlike);
+      for (const primitive of ["s", 0, -1.5, true, null, undefined]) {
+        expect(replacer("p", primitive)).toBe(primitive);
+      }
+    });
+
+    it("converts a cross-realm Error and leaves a hostile Proxy as is without throwing", () => {
+      const replacer = createErrorAwareReplacer();
+      const foreign = vm.runInNewContext('new RangeError("far")') as Error;
+      foreign.stack = STACK;
+      const hostile = new Proxy(
+        {},
+        {
+          getPrototypeOf() {
+            throw new Error("trap refused");
+          },
+        },
+      );
+
+      expect(replacer("f", foreign)).toEqual({ name: "RangeError", message: "far", stack: STACK });
+      expect(replacer("h", hostile)).toBe(hostile);
+    });
+
+    it("keeps the serializer's own cycle detection: a self-referencing cause throws the circular TypeError", () => {
+      const err = selfCausedError("loop");
+      let thrown: unknown;
+
+      try {
+        JSON.stringify({ err }, createErrorAwareReplacer());
+      } catch (caught) {
+        thrown = caught;
+      }
+
+      // Without the memo every visit would build a new view, so the walk would
+      // only stop at the stack limit (whose RangeError the total guards absorb),
+      // emitting thousands of nested copies instead of meeting the same view.
+      expect(thrown).toBeInstanceOf(TypeError);
+      expect((thrown as Error).message).toMatch(/circular/i);
+    });
+
+    it("renders one Error shared by two siblings in full at both places (not a cycle)", () => {
+      const err = fixedError("shared");
+
+      const out = JSON.parse(JSON.stringify({ a: err, b: [err] }, createErrorAwareReplacer()));
+
+      const view = { name: "Error", message: "shared", stack: STACK };
+      expect(out).toEqual({ a: view, b: [view] });
+    });
+  });
+
+  describe("errorAwareStringify", () => {
+    it("renders nested Errors, cause chains included, with the requested indentation", () => {
+      const value = { err: fixedError("outer", { cause: fixedError("inner") }), n: 1n };
+
+      expect(errorAwareStringify(value, 2)).toBe(
+        JSON.stringify(
+          {
+            err: {
+              name: "Error",
+              message: "outer",
+              stack: STACK,
+              cause: { name: "Error", message: "inner", stack: STACK },
+            },
+            n: "1",
+          },
+          null,
+          2,
+        ),
+      );
+    });
+
+    it("is byte-identical to the BigInt-only replacer for Error-free values (property)", () => {
+      fc.assert(
+        fc.property(
+          fc.anything({
+            withBigInt: true,
+            withDate: true,
+            withTypedArray: true,
+            withBoxedValues: true,
+            withMap: true,
+            withSet: true,
+            withNullPrototype: true,
+            withSparseArray: true,
+          }),
+          fc.constantFrom(undefined, 0, 2),
+          (value, space) => {
+            expect(errorAwareStringify(value, space)).toBe(
+              JSON.stringify(value, bigintSafeReplacer, space),
+            );
+          },
+        ),
+        { numRuns: 300, seed: 20260925 },
+      );
+    });
+
+    it("retries with the BigInt-only replacer when the Error-aware pass throws", () => {
+      const value = { err: selfCausedError("loop"), n: 2n };
+
+      const out = errorAwareStringify(value);
+
+      expect(out).toBe('{"err":{},"n":"2"}');
+      expect(out).toBe(JSON.stringify(value, bigintSafeReplacer));
+    });
+
+    it("lets the retry's own throw propagate, so each caller keeps its last resort", () => {
+      const selfRef = fixedError("self");
+      (selfRef as unknown as { self: unknown }).self = selfRef;
+      const refusing = {
+        toJSON() {
+          throw new Error("toJSON refused");
+        },
+      };
+
+      expect(() => errorAwareStringify({ err: selfRef })).toThrow(TypeError);
+      expect(() => errorAwareStringify(refusing)).toThrow("toJSON refused");
+    });
+
+    it("returns undefined for a value JSON cannot express, without a retry", () => {
+      let calls = 0;
+      const absent = {
+        toJSON() {
+          calls += 1;
+          return undefined;
+        },
+      };
+
+      expect(errorAwareStringify(absent)).toBeUndefined();
+      expect(calls).toBe(1);
+      expect(errorAwareStringify(() => 1)).toBeUndefined();
     });
   });
 });

@@ -1,5 +1,7 @@
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import vm from "node:vm";
+import winston from "winston";
 import {
   createRequestLogger,
   REQUEST_START_SYMBOL,
@@ -4652,6 +4654,226 @@ describe("request middleware internals", () => {
       expect(payload.http.method).toBe("POST");
       expect(payload.http.statusCode).toBe(200);
       expect(payload.http.responseTimeMs).toEqual(expect.any(Number));
+    });
+  });
+});
+
+describe("nested Errors in the request-log context and body", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const STACK = "Error: fixed\n    at fixed (fixed.js:1:1)";
+
+  /** An Error with a deterministic stack, optionally carrying own properties. */
+  const fixedError = (
+    message: string,
+    own: Record<string, unknown> = {},
+    options?: ErrorOptions,
+  ) => {
+    const err = Object.assign(new Error(message, options), own);
+    err.stack = STACK;
+    return err;
+  };
+
+  /** A self-referencing cause in the ES2022 options shape: own, NON-enumerable. */
+  const selfCausedError = (message: string): Error => {
+    const err = fixedError(message);
+    Object.defineProperty(err, "cause", { value: err, writable: true, configurable: true });
+    return err;
+  };
+
+  const logOnce = (options: Parameters<typeof createRequestLogger>[0], body?: unknown) => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({ logger, includeHttpContext: true, ...options });
+    const { res } = runMiddleware(middleware, body === undefined ? {} : { body });
+    res.emit("finish");
+    expect(log).toHaveBeenCalledTimes(1);
+    return log.mock.calls[0][0].http as Record<string, unknown>;
+  };
+
+  describe("context (enrich)", () => {
+    it("copies a nested Error by its fields instead of as {}", () => {
+      const err = fixedError("boom", { code: "E1" });
+
+      const http = logOnce({ enrich: () => ({ err, orderId: 7 }) });
+
+      expect(http.context).toEqual({
+        err: { name: "Error", message: "boom", stack: STACK, code: "E1" },
+        orderId: 7,
+      });
+      const context = http.context as { err: unknown };
+      // An owned plain copy, never the caller's Error.
+      expect(context.err).not.toBe(err);
+      expect(context.err instanceof Error).toBe(false);
+      expect(Object.keys(err)).toEqual(["code"]);
+      expect(err.message).toBe("boom");
+    });
+
+    it("renders a cause chain and a BigInt in the same context", () => {
+      const err = fixedError("outer", {}, { cause: fixedError("inner") });
+
+      const http = logOnce({ enrich: () => ({ id: 5n, err }) });
+
+      expect(http.context).toEqual({
+        id: "5",
+        err: {
+          name: "Error",
+          message: "outer",
+          stack: STACK,
+          cause: { name: "Error", message: "inner", stack: STACK },
+        },
+      });
+    });
+
+    it("lets redactPaths target a nested Error's field", () => {
+      const err = fixedError("boom");
+
+      const http = logOnce({
+        enrich: () => ({ err }),
+        redactPaths: ["context.err.stack"],
+      });
+
+      expect(http.context).toEqual({
+        err: { name: "Error", message: "boom", stack: "[REDACTED]" },
+      });
+      // The caller's Error is never written.
+      expect(err.stack).toBe(STACK);
+    });
+
+    it("a NON-enumerable self-referencing cause is no worse than today: the retry keeps the pre-fix copy", () => {
+      const err = selfCausedError("loop");
+
+      const http = logOnce({ enrich: () => ({ err, orderId: 7 }) });
+
+      expect(http.context).toEqual({ err: {}, orderId: 7 });
+      expect(http.context).not.toEqual({ _unserializable: true });
+      expect(err.cause).toBe(err);
+    });
+
+    it("a context no round-trip can express still degrades to the owned sentinel", () => {
+      const circular: Record<string, unknown> = { err: fixedError("x") };
+      circular.self = circular;
+
+      const http = logOnce({ enrich: () => circular });
+
+      expect(http.context).toEqual({ _unserializable: true });
+    });
+  });
+
+  describe("body (includeRequestBody)", () => {
+    it("an under-limit body Error renders its fields through a real logger", async () => {
+      const sink = new PassThrough();
+      const chunks: string[] = [];
+      sink.on("data", (chunk: Buffer | string) => chunks.push(String(chunk)));
+      const logger = loggerModule.createLogger({
+        moduleName: "nested-body-json",
+        format: "json",
+        includeConsole: false,
+        includeFile: false,
+        includeGlobalFile: false,
+        captureUncaught: false,
+        additionalTransports: [new winston.transports.Stream({ stream: sink, eol: "\n" })],
+      });
+      const err = fixedError("boom");
+      const middleware = createRequestLogger({
+        logger,
+        includeHttpContext: true,
+        includeRequestBody: true,
+      });
+
+      const { res } = runMiddleware(middleware, { body: { err, id: 1 } });
+      res.emit("finish");
+      await loggerModule.shutdownLogger(logger);
+
+      const line = JSON.parse(chunks.join("")) as { http: { requestBody: unknown } };
+      expect(line.http.requestBody).toEqual({
+        err: { name: "Error", message: "boom", stack: STACK },
+        id: 1,
+      });
+      expect(chunks.join("")).not.toContain('"err":{}');
+      expect(Object.keys(err)).toEqual([]);
+    });
+
+    it("an over-limit body previews and measures a body Error by its fields", () => {
+      const err = fixedError("boom");
+      const body = { err, pad: "x".repeat(100) };
+      const expectedSerialized = JSON.stringify({
+        err: { name: "Error", message: "boom", stack: STACK },
+        pad: body.pad,
+      });
+
+      const http = logOnce({ includeRequestBody: true, maxBodyLength: 60 }, body);
+
+      expect(http.requestBody).toEqual({
+        _truncated: true,
+        _originalLength: expectedSerialized.length,
+        _preview: __requestInternals.truncateString(expectedSerialized, 60),
+      });
+      expect((http.requestBody as { _preview: string })._preview).toContain('"message":"boom"');
+      expect((http.requestBody as { _preview: string })._preview).not.toContain('"err":{}');
+    });
+
+    it("lets a body-scoped redactPaths entry target a body Error's field", () => {
+      const err = fixedError("boom");
+
+      const http = logOnce(
+        { includeRequestBody: true, redactPaths: ["body.err.stack"] },
+        { err, id: 1 },
+      );
+
+      expect(http.requestBody).toEqual({
+        err: { name: "Error", message: "boom", stack: "[REDACTED]" },
+        id: 1,
+      });
+      expect(err.stack).toBe(STACK);
+    });
+
+    it("a body Error with a NON-enumerable self-referencing cause renders [Circular], never the sentinel", () => {
+      const err = selfCausedError("loop");
+
+      for (const redactPaths of [undefined, ["body.id"]]) {
+        const http = logOnce({ includeRequestBody: true, redactPaths }, { err, id: 1 });
+
+        expect(http.requestBody).toEqual({
+          err: { name: "Error", message: "loop", stack: STACK, cause: "[Circular]" },
+          id: redactPaths ? "[REDACTED]" : 1,
+        });
+      }
+      expect(err.cause).toBe(err);
+    });
+
+    it("a body whose mandated redactPaths cannot be applied still fails closed", () => {
+      const body = {
+        err: fixedError("x"),
+        toJSON() {
+          throw new Error("toJSON refused");
+        },
+      };
+
+      const http = logOnce({ includeRequestBody: true, redactPaths: ["body.err"] }, body);
+
+      expect(http.requestBody).toBe("[UNSERIALIZABLE]");
+    });
+
+    it("an Error-free body with a BigInt renders exactly as before", () => {
+      const { serializeBody } = __requestInternals;
+
+      expect(
+        serializeBody({ id: 5n, nested: { a: [1, 2] } }, [], 3000, ["body.nested.a.0"]),
+      ).toEqual({
+        id: "5",
+        nested: { a: ["[REDACTED]", 2] },
+      });
+      expect(serializeBody({ id: 5n, pad: "y".repeat(40) }, [], 20)).toEqual({
+        _truncated: true,
+        _originalLength: JSON.stringify({ id: "5", pad: "y".repeat(40) }).length,
+        _preview: __requestInternals.truncateString(
+          JSON.stringify({ id: "5", pad: "y".repeat(40) }),
+          20,
+        ),
+      });
     });
   });
 });

@@ -5,7 +5,7 @@ import DailyRotateFile from "winston-daily-rotate-file";
 import moment from "moment-timezone";
 import { InvalidTimezoneError, LoggerOptionError } from "./errors";
 import { redactValue, FORBIDDEN_KEYS, REDACTION_FAILED } from "./redact";
-import { bigintSafeReplacer } from "./serialize";
+import { bigintSafeReplacer, createErrorAwareReplacer, errorAwareStringify } from "./serialize";
 import { registerCrashCapture, deregisterCrashCapture, resetCrashCapture } from "./crash-capture";
 import { acquireSharedGlobalFile, resetSharedFileRegistry } from "./shared-file-transport";
 import type { LoggerOptions, TimestampContext, LogLevel, RotationStrategy } from "./types";
@@ -1412,10 +1412,17 @@ const UNSERIALIZABLE = "[UNSERIALIZABLE]";
  * sentinel loses one field, the throw loses the process. Note the boundary —
  * this makes the FORMATTER total, not `JSON.stringify` itself: a value no JSON
  * serializer can express still renders as the sentinel rather than as data.
+ *
+ * Nested `Error`s render their fields (`errorAwareStringify` builds a fresh
+ * Error-aware replacer per call). When that pass throws, the value is retried
+ * with `bigintSafeReplacer` alone, the pre-existing call, before the sentinel:
+ * a cycle through a non-enumerable `cause` then renders the line exactly as
+ * it did before nested Errors were converted (`"err": {}` plus its siblings)
+ * instead of collapsing the whole block to the sentinel.
  */
 const safeStringify = (value: unknown, space?: number): string => {
   try {
-    return JSON.stringify(value, bigintSafeReplacer, space);
+    return errorAwareStringify(value, space) as string;
   } catch {
     return UNSERIALIZABLE;
   }
@@ -1452,9 +1459,21 @@ const JSON_SERIALIZE_FAILED = "_unserializable";
  * winston rather than a package-added crash. A log call must never take the
  * process down.
  *
- * The happy path delegates to the wrapped `json()` transform unchanged, so its
- * output (and the `info[MESSAGE]` it writes) is byte-identical to the un-wrapped
- * format. On a throw it writes a minimal, guaranteed-serializable sentinel into
+ * The happy path delegates to the wrapped `json()` transform with one change:
+ * a FRESH Error-aware replacer (`createErrorAwareReplacer`) in place of
+ * logform's default, so a nested `Error` renders its fields instead of `{}`.
+ * It delegates every other value to `bigintSafeReplacer`, which does what
+ * logform's own replacer does (a BigInt as its decimal string), so an
+ * Error-free line is byte-identical to the un-wrapped format. logform passes
+ * the transform options to `safe-stable-stringify`'s `configure`, which ignores
+ * the unknown `replacer` key, and reads `opts.replacer` itself. That pass can
+ * throw where the plain one does not (a throwing getter or `toJSON` inside a
+ * newly visible `cause`), so a throw is retried with the plain options, the
+ * pre-existing call, before the sentinel: such a line renders exactly as it
+ * did before nested Errors were converted. The retry writes nothing extra,
+ * because `json()` writes `info[MESSAGE]` only after a successful stringify,
+ * but it does run again every getter and `toJSON` the first pass reached.
+ * When the retry throws too, it writes a minimal, guaranteed-serializable sentinel into
  * the SAME `info[MESSAGE]` slot `json()` uses — carrying the level, the captured
  * timestamp, and the module label when present, plus an `_unserializable: true`
  * marker. Because the json-mode Console transport carries no format and reads
@@ -1464,6 +1483,14 @@ const JSON_SERIALIZE_FAILED = "_unserializable";
 const buildSafeJsonFormat = (): winston.Logform.Format => {
   const jsonFormat = winston.format.json();
   return winston.format((info) => {
+    try {
+      return jsonFormat.transform(info, {
+        ...jsonFormat.options,
+        replacer: createErrorAwareReplacer(),
+      });
+    } catch {
+      // Retried below with logform's own replacer.
+    }
     try {
       return jsonFormat.transform(info, jsonFormat.options);
     } catch {
@@ -2809,10 +2836,11 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
       return value.toString();
     }
     try {
-      // `bigintSafeReplacer` keeps a NESTED BigInt from throwing here and
-      // degrading the whole payload to `String(value)` → `"[object Object]"` —
-      // the same collapse `serializeBody` suffered.
-      const serialized = JSON.stringify(value, bigintSafeReplacer);
+      // The replacer keeps a NESTED BigInt from throwing here and degrading
+      // the whole payload to `String(value)` → `"[object Object]"` (the same
+      // collapse `serializeBody` suffered), and renders a nested Error's
+      // fields, with the same retry as `safeStringify`.
+      const serialized = errorAwareStringify(value);
       if (typeof serialized === "string") {
         return serialized;
       }
