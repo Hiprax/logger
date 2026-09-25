@@ -5153,9 +5153,9 @@ describe("createLogger", () => {
       // no `toJSON` is in play. The plain rebuild would render
       // `{"0":"a","1":"b","level":"info","timestamp":"…"}` while the no-mask
       // line renders `["a","b"]` (json()'s array branch ignores the level /
-      // timestamp props winston assigned onto the array) — which is why the
-      // delegation is gated on `Array.isArray(subject) || resolvedViaToJSON`
-      // rather than on the toJSON resolve alone.
+      // timestamp props winston assigned onto the array) — which is why an
+      // array subject is always delegated to `redactValue`, whether or not a
+      // toJSON produced it.
       const withMask = renderJson("arrinfo-on", (l) => l.log("info", ["a", "b"] as never), [
         "password",
       ]);
@@ -5177,8 +5177,8 @@ describe("createLogger", () => {
     it("keeps a toJSON returning an ARRAY an array (not an index-keyed object)", () => {
       // The plain rebuild is `Object.keys` into a fresh `{}`, which would render
       // `{"0":"a","1":"b"}` here while the no-mask line renders `["a","b"]` —
-      // the same mask-diverges-from-no-mask defect in a new shape. Non-plain
-      // toJSON outputs are delegated to `redactValue` instead.
+      // the same mask-diverges-from-no-mask defect in a new shape. An array
+      // output is delegated to `redactValue` instead.
       class ArrDto {
         public message = "m";
         toJSON(): unknown[] {
@@ -5208,11 +5208,11 @@ describe("createLogger", () => {
       expect(rendered).toContain("keep");
     });
 
-    it("hands a toJSON returning a built-in back to the serializer (redactValue identity branch)", () => {
-      // `redactValue` returns a `Date`/`Map` by identity — its own rule for a
-      // value owning no key-addressable secret. We must not attach symbols to a
-      // caller-owned value, so `info` is returned and the serializer resolves it
-      // exactly as the no-mask line does.
+    it("renders a toJSON returning a built-in exactly as the no-mask line does", () => {
+      // The serializer calls `toJSON` once and serializes the returned `Date`
+      // by its own enumerable keys (none), so the no-mask line is `{}`. The
+      // masked path rebuilds the result key by key into a fresh object and
+      // must produce the same line, without touching the caller's value.
       class DateDto {
         public message = "m";
         toJSON(): Date {
@@ -9077,4 +9077,1197 @@ describe("pretty console message rendering", () => {
       expect(errorSpy).toHaveBeenCalledWith("[winston] Unknown logger level: %s", "bogus");
     },
   );
+});
+
+/**
+ * Shared harness for the maskMetaKeys message/stack suites below: a real logger
+ * with the built-in Console and a formatless Stream sink, a fixed clock, and
+ * helpers for the exact line each chain writes.
+ */
+const FIXED_NOW = new Date(Date.UTC(2026, 0, 2, 3, 4, 5));
+const STAMP = "2026-01-02 03:04:05";
+const stripAnsi = (value: string): string => value.replace(/\x1b\[[0-9;]*m/g, "");
+
+type Format = "pretty" | "json";
+
+interface Rendered {
+  fileOut: string;
+  consoleOut: string;
+  thrown: unknown;
+}
+
+/**
+ * Logs once through a real logger whose outputs are the built-in Console
+ * (default colorize) and a formatless `Stream` sink. The sink writes the
+ * logger-level `info[MESSAGE]`, i.e. exactly the file line, so both the
+ * file rendering and the console rendering of every chain are observed. A
+ * throw out of the log call is captured rather than propagated, so a test
+ * can assert that none happened.
+ */
+const render = async (
+  moduleName: string,
+  format: Format,
+  emit: (logger: winston.Logger) => void,
+  maskMetaKeys?: string[],
+): Promise<Rendered> => {
+  const sink = new PassThrough();
+  const chunks: string[] = [];
+  sink.on("data", (chunk: Buffer | string) => chunks.push(String(chunk)));
+  const logger = createLogger({
+    moduleName,
+    format,
+    includeFile: false,
+    includeGlobalFile: false,
+    captureUncaught: false,
+    clock: () => FIXED_NOW,
+    ...(maskMetaKeys ? { maskMetaKeys } : {}),
+    additionalTransports: [new winston.transports.Stream({ stream: sink, eol: "\n" })],
+  });
+  let thrown: unknown;
+  const rawConsole = captureConsole(() => {
+    try {
+      emit(logger);
+    } catch (err) {
+      thrown = err;
+    }
+  });
+  await shutdownLogger(logger);
+  const consoleOut = rawConsole.endsWith(os.EOL)
+    ? `${rawConsole.slice(0, rawConsole.length - os.EOL.length)}\n`
+    : rawConsole;
+  return { fileOut: chunks.join(""), consoleOut, thrown };
+};
+
+/** The exact line each chain writes for a message whose serialized form is given. */
+const prettyLine = (label: string, body: string): string =>
+  `UTC: ${STAMP}\n[INFO] (${label})\n${body}\n\n`;
+const jsonLine = (label: string, body: string): string =>
+  `{"level":"info","message":${body},"module":"${label}","timestamp":"${STAMP}"}\n`;
+
+/** The console shows the pretty file line without its `UTC:` header; json is identical. */
+const expectConsoleMatchesFile = (format: Format, out: Rendered): void => {
+  if (format === "json") {
+    expect(out.consoleOut).toBe(out.fileOut);
+  } else {
+    expect(out.fileOut.startsWith(`UTC: ${STAMP}\n`)).toBe(true);
+    expect(stripAnsi(out.consoleOut)).toBe(out.fileOut.slice(`UTC: ${STAMP}\n`.length));
+  }
+};
+
+describe("maskMetaKeys covers object-valued messages", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  /** Own string-keyed properties only (drops winston's `Symbol(level)` slot). */
+  const stringKeyed = (value: object): Record<string, unknown> =>
+    Object.fromEntries(Object.keys(value).map((key) => [key, (value as never)[key]]));
+
+  class Account {
+    public user = "bob";
+    readonly #password: string;
+    constructor(password: string) {
+      this.#password = password;
+    }
+    toJSON(): Record<string, unknown> {
+      return { user: this.user, password: this.#password };
+    }
+  }
+
+  interface MaskCase {
+    title: string;
+    make: () => object;
+    secret: string;
+    keeps: string[];
+    /** True when winston hands the caller's own object to the chain (truthy `message`). */
+    callerIsInfo: boolean;
+    pretty: string;
+    json: string;
+  }
+
+  const cases: MaskCase[] = [
+    {
+      title: "logger.info({ user, password }) (a single object without a message key)",
+      make: () => ({ user: "bob", password: "secret-S1" }),
+      secret: "secret-S1",
+      keeps: ['"user": "bob"', '"user":"bob"'],
+      callerIsInfo: false,
+      pretty: '{\n  "user": "bob",\n  "password": "secret-S1"\n}',
+      json: '{"password":"secret-S1","user":"bob"}',
+    },
+    {
+      title: "logger.info({ message: { password } }) (an object-valued message)",
+      make: () => ({ message: { password: "secret-S2" } }),
+      secret: "secret-S2",
+      keeps: [],
+      callerIsInfo: true,
+      pretty: '{\n  "password": "secret-S2"\n}',
+      json: '{"password":"secret-S2"}',
+    },
+    {
+      title: "logger.info([{ password }]) (an array message)",
+      make: () => [{ password: "secret-S3" }],
+      secret: "secret-S3",
+      keeps: [],
+      callerIsInfo: false,
+      pretty: '[\n  {\n    "password": "secret-S3"\n  }\n]',
+      json: '[{"password":"secret-S3"}]',
+    },
+    {
+      title: 'logger.info({ message: "", password }) (a falsy message wraps the whole object)',
+      make: () => ({ message: "", password: "secret-S4" }),
+      secret: "secret-S4",
+      keeps: ['"message": ""', '"message":""'],
+      callerIsInfo: false,
+      pretty: '{\n  "message": "",\n  "password": "secret-S4"\n}',
+      json: '{"message":"","password":"secret-S4"}',
+    },
+    {
+      title: "a class instance without a message whose toJSON exposes password",
+      make: () => new Account("secret-S5"),
+      secret: "secret-S5",
+      keeps: ['"user": "bob"', '"user":"bob"'],
+      callerIsInfo: false,
+      pretty: '{\n  "user": "bob",\n  "password": "secret-S5"\n}',
+      json: '{"password":"secret-S5","user":"bob"}',
+    },
+    {
+      title: "a nested secret ({ profile: { name, password } })",
+      make: () => ({ profile: { name: "bob", password: "secret-S6" } }),
+      secret: "secret-S6",
+      keeps: ['"name": "bob"', '"name":"bob"'],
+      callerIsInfo: false,
+      pretty: '{\n  "profile": {\n    "name": "bob",\n    "password": "secret-S6"\n  }\n}',
+      json: '{"profile":{"name":"bob","password":"secret-S6"}}',
+    },
+    {
+      title: "a mixed-case key (Password)",
+      make: () => ({ user: "bob", Password: "secret-S7" }),
+      secret: "secret-S7",
+      keeps: ['"user": "bob"', '"user":"bob"'],
+      callerIsInfo: false,
+      pretty: '{\n  "user": "bob",\n  "Password": "secret-S7"\n}',
+      json: '{"Password":"secret-S7","user":"bob"}',
+    },
+  ];
+
+  const formats: Format[] = ["pretty", "json"];
+
+  describe.each(formats)("format %s", (format) => {
+    const expectedLine = (label: string, body: string): string =>
+      format === "json" ? jsonLine(label, body) : prettyLine(label, body);
+    const bodyOf = (testCase: MaskCase): string =>
+      format === "json" ? testCase.json : testCase.pretty;
+
+    it.each(cases)(
+      "without maskMetaKeys, $title renders exactly as before (pinned bytes)",
+      async (testCase) => {
+        const label = `mom-off-${format}`;
+        const out = await render(label, format, (logger) => {
+          logger.info(testCase.make());
+        });
+
+        expect(out.thrown).toBeUndefined();
+        expect(out.fileOut).toBe(expectedLine(label, bodyOf(testCase)));
+        expectConsoleMatchesFile(format, out);
+        expect(out.fileOut).toContain(testCase.secret);
+        expect(out.fileOut).not.toContain("[REDACTED]");
+      },
+    );
+
+    it.each(cases)(
+      "with maskMetaKeys, $title redacts the secret in the file and on the console and changes nothing else",
+      async (testCase) => {
+        const label = `mom-on-${format}`;
+        const payload = testCase.make();
+        const snapshot = structuredClone(payload);
+        const out = await render(
+          label,
+          format,
+          (logger) => {
+            logger.info(payload);
+          },
+          ["password"],
+        );
+
+        expect(out.thrown).toBeUndefined();
+        // The masked line is the unmasked line with ONLY the secret's JSON
+        // string swapped for the placeholder: same keys, same order, same
+        // non-secret values.
+        const unmaskedBody = bodyOf(testCase);
+        const maskedBody = unmaskedBody.replace(`"${testCase.secret}"`, '"[REDACTED]"');
+        expect(maskedBody).not.toBe(unmaskedBody);
+        expect(out.fileOut).toBe(expectedLine(label, maskedBody));
+        expectConsoleMatchesFile(format, out);
+        for (const output of [out.fileOut, out.consoleOut]) {
+          expect(output).not.toContain(testCase.secret);
+          expect(output).toContain("[REDACTED]");
+          expect(testCase.keeps.some((fragment) => output.includes(fragment))).toBe(
+            testCase.keeps.length > 0,
+          );
+        }
+
+        // The caller's object is never rewritten. The only write on it is
+        // winston-core's own `level` slot, and only when winston hands the
+        // caller's object itself to the chain (a truthy `message`).
+        if (testCase.callerIsInfo) {
+          expect(stringKeyed(payload)).toEqual({ ...snapshot, level: "info" });
+          expect(Object.getOwnPropertySymbols(payload)).toEqual([Symbol.for("level")]);
+        } else {
+          expect(payload).toEqual(snapshot);
+          expect(Object.keys(payload)).toEqual(Object.keys(snapshot));
+        }
+        if (payload instanceof Account) {
+          expect(payload.toJSON()).toEqual({ user: "bob", password: "secret-S5" });
+        }
+      },
+    );
+
+    it("a message object whose getter throws renders the redaction sentinel instead of throwing or leaking", async () => {
+      const label = `mom-throw-${format}`;
+      const payload = {
+        password: "secret-S8",
+        get profile(): string {
+          throw new Error("profile getter failed");
+        },
+      };
+      const out = await render(
+        label,
+        format,
+        (logger) => {
+          logger.info(payload);
+        },
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(expectedLine(label, '"[RedactionFailed]"'));
+      expectConsoleMatchesFile(format, out);
+      for (const output of [out.fileOut, out.consoleOut]) {
+        expect(output).not.toContain("secret-S8");
+        expect(output).not.toContain("profile getter failed");
+        expect(output).not.toContain("[UNSERIALIZABLE]");
+        expect(output).not.toContain("_unserializable");
+      }
+    });
+
+    it("with maskMetaKeys, an object message with nothing to mask renders byte-identically to no mask", async () => {
+      const payload = { user: "bob", tags: ["a", "b"], nested: { n: 1, ok: true } };
+      const masked = await render(
+        `mom-same-${format}`,
+        format,
+        (logger) => {
+          logger.info(payload);
+        },
+        ["password"],
+      );
+      const plain = await render(`mom-same-${format}`, format, (logger) => {
+        logger.info(payload);
+      });
+
+      expect(masked.thrown).toBeUndefined();
+      expect(masked.fileOut).toBe(plain.fileOut);
+      expect(masked.consoleOut).toBe(plain.consoleOut);
+      expect(masked.fileOut).not.toContain("[REDACTED]");
+      expect(payload).toEqual({ user: "bob", tags: ["a", "b"], nested: { n: 1, ok: true } });
+    });
+
+    it("with maskMetaKeys, a string message that mentions a masked key is left untouched", async () => {
+      const label = `mom-string-${format}`;
+      const out = await render(
+        label,
+        format,
+        (logger) => {
+          logger.info("reset password for bob");
+        },
+        ["password"],
+      );
+
+      expect(out.fileOut).toBe(
+        format === "json"
+          ? jsonLine(label, '"reset password for bob"')
+          : prettyLine(label, "reset password for bob"),
+      );
+      expectConsoleMatchesFile(format, out);
+      expect(out.fileOut).not.toContain("[REDACTED]");
+    });
+  });
+
+  it("json mode: a top-level toJSON whose output carries an object message is redacted", async () => {
+    // `buildMetaRedactor` resolves a top-level `toJSON` and rebuilds from its
+    // output, copying the reserved `message` key across; the object behind it
+    // must be walked like any other message object.
+    const payload = {
+      message: "wrapped",
+      toJSON: () => ({ message: { user: "bob", password: "secret-S10" } }),
+    };
+    const plain = await render("mom-tojson", "json", (logger) => {
+      logger.info(payload);
+    });
+    const masked = await render(
+      "mom-tojson",
+      "json",
+      (logger) => {
+        logger.info(payload);
+      },
+      ["password"],
+    );
+
+    expect(plain.fileOut).toBe('{"message":{"password":"secret-S10","user":"bob"}}\n');
+    expect(masked.thrown).toBeUndefined();
+    expect(masked.fileOut).toBe('{"message":{"password":"[REDACTED]","user":"bob"}}\n');
+    expect(masked.consoleOut).toBe(masked.fileOut);
+    // The payload IS the info here (truthy `message`): only winston's `level`
+    // lands on it, and its own `message` is still the original string.
+    expect(Object.keys(payload)).toEqual(["message", "toJSON", "level"]);
+    expect(payload.message).toBe("wrapped");
+  });
+});
+
+describe("redactMessagePayload (shared reserved-slot redaction helper)", () => {
+  const { redactMessagePayload, REDACTION_FAILED } = __loggerInternals;
+  const mask: ReadonlySet<string> = new Set(["password"]);
+
+  it("returns primitives, null, and functions unchanged, since a mask has no key to address", () => {
+    const fn = (): string => "password";
+    for (const value of ["password=hunter2", 42, 7n, true, undefined, null, fn]) {
+      expect(redactMessagePayload(value, mask, "message")).toBe(value);
+    }
+  });
+
+  it("returns a fresh redacted copy of a plain object and leaves the input untouched", () => {
+    const input = { user: "bob", PassWord: "pw-1", nested: { password: "pw-2", keep: [1, 2] } };
+    const out = redactMessagePayload(input, mask, "message");
+
+    expect(out).toEqual({
+      user: "bob",
+      PassWord: "[REDACTED]",
+      nested: { password: "[REDACTED]", keep: [1, 2] },
+    });
+    expect(out).not.toBe(input);
+    expect(input).toEqual({
+      user: "bob",
+      PassWord: "pw-1",
+      nested: { password: "pw-2", keep: [1, 2] },
+    });
+  });
+
+  it("walks an array message element by element", () => {
+    const input = [{ password: "pw" }, "plain", 3];
+    const out = redactMessagePayload(input, mask, "");
+
+    expect(out).toEqual([{ password: "[REDACTED]" }, "plain", 3]);
+    expect(input[0]).toEqual({ password: "pw" });
+  });
+
+  it("returns a class instance with nothing to mask by identity, so the serializer renders it as before", () => {
+    class Point {
+      constructor(
+        public x: number,
+        public y: number,
+      ) {}
+    }
+    const point = new Point(1, 2);
+    expect(redactMessagePayload(point, mask, "message")).toBe(point);
+  });
+
+  it("resolves toJSON on the real instance with the serializer's key, then redacts its output", () => {
+    const seenKeys: string[] = [];
+    class Vault {
+      readonly #password = "pw-private";
+      toJSON(key: string): Record<string, unknown> {
+        seenKeys.push(key);
+        return { owner: "bob", password: this.#password };
+      }
+    }
+    const vault = new Vault();
+
+    expect(redactMessagePayload(vault, mask, "message")).toEqual({
+      owner: "bob",
+      password: "[REDACTED]",
+    });
+    expect(redactMessagePayload(vault, mask, "")).toEqual({
+      owner: "bob",
+      password: "[REDACTED]",
+    });
+    // Called once per resolution, with exactly the key the serializer would pass.
+    expect(seenKeys).toEqual(["message", ""]);
+  });
+
+  it("returns the original value when toJSON yields a primitive, so the serializer resolves it as before", () => {
+    const primitive = { toJSON: (): string => "as-text" };
+    expect(redactMessagePayload(primitive, mask, "")).toBe(primitive);
+  });
+
+  it("rebuilds a toJSON result by its own keys, the way the serializer reads it", () => {
+    // Serializers call toJSON once and serialize the result by its own
+    // enumerable keys: a Date result renders "{}", a result's own toJSON is
+    // never called, and a result that is the instance itself is read field by
+    // field.
+    const date = { toJSON: (): Date => new Date(0) };
+    const nested = { toJSON: () => ({ user: "bob", toJSON: () => ({ password: "pw-n" }) }) };
+    class Self {
+      public user = "bob";
+      public password = "pw-s";
+      toJSON(): this {
+        return this;
+      }
+    }
+
+    const dateOut = redactMessagePayload(date, mask, "");
+    expect(dateOut).toEqual({});
+    expect(JSON.stringify(dateOut)).toBe(JSON.stringify(date));
+
+    const nestedOut = redactMessagePayload(nested, mask, "");
+    expect(nestedOut).toEqual({ user: "bob" });
+    expect(JSON.stringify(nestedOut)).toBe(JSON.stringify(nested));
+
+    const self = new Self();
+    expect(redactMessagePayload(self, mask, "")).toEqual({ user: "bob", password: "[REDACTED]" });
+    expect(self.password).toBe("pw-s");
+  });
+
+  it("keeps an array toJSON result an array and drops forbidden keys from an object result", () => {
+    const arr = { toJSON: () => [{ password: "pw-a" }, 1] };
+    const proto = {
+      toJSON: () => JSON.parse('{"user":"bob","__proto__":{"password":"pw-p"}}') as object,
+    };
+
+    expect(redactMessagePayload(arr, mask, "")).toEqual([{ password: "[REDACTED]" }, 1]);
+    // The key-by-key rebuild (a result that defines its own toJSON) drops the
+    // same forbidden keys and the result's toJSON.
+    const withOwnToJSON = JSON.parse('{"user":"bob","__proto__":{"password":"pw-q"}}') as Record<
+      string,
+      unknown
+    >;
+    withOwnToJSON.toJSON = (): string => "never called";
+    const rebuiltOut = redactMessagePayload({ toJSON: () => withOwnToJSON }, mask, "") as Record<
+      string,
+      unknown
+    >;
+    expect(rebuiltOut).toEqual({ user: "bob" });
+    expect(Object.keys(rebuiltOut)).toEqual(["user"]);
+    expect(Object.getPrototypeOf(rebuiltOut)).toBe(Object.prototype);
+    const protoOut = redactMessagePayload(proto, mask, "") as Record<string, unknown>;
+    expect(protoOut).toEqual({ user: "bob" });
+    expect(Object.keys(protoOut)).toEqual(["user"]);
+    expect(Object.getPrototypeOf(protoOut)).toBe(Object.prototype);
+  });
+
+  it.each([
+    [
+      "a throwing toJSON",
+      {
+        password: "pw-a",
+        toJSON: (): never => {
+          throw new Error("toJSON failed");
+        },
+      },
+    ],
+    [
+      "a throwing toJSON getter",
+      Object.defineProperty({ password: "pw-b" }, "toJSON", {
+        get(): never {
+          throw new Error("toJSON getter failed");
+        },
+      }),
+    ],
+    [
+      "a throwing nested getter",
+      {
+        password: "pw-c",
+        get detail(): string {
+          throw new Error("detail getter failed");
+        },
+      },
+    ],
+  ])("fails closed to the redaction sentinel on %s, never the raw value", (_name, value) => {
+    let out: unknown;
+    expect(() => {
+      out = redactMessagePayload(value, mask, "message");
+    }).not.toThrow();
+    expect(out).toBe(REDACTION_FAILED);
+    expect(REDACTION_FAILED).toBe("[RedactionFailed]");
+    expect(JSON.stringify(out)).not.toMatch(/pw-/);
+  });
+});
+
+describe("maskMetaKeys covers the fail-closed message copy and non-string stacks", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  describe("a top-level toJSON that throws (the fail-closed rebuild)", () => {
+    const makePayload = (): Record<string, unknown> => ({
+      message: { user: "bob", password: "secret-S11" },
+      toJSON: (): never => {
+        throw new Error("toJSON failed");
+      },
+    });
+
+    it("json: the fail-closed line still redacts an object message instead of copying it raw", async () => {
+      const payload = makePayload();
+      const out = await render(
+        "mom-fail-json",
+        "json",
+        (logger) => {
+          logger.info(payload);
+        },
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        '{"_redactionFailed":true,"level":"info","message":{"password":"[REDACTED]","user":"bob"}}\n',
+      );
+      expect(out.consoleOut).toBe(out.fileOut);
+      expect(out.fileOut).not.toContain("secret-S11");
+      expect(out.fileOut).not.toContain("toJSON failed");
+      // The caller's message object still holds the real secret.
+      expect(payload.message).toEqual({ user: "bob", password: "secret-S11" });
+    });
+
+    it("json: a message whose own redaction also fails renders the sentinel, never the raw object", async () => {
+      const payload = {
+        message: {
+          password: "secret-S14",
+          get detail(): string {
+            throw new Error("detail getter failed");
+          },
+        },
+        toJSON: (): never => {
+          throw new Error("toJSON failed");
+        },
+      };
+      const out = await render(
+        "mom-fail-json2",
+        "json",
+        (logger) => {
+          logger.info(payload);
+        },
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        '{"_redactionFailed":true,"level":"info","message":"[RedactionFailed]"}\n',
+      );
+      expect(out.fileOut).not.toContain("secret-S14");
+    });
+
+    it("json: a string message on the fail-closed line is copied unchanged", async () => {
+      const out = await render(
+        "mom-fail-json3",
+        "json",
+        (logger) => {
+          logger.info({
+            message: "plain text",
+            password: "secret-S15",
+            toJSON: (): never => {
+              throw new Error("toJSON failed");
+            },
+          });
+        },
+        ["password"],
+      );
+
+      expect(out.fileOut).toBe('{"_redactionFailed":true,"level":"info","message":"plain text"}\n');
+      expect(out.fileOut).not.toContain("secret-S15");
+    });
+
+    it("pretty: the same payload renders the redacted message (the metadata block, holding only toJSON, is unserializable)", async () => {
+      const out = await render(
+        "mom-fail-pretty",
+        "pretty",
+        (logger) => {
+          logger.info(makePayload());
+        },
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        `UTC: ${STAMP}\n[INFO] (mom-fail-pretty)\n{\n  "user": "bob",\n  "password": "[REDACTED]"\n}\n[UNSERIALIZABLE]\n\n`,
+      );
+      expectConsoleMatchesFile("pretty", out);
+      expect(out.fileOut).not.toContain("secret-S11");
+    });
+  });
+
+  const formats: Format[] = ["pretty", "json"];
+
+  describe.each(formats)("non-string stack, format %s", (format) => {
+    const line = (label: string, stackBody: string, level = "info", message = "m"): string =>
+      format === "json"
+        ? `{"level":"${level}","message":"${message}","module":"${label}","stack":${stackBody},"timestamp":"${STAMP}"}\n`
+        : `UTC: ${STAMP}\n[${level.toUpperCase()}] (${label})\n${message}\n${stackBody}\n\n`;
+    const body = (pretty: string, json: string): string => (format === "json" ? json : pretty);
+
+    const stackForms: [string, (logger: winston.Logger, stack: unknown) => void][] = [
+      ["logger.info({ message, stack })", (logger, stack) => logger.info({ message: "m", stack })],
+      [
+        'logger.log("info", { message, stack })',
+        (logger, stack) => logger.log("info", { message: "m", stack }),
+      ],
+      ['logger.info("m", { stack })', (logger, stack) => logger.info("m", { stack })],
+    ];
+
+    it.each(stackForms)(
+      "without maskMetaKeys, an object stack via %s renders exactly as before (pinned bytes)",
+      async (_form, emit) => {
+        const label = `mom-stack-off-${format}`;
+        const out = await render(label, format, (logger) =>
+          emit(logger, { password: "secret-S12", frame: "f1" }),
+        );
+
+        expect(out.fileOut).toBe(
+          line(
+            label,
+            body(
+              '{\n  "password": "secret-S12",\n  "frame": "f1"\n}',
+              '{"frame":"f1","password":"secret-S12"}',
+            ),
+          ),
+        );
+        expectConsoleMatchesFile(format, out);
+      },
+    );
+
+    it.each(stackForms)(
+      "with maskMetaKeys, an object stack via %s is redacted and the caller's stack is untouched",
+      async (_form, emit) => {
+        const label = `mom-stack-on-${format}`;
+        const stack = { password: "secret-S12", frame: "f1" };
+        const out = await render(label, format, (logger) => emit(logger, stack), ["password"]);
+
+        expect(out.thrown).toBeUndefined();
+        expect(out.fileOut).toBe(
+          line(
+            label,
+            body(
+              '{\n  "password": "[REDACTED]",\n  "frame": "f1"\n}',
+              '{"frame":"f1","password":"[REDACTED]"}',
+            ),
+          ),
+        );
+        expectConsoleMatchesFile(format, out);
+        expect(out.consoleOut).not.toContain("secret-S12");
+        expect(stack).toEqual({ password: "secret-S12", frame: "f1" });
+      },
+    );
+
+    it("with maskMetaKeys, an array stack is walked too", async () => {
+      const label = `mom-stack-arr-${format}`;
+      const out = await render(
+        label,
+        format,
+        (logger) => logger.info({ message: "m", stack: [{ password: "secret-S13" }, "frame"] }),
+        ["password"],
+      );
+
+      expect(out.fileOut).toBe(
+        line(
+          label,
+          body(
+            '[\n  {\n    "password": "[REDACTED]"\n  },\n  "frame"\n]',
+            '[{"password":"[REDACTED]"},"frame"]',
+          ),
+        ),
+      );
+      expect(out.consoleOut).not.toContain("secret-S13");
+    });
+
+    it("with maskMetaKeys, a stack object whose getter throws renders the redaction sentinel", async () => {
+      const label = `mom-stack-throw-${format}`;
+      const out = await render(
+        label,
+        format,
+        (logger) =>
+          logger.info({
+            message: "m",
+            stack: {
+              password: "secret-S16",
+              get frame(): string {
+                throw new Error("frame getter failed");
+              },
+            },
+          }),
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(line(label, '"[RedactionFailed]"'));
+      expectConsoleMatchesFile(format, out);
+      expect(out.fileOut).not.toContain("secret-S16");
+    });
+
+    it("with maskMetaKeys, a real Error's string stack renders byte-identically to no mask", async () => {
+      const makeError = (): Error => {
+        const err = new Error("boom");
+        err.stack = "Error: boom\n    at fixedFrame (fixed.ts:1:1)";
+        return err;
+      };
+      const label = `mom-stack-str-${format}`;
+      const masked = await render(label, format, (logger) => logger.error(makeError()), [
+        "password",
+      ]);
+      const plain = await render(label, format, (logger) => logger.error(makeError()));
+
+      expect(masked.fileOut).toBe(
+        line(
+          label,
+          body(
+            "Error: boom\n    at fixedFrame (fixed.ts:1:1)",
+            '"Error: boom\\n    at fixedFrame (fixed.ts:1:1)"',
+          ),
+          "error",
+          "boom",
+        ),
+      );
+      expect(masked.fileOut).toBe(plain.fileOut);
+      expect(masked.consoleOut).toBe(plain.consoleOut);
+    });
+  });
+});
+
+describe("maskMetaKeys object-message boundaries", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const formats: Format[] = ["pretty", "json"];
+
+  describe.each(formats)("format %s", (format) => {
+    const pick = (pretty: string, json: string): string => (format === "json" ? json : pretty);
+
+    it("a class-instance payload with an object message is redacted, and the instance's message is left alone", async () => {
+      class AuditEvent {
+        public message = { user: "bob", password: "secret-S20" };
+        public kind = "login";
+      }
+      const event = new AuditEvent();
+      const originalMessage = event.message;
+      const label = `mom-class-${format}`;
+      const out = await render(label, format, (logger) => logger.info(event), ["password"]);
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe(
+        pick(
+          `UTC: ${STAMP}\n[INFO] (${label})\n{\n  "user": "bob",\n  "password": "[REDACTED]"\n}\n{\n  "kind": "login"\n}\n\n`,
+          `{"kind":"login","level":"info","message":{"password":"[REDACTED]","user":"bob"},"module":"${label}","timestamp":"${STAMP}"}\n`,
+        ),
+      );
+      expectConsoleMatchesFile(format, out);
+      expect(out.consoleOut).not.toContain("secret-S20");
+      // Winston hands the instance itself to the chain. Its message object is
+      // the same object, still holding the secret; the only writes on the
+      // instance are winston's `level` and the documented in-place `timestamp`
+      // for non-plain payloads.
+      expect(event.message).toBe(originalMessage);
+      expect(event.message).toEqual({ user: "bob", password: "secret-S20" });
+      expect(Object.keys(event).sort()).toEqual(["kind", "level", "message", "timestamp"]);
+    });
+
+    it("the multi-argument form logger.info(object, meta) redacts the object message", async () => {
+      const label = `mom-multi-${format}`;
+      const out = await render(
+        label,
+        format,
+        // Winston's typings only declare a string first argument here; the
+        // runtime accepts an object and treats it as the message.
+        (logger) =>
+          (logger.info as unknown as (...args: unknown[]) => void)(
+            { password: "secret-S21" },
+            { requestId: "r1" },
+          ),
+        ["password"],
+      );
+
+      expect(out.fileOut).toBe(
+        pick(
+          `UTC: ${STAMP}\n[INFO] (${label})\n{\n  "password": "[REDACTED]"\n}\n{\n  "requestId": "r1"\n}\n\n`,
+          `{"level":"info","message":{"password":"[REDACTED]"},"module":"${label}","requestId":"r1","timestamp":"${STAMP}"}\n`,
+        ),
+      );
+      expect(out.consoleOut).not.toContain("secret-S21");
+    });
+
+    it("the unknown-method fallback redacts an object message too", async () => {
+      const label = `mom-fallback-${format}`;
+      const out = await render(
+        label,
+        format,
+        (logger) =>
+          (logger as unknown as Record<string, (arg: unknown) => void>).audit({
+            password: "secret-S22",
+          }),
+        ["password"],
+      );
+
+      expect(out.thrown).toBeUndefined();
+      // First line: the one-time fallback warning; second: the redacted entry.
+      expect(out.fileOut).toContain(
+        pick('Unknown logger method "audit" called', 'Unknown logger method \\"audit\\" called'),
+      );
+      expect(out.fileOut).toContain(
+        pick('{\n  "password": "[REDACTED]"\n}', '"message":{"password":"[REDACTED]"}'),
+      );
+      expect(out.fileOut).not.toContain("secret-S22");
+      expect(out.consoleOut).not.toContain("secret-S22");
+    });
+
+    it("a self-referencing object message renders [Circular] with a mask, and as before without one", async () => {
+      const makeCyclic = (): Record<string, unknown> => {
+        const message: Record<string, unknown> = { user: "bob" };
+        message.self = message;
+        return message;
+      };
+      const label = `mom-cycle-${format}`;
+      const masked = await render(label, format, (logger) => logger.info(makeCyclic()), [
+        "password",
+      ]);
+      const plain = await render(label, format, (logger) => logger.info(makeCyclic()));
+
+      // Without a mask the serializers behave as before: pretty cannot express
+      // the cycle; json's serializer marks it.
+      expect(plain.fileOut).toBe(
+        pick(
+          `UTC: ${STAMP}\n[INFO] (${label})\n[UNSERIALIZABLE]\n\n`,
+          `{"level":"info","message":{"self":"[Circular]","user":"bob"},"module":"${label}","timestamp":"${STAMP}"}\n`,
+        ),
+      );
+      // With a mask the message is walked first, like the metadata bag, so the
+      // back-reference is marked and the rest of the object still renders.
+      expect(masked.thrown).toBeUndefined();
+      expect(masked.fileOut).toBe(
+        pick(
+          `UTC: ${STAMP}\n[INFO] (${label})\n{\n  "user": "bob",\n  "self": "[Circular]"\n}\n\n`,
+          plain.fileOut,
+        ),
+      );
+    });
+
+    it("an own __proto__ key in an object message is dropped with a mask (same guard as metadata)", async () => {
+      const label = `mom-proto-${format}`;
+      const out = await render(
+        label,
+        format,
+        (logger) =>
+          logger.info(JSON.parse('{"user":"bob","__proto__":{"password":"secret-S23"}}') as object),
+        ["password"],
+      );
+
+      expect(out.fileOut).toBe(
+        pick(
+          `UTC: ${STAMP}\n[INFO] (${label})\n{\n  "user": "bob"\n}\n\n`,
+          `{"level":"info","message":{"user":"bob"},"module":"${label}","timestamp":"${STAMP}"}\n`,
+        ),
+      );
+      expect(out.consoleOut).not.toContain("secret-S23");
+    });
+  });
+});
+
+describe("maskMetaKeys and toJSON outputs (serializers resolve toJSON once)", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  // Both `JSON.stringify` and winston's json serializer call `toJSON` once and
+  // then serialize its result by its own enumerable keys; a `toJSON` on the
+  // RESULT is never called. Masking must read the result the same way.
+  class SelfDoc {
+    public user = "bob";
+    public password = "secret-S30";
+    toJSON(): this {
+      return this;
+    }
+  }
+
+  const formats: Format[] = ["pretty", "json"];
+
+  describe.each(formats)("format %s", (format) => {
+    const pick = (pretty: string, json: string): string => (format === "json" ? json : pretty);
+
+    it("masks a message whose toJSON returns the instance itself", async () => {
+      const label = `mom-self-${format}`;
+      const plain = await render(label, format, (logger) => logger.info(new SelfDoc()));
+      const masked = await render(label, format, (logger) => logger.info(new SelfDoc()), [
+        "password",
+      ]);
+
+      expect(plain.fileOut).toBe(
+        pick(
+          prettyLine(label, '{\n  "user": "bob",\n  "password": "secret-S30"\n}'),
+          jsonLine(label, '{"password":"secret-S30","user":"bob"}'),
+        ),
+      );
+      expect(masked.fileOut).toBe(plain.fileOut.replace('"secret-S30"', '"[REDACTED]"'));
+      expectConsoleMatchesFile(format, masked);
+      expect(masked.consoleOut).not.toContain("secret-S30");
+    });
+
+    it("never calls a toJSON found on a toJSON result (the serializer omits it)", async () => {
+      const label = `mom-nested-tojson-${format}`;
+      const payload = {
+        toJSON: () => ({ user: "bob", toJSON: () => ({ password: "secret-S32" }) }),
+      };
+      const plain = await render(label, format, (logger) => logger.info(payload));
+      const masked = await render(label, format, (logger) => logger.info(payload), ["password"]);
+
+      expect(plain.fileOut).toBe(
+        pick(prettyLine(label, '{\n  "user": "bob"\n}'), jsonLine(label, '{"user":"bob"}')),
+      );
+      expect(masked.fileOut).toBe(plain.fileOut);
+      expect(masked.consoleOut).not.toContain("secret-S32");
+    });
+
+    it("passes toJSON the key the serializer passes (root in pretty, message in json)", async () => {
+      const label = `mom-key-${format}`;
+      const payload = {
+        toJSON: (key: string) => ({ seenKey: key, password: "secret-S33" }),
+      };
+      const plain = await render(label, format, (logger) => logger.info(payload));
+      const masked = await render(label, format, (logger) => logger.info(payload), ["password"]);
+
+      expect(plain.fileOut).toBe(
+        pick(
+          prettyLine(label, '{\n  "seenKey": "",\n  "password": "secret-S33"\n}'),
+          jsonLine(label, '{"password":"secret-S33","seenKey":"message"}'),
+        ),
+      );
+      expect(masked.fileOut).toBe(plain.fileOut.replace('"secret-S33"', '"[REDACTED]"'));
+    });
+
+    it("leaves a BigInt message alone with a mask", async () => {
+      const label = `mom-bigint-${format}`;
+      const plain = await render(label, format, (logger) => logger.info(123n));
+      const masked = await render(label, format, (logger) => logger.info(123n), ["password"]);
+
+      expect(plain.fileOut).toBe(pick(prettyLine(label, "123"), jsonLine(label, '"123"')));
+      expect(masked.fileOut).toBe(plain.fileOut);
+    });
+  });
+
+  it("json: masks a top-level payload whose toJSON returns the instance itself", async () => {
+    class SelfEvent {
+      public message = "evt";
+      public password = "secret-S31";
+      toJSON(): this {
+        return this;
+      }
+    }
+    const plain = await render("mom-self-top", "json", (logger) => logger.info(new SelfEvent()));
+    const masked = await render("mom-self-top", "json", (logger) => logger.info(new SelfEvent()), [
+      "password",
+    ]);
+
+    expect(plain.fileOut).toBe(
+      `{"level":"info","message":"evt","password":"secret-S31","timestamp":"${STAMP}"}\n`,
+    );
+    expect(masked.fileOut).toBe(plain.fileOut.replace('"secret-S31"', '"[REDACTED]"'));
+    expect(masked.consoleOut).toBe(masked.fileOut);
+  });
+
+  it("json: a top-level toJSON result's own toJSON is not called with a mask either", async () => {
+    const payload = {
+      message: "m",
+      toJSON: () => ({ message: "m", toJSON: () => ({ password: "secret-S34" }) }),
+    };
+    const plain = await render("mom-top-nested", "json", (logger) => logger.info(payload));
+    const masked = await render("mom-top-nested", "json", (logger) => logger.info(payload), [
+      "password",
+    ]);
+
+    expect(plain.fileOut).toBe('{"message":"m"}\n');
+    expect(masked.fileOut).toBe(plain.fileOut);
+  });
+});
+
+describe("maskMetaKeys keeps toJSON results without their own toJSON on the serializer's path", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const formats: Format[] = ["pretty", "json"];
+
+  describe.each(formats)("format %s", (format) => {
+    const pick = (pretty: string, json: string): string => (format === "json" ? json : pretty);
+
+    it("a boxed-primitive toJSON result renders like the no-mask line", async () => {
+      // JSON.stringify unwraps a boxed primitive; safe-stable-stringify (json
+      // mode) reads it by its index keys. Either way the mask must not differ.
+      const label = `mom-boxed-${format}`;
+      const payload = { toJSON: (): unknown => new String("boxed") };
+      const plain = await render(label, format, (logger) => logger.info(payload));
+      const masked = await render(label, format, (logger) => logger.info(payload), ["password"]);
+
+      expect(plain.fileOut).toBe(
+        pick(
+          prettyLine(label, '"boxed"'),
+          jsonLine(label, '{"0":"b","1":"o","2":"x","3":"e","4":"d"}'),
+        ),
+      );
+      expect(masked.fileOut).toBe(plain.fileOut);
+    });
+
+    it("a typed-array toJSON result renders like the no-mask line (index order kept)", async () => {
+      const label = `mom-typed-${format}`;
+      const payload = { toJSON: (): Uint8Array => Uint8Array.from({ length: 12 }, (_v, i) => i) };
+      const plain = await render(label, format, (logger) => logger.info(payload));
+      const masked = await render(label, format, (logger) => logger.info(payload), ["password"]);
+
+      expect(masked.fileOut).toBe(plain.fileOut);
+      if (format === "json") {
+        expect(plain.fileOut).toContain('"message":{"0":0,"1":1,"2":2,');
+      }
+    });
+
+    it("a Buffer toJSON result renders like the no-mask line (binary views are never rebuilt)", async () => {
+      const label = `mom-buffer-${format}`;
+      const payload = {
+        toJSON: (): Buffer => Buffer.from(Array.from({ length: 12 }, (_v, i) => i)),
+      };
+      const plain = await render(label, format, (logger) => logger.info(payload));
+      const masked = await render(label, format, (logger) => logger.info(payload), ["password"]);
+
+      expect(masked.fileOut).toBe(plain.fileOut);
+      expect(plain.fileOut).not.toContain('"type"');
+    });
+
+    it("a class-instance toJSON result without its own toJSON is masked, or kept as is when nothing matches", async () => {
+      class Creds {
+        public user = "bob";
+        public password = "secret-S40";
+      }
+      class Plain {
+        public user = "bob";
+      }
+      const label = `mom-inst-${format}`;
+      const secret = { toJSON: (): Creds => new Creds() };
+      const clean = { toJSON: (): Plain => new Plain() };
+      const maskedSecret = await render(label, format, (logger) => logger.info(secret), [
+        "password",
+      ]);
+      const plainClean = await render(label, format, (logger) => logger.info(clean));
+      const maskedClean = await render(label, format, (logger) => logger.info(clean), ["password"]);
+
+      expect(maskedSecret.fileOut).toBe(
+        pick(
+          prettyLine(label, '{\n  "user": "bob",\n  "password": "[REDACTED]"\n}'),
+          jsonLine(label, '{"password":"[REDACTED]","user":"bob"}'),
+        ),
+      );
+      expect(maskedClean.fileOut).toBe(plainClean.fileOut);
+    });
+  });
+
+  describe("json: a top-level payload's toJSON result", () => {
+    it("a boxed primitive renders like the no-mask line", async () => {
+      class Boxed {
+        public message = "m";
+        toJSON(): unknown {
+          return new String("boxed");
+        }
+      }
+      const plain = await render("mom-top-boxed", "json", (logger) => logger.info(new Boxed()));
+      const masked = await render("mom-top-boxed", "json", (logger) => logger.info(new Boxed()), [
+        "password",
+      ]);
+
+      expect(plain.fileOut).toBe('{"0":"b","1":"o","2":"x","3":"e","4":"d"}\n');
+      expect(masked.fileOut).toBe(plain.fileOut);
+    });
+
+    it("a typed array renders like the no-mask line (index order kept)", async () => {
+      class Bytes {
+        public message = "m";
+        toJSON(): Uint8Array {
+          return Uint8Array.from({ length: 12 }, (_v, i) => i);
+        }
+      }
+      const plain = await render("mom-top-typed", "json", (logger) => logger.info(new Bytes()));
+      const masked = await render("mom-top-typed", "json", (logger) => logger.info(new Bytes()), [
+        "password",
+      ]);
+
+      expect(plain.fileOut.startsWith('{"0":0,"1":1,"2":2,')).toBe(true);
+      expect(masked.fileOut).toBe(plain.fileOut);
+    });
+
+    it("a Buffer renders like the no-mask line", async () => {
+      class Bytes {
+        public message = "m";
+        toJSON(): Buffer {
+          return Buffer.from(Array.from({ length: 12 }, (_v, i) => i));
+        }
+      }
+      const plain = await render("mom-top-buffer", "json", (logger) => logger.info(new Bytes()));
+      const masked = await render("mom-top-buffer", "json", (logger) => logger.info(new Bytes()), [
+        "password",
+      ]);
+
+      expect(plain.fileOut.startsWith('{"0":0,"1":1,"2":2,')).toBe(true);
+      expect(masked.fileOut).toBe(plain.fileOut);
+    });
+
+    it("a class instance is masked, and kept as is when nothing matches", async () => {
+      class Creds {
+        public message = "m";
+        public password = "secret-S41";
+      }
+      class Clean {
+        public message = "m";
+      }
+      class WrapsCreds {
+        public message = "w";
+        toJSON(): Creds {
+          return new Creds();
+        }
+      }
+      class WrapsClean {
+        public message = "w";
+        toJSON(): Clean {
+          return new Clean();
+        }
+      }
+      const masked = await render("mom-top-inst", "json", (l) => l.info(new WrapsCreds()), [
+        "password",
+      ]);
+      const plainClean = await render("mom-top-inst", "json", (l) => l.info(new WrapsClean()));
+      const maskedClean = await render("mom-top-inst", "json", (l) => l.info(new WrapsClean()), [
+        "password",
+      ]);
+
+      expect(masked.fileOut).toBe('{"message":"m","password":"[REDACTED]"}\n');
+      expect(maskedClean.fileOut).toBe(plainClean.fileOut);
+      expect(plainClean.fileOut).toBe('{"message":"m"}\n');
+    });
+
+    it("a Proxy whose key listing throws fails closed instead of throwing out of logger.info", async () => {
+      class Hostile {
+        public message = "hostile";
+        toJSON(): object {
+          return new Proxy(
+            {},
+            {
+              ownKeys: (): never => {
+                throw new Error("ownKeys trap failed");
+              },
+            },
+          );
+        }
+      }
+      const out = await render("mom-top-proxy", "json", (l) => l.info(new Hostile()), ["password"]);
+
+      expect(out.thrown).toBeUndefined();
+      expect(out.fileOut).toBe('{"_redactionFailed":true,"level":"info","message":"hostile"}\n');
+      expect(out.fileOut).not.toContain("ownKeys trap failed");
+    });
+  });
 });

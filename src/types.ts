@@ -350,12 +350,12 @@ export interface LoggerOptions {
    */
   colorize?: boolean | { message?: boolean; level?: boolean; all?: boolean };
   /**
-   * Metadata keys whose values should be replaced with `"[REDACTED]"` in the
+   * Keys whose values should be replaced with `"[REDACTED]"` in the
    * serialized log output. Matched **case-insensitively** and applied
-   * **deeply** (including arrays and nested objects) before the metadata is
-   * `JSON.stringify`'d into the log line.
+   * **deeply** (including arrays and nested objects) before the value is
+   * serialized into the log line.
    *
-   * Targets the metadata object passed as the second-or-later argument to
+   * Covers the metadata object passed as the second-or-later argument to
    * `logger.info(...)` / `logger.warn(...)` / etc. — for example:
    *
    * ```ts
@@ -363,6 +363,17 @@ export interface LoggerOptions {
    * logger.info("Login", { email: "u@example.com", password: "topsecret" });
    * // Logged metadata: { email: "u@example.com", password: "[REDACTED]" }
    * ```
+   *
+   * It also covers **object and array messages**. Winston puts a
+   * single-argument payload without a truthy `message` into the message slot,
+   * so `logger.info({ user, password })`, `logger.info([{ password }])`, and
+   * `logger.info({ message: { password } })` are masked the same way, as is a
+   * non-string `stack` (a real `Error` stack is a string). A `toJSON()` on the
+   * message value is called first, and its result is masked the way the
+   * serializer reads it (by its own keys). String and BigInt messages and
+   * string stacks are never changed. If walking a message or stack throws (a
+   * throwing getter or `toJSON()`), it renders as the string
+   * `"[RedactionFailed]"`, never the raw value, and the log call does not throw.
    *
    * Defaults to `[]` (no redaction) for backward compatibility. The redaction
    * runs in BOTH the file pipeline and the console pipeline, so a key cannot
@@ -375,10 +386,11 @@ export interface LoggerOptions {
    * serializable classes) or that carry no enumerable own keys (`Map`, `Set`,
    * `RegExp`, etc.) are serialized via their built-in method and are **not**
    * key-redacted — use `redactPaths` or normalize to a plain object for those.
-   * A `toJSON`-defining object passed as the log call's own subject
-   * (`logger.info(dto)` in `format: "json"`) is the exception: its `toJSON()`
-   * is resolved first and the resulting fields ARE key-redacted, so enabling
-   * the mask never emits more than logging the same object without it would.
+   * Two top-level values are the exception, and their `toJSON()` is resolved
+   * first so the resulting fields ARE key-redacted: a `toJSON`-defining message
+   * (any format), and a `toJSON`-defining object passed as the log call's own
+   * subject (`logger.info(dto)` in `format: "json"`). Enabling the mask never
+   * emits more than logging the same value without it would.
    *
    * **Console/file parity (`format: "json"`).** The json-mode Console transport
    * carries no per-transport format, so `winston-transport` writes the
