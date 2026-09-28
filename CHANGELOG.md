@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-28
+
 ### Security
 
 - **Masked copies no longer fail, or hand a value to `Object.prototype`, on a key named after one of its members** (`src/redact.ts`, `src/serialize.ts`, `src/logger.ts`, `src/request-middleware.ts`, `README.md`; tests in `tests/request-middleware.spec.ts` and `tests/logger.spec.ts`, helpers in `tests/_helpers.ts`). Resolves the CodeQL `js/remote-property-injection` findings (CWE-250, CWE-400) in `src/redact.ts`. The masked copies of request bodies, request and response headers, `maskMetaKeys` metadata, `Error` fields and `toJSON()` output were built by assigning each caller- or client-chosen key onto a fresh object. Assigning a key the object does not own consults `Object.prototype`, so in an application that freezes `Object.prototype` (a common prototype-pollution mitigation, recommended by OWASP) a key named after one of its members (`toString`, `valueOf`, `hasOwnProperty`, ...) threw:
