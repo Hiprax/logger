@@ -38,7 +38,14 @@ import {
 } from "../src/serialize";
 import { InvalidTimezoneError, LoggerOptionError } from "../src/errors";
 import type { LoggerOptions, RotationStrategy } from "../src/types";
-import { captureConsole, createTempDir, teardownLogger } from "./_helpers";
+import {
+  captureConsole,
+  createTempDir,
+  restoreObjectPrototype,
+  teardownLogger,
+  withPrototypeSetter,
+  withReadOnlyPrototypeKey,
+} from "./_helpers";
 
 /**
  * Minimal Winston-compatible transport used by the transport-error-handling
@@ -15336,5 +15343,301 @@ describe("an explicit undefined rotation field means the default", () => {
 
     expect(second).toBe(first);
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Masked copies define their keys (a frozen or polluted Object.prototype)
+//
+// The masked copies (`maskMetaKeys`, the `errorToPlain` view) used to be built
+// by ASSIGNING each key onto a fresh `{}`. For a key the object does not own,
+// assignment consults `Object.prototype`, so under a frozen `Object.prototype`
+// (the OWASP prototype-pollution mitigation) a caller key named after one of
+// its members made the copy throw, and the line degraded to
+// `_unserializable` / `_redactionFailed` / `"[RedactionFailed]"`. The copies
+// now DEFINE their keys (`Object.fromEntries`). Each case compares the line
+// written while the key is read-only on `Object.prototype` with the line the
+// same logger writes for the same payload without it (a fixed clock makes
+// them byte-identical), plus the fields that line must hold.
+// ---------------------------------------------------------------------------
+describe("masked copies define their keys (a frozen or polluted Object.prototype)", () => {
+  const READ_ONLY_PROBE = "__hiprax_ro_probe";
+  const SETTER_PROBE = "__hiprax_setter_probe";
+  const fixedClock = (): Date => new Date("2031-03-04T05:06:07Z");
+  let sequence = 0;
+
+  afterEach(() => {
+    restoreObjectPrototype([READ_ONLY_PROBE, SETTER_PROBE]);
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  /**
+   * A logger writing to an in-memory Stream sink that carries no format of its
+   * own; `next()` returns the text written since the previous call (the sink
+   * receives each line synchronously inside the log call).
+   */
+  const sinkLogger = (options: LoggerOptions) => {
+    const stream = new PassThrough();
+    let text = "";
+    let read = 0;
+    stream.on("data", (chunk) => {
+      text += chunk.toString();
+    });
+    sequence += 1;
+    const moduleName = `define-keys-${sequence}`;
+    const logger = createLogger({
+      moduleName,
+      includeConsole: false,
+      includeFile: false,
+      includeGlobalFile: false,
+      captureUncaught: false,
+      clock: fixedClock,
+      ...options,
+      additionalTransports: [new winston.transports.Stream({ stream, eol: "\n" })],
+    });
+    const next = (): string => {
+      const out = text.slice(read);
+      read = text.length;
+      return out;
+    };
+    return { logger, next, moduleName };
+  };
+
+  describe("errorToPlain", () => {
+    it("keeps an own key of the Error that is read-only on Object.prototype", () => {
+      const err = new Error("boom");
+      err.stack = "Error: boom\n    at fixed (file.ts:1:1)";
+      Object.assign(err, { [READ_ONLY_PROBE]: "kept" });
+
+      const view = withReadOnlyPrototypeKey(READ_ONLY_PROBE, () => errorToPlain(err));
+
+      expect(view).toEqual({
+        name: "Error",
+        message: "boom",
+        stack: "Error: boom\n    at fixed (file.ts:1:1)",
+        [READ_ONLY_PROBE]: "kept",
+      });
+      expect(Object.keys(view)).toEqual(["name", "message", "stack", READ_ONLY_PROBE]);
+      expect(Object.getPrototypeOf(view)).toBe(Object.prototype);
+    });
+
+    it("never hands a field to an accessor on Object.prototype", () => {
+      const err = new Error("boom");
+      err.stack = "fixed";
+      Object.assign(err, { [SETTER_PROBE]: "value" });
+
+      const { result, received } = withPrototypeSetter(SETTER_PROBE, () => errorToPlain(err));
+
+      expect(received).toEqual([]);
+      expect(result).toEqual({
+        name: "Error",
+        message: "boom",
+        stack: "fixed",
+        [SETTER_PROBE]: "value",
+      });
+    });
+  });
+
+  describe("json + maskMetaKeys", () => {
+    it("renders a single-object entry holding such a top-level key in full, not as the _unserializable line", () => {
+      const { logger, next, moduleName } = sinkLogger({
+        format: "json",
+        maskMetaKeys: ["password"],
+      });
+      const payload = (): object =>
+        JSON.parse(
+          `{"message":"login","user":"bob","password":"hunter2","${READ_ONLY_PROBE}":"kept"}`,
+        );
+
+      logger.info(payload());
+      const expected = next();
+      withReadOnlyPrototypeKey(READ_ONLY_PROBE, () => logger.info(payload()));
+      const line = next();
+      teardownLogger(logger);
+
+      expect(line).toBe(expected);
+      expect(JSON.parse(line)).toEqual({
+        level: "info",
+        message: "login",
+        module: moduleName,
+        timestamp: "2031-03-04 05:06:07",
+        user: "bob",
+        password: "[REDACTED]",
+        [READ_ONLY_PROBE]: "kept",
+      });
+    });
+
+    it("renders a toString key while Object.prototype.toString is read-only", () => {
+      const { logger, next, moduleName } = sinkLogger({
+        format: "json",
+        maskMetaKeys: ["password"],
+      });
+      const payload = (): object =>
+        JSON.parse(
+          '{"message":"login","password":"hunter2","toString":"x","nested":{"valueOf":1}}',
+        );
+
+      logger.info(payload());
+      const expected = next();
+      withReadOnlyPrototypeKey("toString", () => logger.info(payload()));
+      const line = next();
+      teardownLogger(logger);
+
+      expect(line).toBe(expected);
+      expect(JSON.parse(line)).toEqual({
+        level: "info",
+        message: "login",
+        module: moduleName,
+        timestamp: "2031-03-04 05:06:07",
+        password: "[REDACTED]",
+        toString: "x",
+        nested: { valueOf: 1 },
+      });
+    });
+
+    it("renders such a top-level key in full with the built-in json console on (it carries no format)", () => {
+      const { logger, next } = sinkLogger({
+        format: "json",
+        maskMetaKeys: ["password"],
+        includeConsole: true,
+      });
+      const payload = (): object =>
+        JSON.parse(`{"message":"login","password":"hunter2","${READ_ONLY_PROBE}":"kept"}`);
+
+      const expectedConsole = captureConsole(() => logger.info(payload()));
+      const expectedSink = next();
+      let consoleText = "";
+      expect(() => {
+        consoleText = captureConsole(() =>
+          withReadOnlyPrototypeKey(READ_ONLY_PROBE, () => logger.info(payload())),
+        );
+      }).not.toThrow();
+      const sinkText = next();
+      teardownLogger(logger);
+
+      expect(consoleText).toBe(expectedConsole);
+      expect(sinkText).toBe(expectedSink);
+      // The built-in Console ends its line with os.EOL (CRLF on Windows), the sink
+      // with a bare line feed; normalized only when present, as elsewhere in this file.
+      const consoleLine = consoleText.endsWith(os.EOL)
+        ? `${consoleText.slice(0, consoleText.length - os.EOL.length)}\n`
+        : consoleText;
+      expect(consoleLine).toBe(sinkText);
+      expect(JSON.parse(sinkText)).toMatchObject({
+        password: "[REDACTED]",
+        [READ_ONLY_PROBE]: "kept",
+      });
+      expect(sinkText).not.toContain("_unserializable");
+    });
+
+    it("masks an object carried in the message slot, not the [RedactionFailed] placeholder", () => {
+      const { logger, next } = sinkLogger({ format: "json", maskMetaKeys: ["password"] });
+      // No `message` key: winston wraps the object as `{ message: payload }`.
+      const payload = (): object =>
+        JSON.parse(`{"user":"bob","password":"hunter2","${READ_ONLY_PROBE}":"kept"}`);
+
+      logger.info(payload());
+      const expected = next();
+      withReadOnlyPrototypeKey(READ_ONLY_PROBE, () => logger.info(payload()));
+      const line = next();
+      teardownLogger(logger);
+
+      expect(line).toBe(expected);
+      expect(JSON.parse(line).message).toEqual({
+        user: "bob",
+        password: "[REDACTED]",
+        [READ_ONLY_PROBE]: "kept",
+      });
+    });
+
+    it("masks a nested object holding such a key, not the [RedactionFailed] placeholder", () => {
+      const { logger, next } = sinkLogger({ format: "json", maskMetaKeys: ["password"] });
+      const meta = () => ({ body: { [READ_ONLY_PROBE]: "kept", password: "hunter2" } });
+
+      logger.info("login", meta());
+      const expected = next();
+      withReadOnlyPrototypeKey(READ_ONLY_PROBE, () => logger.info("login", meta()));
+      const line = next();
+      teardownLogger(logger);
+
+      expect(line).toBe(expected);
+      expect(JSON.parse(line).body).toEqual({ [READ_ONLY_PROBE]: "kept", password: "[REDACTED]" });
+      expect(line).not.toContain("hunter2");
+    });
+  });
+
+  describe("pretty + maskMetaKeys", () => {
+    it("renders the metadata block with the console off, not the _redactionFailed block", () => {
+      const { logger, next } = sinkLogger({ format: "pretty", maskMetaKeys: ["password"] });
+      const payload = (): object =>
+        JSON.parse(
+          `{"message":"login","password":"hunter2","${READ_ONLY_PROBE}":"kept","nested":{"${READ_ONLY_PROBE}":"kept","password":"p"}}`,
+        );
+
+      logger.info(payload());
+      const expected = next();
+      withReadOnlyPrototypeKey(READ_ONLY_PROBE, () => logger.info(payload()));
+      const block = next();
+      teardownLogger(logger);
+
+      expect(block).toBe(expected);
+      expect(block).toContain(`"${READ_ONLY_PROBE}": "kept"`);
+      expect(block).toContain('"password": "[REDACTED]"');
+      expect(block).not.toContain("_redactionFailed");
+      expect(block).not.toContain("hunter2");
+    });
+
+    it("renders a nested key on the default pretty console and in the sink alike", () => {
+      const { logger, next } = sinkLogger({
+        format: "pretty",
+        maskMetaKeys: ["password"],
+        includeConsole: true,
+      });
+      const meta = () => ({ body: { [READ_ONLY_PROBE]: "kept", password: "hunter2" } });
+
+      const expectedConsole = captureConsole(() => logger.info("login", meta()));
+      const expectedSink = next();
+      const consoleText = captureConsole(() =>
+        withReadOnlyPrototypeKey(READ_ONLY_PROBE, () => logger.info("login", meta())),
+      );
+      const sinkText = next();
+      teardownLogger(logger);
+
+      expect(consoleText).toBe(expectedConsole);
+      expect(sinkText).toBe(expectedSink);
+      for (const text of [consoleText, sinkText]) {
+        expect(text).toContain(`"${READ_ONLY_PROBE}": "kept"`);
+        expect(text).toContain('"password": "[REDACTED]"');
+        expect(text).not.toContain("_redactionFailed");
+        expect(text).not.toContain("hunter2");
+      }
+    });
+  });
+
+  // Boundary, green before and after the change: a transport that carries its
+  // own format (the pretty console here) makes winston-transport re-clone each
+  // entry with `Object.assign`, which ASSIGNS every key. So the logger's last
+  // format (`neutralizeCallerAccessors`) keeps assigning too: its throw on such
+  // a TOP-level key is caught and degrades the line, where a defined copy would
+  // pass the key on and let the re-clone throw out of `logger.info()` instead.
+  it("degrades the default pretty + console line for such a top-level key instead of throwing", () => {
+    const { logger, next } = sinkLogger({ format: "pretty", includeConsole: true });
+    const payload = JSON.parse(`{"message":"login","${READ_ONLY_PROBE}":"kept"}`) as object;
+
+    let consoleText = "";
+    expect(() => {
+      consoleText = captureConsole(() =>
+        withReadOnlyPrototypeKey(READ_ONLY_PROBE, () => logger.info(payload)),
+      );
+    }).not.toThrow();
+    const sinkText = next();
+    teardownLogger(logger);
+
+    for (const text of [consoleText, sinkText]) {
+      expect(text).toContain("login");
+      expect(text).toContain('"_unserializable": true');
+      expect(text).not.toContain("kept");
+    }
   });
 });

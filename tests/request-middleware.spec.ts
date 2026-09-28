@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import vm from "node:vm";
+import fc from "fast-check";
 import winston from "winston";
 import {
   createRequestLogger,
@@ -13,8 +14,22 @@ import { resetLoggerRegistry } from "../src/logger";
 import { RequestLoggerOptionError } from "../src/errors";
 import { MAX_REDACT_DEPTH } from "../src/redact";
 import { createErrorAwareReplacer, errorToPlain } from "../src/serialize";
-import type { LoggableRequest, LoggableResponse, LoggableNext, LogLevel } from "../src/types";
-import { createMockLogger, MockRequest, runMiddleware, withEnv } from "./_helpers";
+import type {
+  LoggableRequest,
+  LoggableResponse,
+  LoggableNext,
+  LogLevel,
+  RequestLoggerOptions,
+} from "../src/types";
+import {
+  createMockLogger,
+  MockRequest,
+  restoreObjectPrototype,
+  runMiddleware,
+  withEnv,
+  withPrototypeSetter,
+  withReadOnlyPrototypeKey,
+} from "./_helpers";
 
 describe("createRequestLogger", () => {
   afterEach(() => {
@@ -5921,5 +5936,593 @@ describe("warning for structured options that nothing writes", () => {
     createRequestLogger({ logger, ...options });
 
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Masked copies define their keys (a frozen or polluted Object.prototype)
+//
+// Every masked copy used to be built by ASSIGNING each key onto a fresh `{}`.
+// For a key the object does not own, assignment (`[[Set]]`) consults
+// `Object.prototype`: when `Object.prototype` is frozen (the OWASP
+// prototype-pollution mitigation), a key named after one of its members
+// (`toString`, `valueOf`, `constructor`, ...) throws in strict mode, and an
+// accessor planted there receives the value while the key goes missing. The
+// copies are now built with `Object.fromEntries`, which DEFINES each key and
+// never consults the prototype. Each case changes `Object.prototype` only for
+// the one call under test and restores it before asserting.
+// ---------------------------------------------------------------------------
+const READ_ONLY_PROBE = "__hiprax_ro_probe";
+const SETTER_PROBE = "__hiprax_setter_probe";
+const HEADER_SETTER_PROBE = "x-hiprax-probe";
+
+describe("masked copies define their keys (a frozen or polluted Object.prototype)", () => {
+  const { redactValue, normalizeHeaders } = __requestInternals;
+
+  afterEach(() => {
+    restoreObjectPrototype([READ_ONLY_PROBE, SETTER_PROBE, HEADER_SETTER_PROBE]);
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  describe("redactValue keeps a key that is read-only on Object.prototype", () => {
+    // Each branch is run twice: with the probe key walked (its value copied)
+    // and with the probe key masked (the placeholder written), because the two
+    // are separate writes in every rebuild.
+    const cases: [string, Set<string>, unknown][] = [
+      ["walked", new Set(["password"]), "kept"],
+      ["masked", new Set(["password", READ_ONLY_PROBE]), "[REDACTED]"],
+    ];
+
+    it.each(cases)("in a plain object, nested too (probe %s)", (_label, mask, probe) => {
+      const input = {
+        [READ_ONLY_PROBE]: "kept",
+        password: "p",
+        nested: { [READ_ONLY_PROBE]: "kept", password: "p" },
+      };
+
+      const out = withReadOnlyPrototypeKey(READ_ONLY_PROBE, () =>
+        redactValue(input, mask, new WeakSet()),
+      ) as Record<string, unknown>;
+
+      expect(out).toEqual({
+        [READ_ONLY_PROBE]: probe,
+        password: "[REDACTED]",
+        nested: { [READ_ONLY_PROBE]: probe, password: "[REDACTED]" },
+      });
+      expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+      expect(Object.getOwnPropertyDescriptor(out, READ_ONLY_PROBE)).toEqual({
+        value: probe,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      // The caller's object is never changed.
+      expect(input).toEqual({
+        [READ_ONLY_PROBE]: "kept",
+        password: "p",
+        nested: { [READ_ONLY_PROBE]: "kept", password: "p" },
+      });
+    });
+
+    it.each(cases)(
+      "in a plain object with a Symbol-keyed property, which the copy leaves out unread (probe %s)",
+      (_label, mask, probe) => {
+        const hidden = Symbol("hidden");
+        let symbolReads = 0;
+        const input: Record<PropertyKey, unknown> = { [READ_ONLY_PROBE]: "kept", password: "p" };
+        Object.defineProperty(input, hidden, {
+          enumerable: true,
+          get: () => {
+            symbolReads += 1;
+            return "secret";
+          },
+        });
+
+        const out = withReadOnlyPrototypeKey(READ_ONLY_PROBE, () =>
+          redactValue(input, mask, new WeakSet()),
+        ) as Record<string, unknown>;
+
+        expect(out).toEqual({ [READ_ONLY_PROBE]: probe, password: "[REDACTED]" });
+        expect(Object.getOwnPropertySymbols(out)).toEqual([]);
+        expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+        expect(symbolReads).toBe(0);
+      },
+    );
+
+    it("reads each value exactly once, in key order, on the spread path and on the Symbol-keyed path", () => {
+      const withGetters = (reads: string[], withSymbol: boolean): Record<PropertyKey, unknown> => {
+        const source: Record<PropertyKey, unknown> = {};
+        for (const key of ["a", "password", "b", "2"]) {
+          Object.defineProperty(source, key, {
+            enumerable: true,
+            get: () => {
+              reads.push(key);
+              return key === "b" ? { nested: key } : key;
+            },
+          });
+        }
+        if (withSymbol) {
+          Object.defineProperty(source, Symbol("tag"), { value: "t", enumerable: true });
+        }
+        return source;
+      };
+
+      for (const withSymbol of [false, true]) {
+        const reads: string[] = [];
+        const out = redactValue(
+          withGetters(reads, withSymbol),
+          new Set(["password"]),
+          new WeakSet(),
+        );
+
+        // Integer-like keys come first, as `Object.keys` orders them.
+        expect(reads).toEqual(["2", "a", "password", "b"]);
+        expect(out).toEqual({ 2: "2", a: "a", password: "[REDACTED]", b: { nested: "b" } });
+        expect(Object.keys(out as object)).toEqual(["2", "a", "password", "b"]);
+      }
+    });
+
+    it("drops __proto__, constructor and prototype on the Symbol-keyed path too", () => {
+      const input = JSON.parse(
+        '{"__proto__":{"polluted":"yes"},"constructor":"c","prototype":"p","password":"p","id":1}',
+      ) as Record<PropertyKey, unknown>;
+      Object.defineProperty(input, Symbol("tag"), { value: "t", enumerable: true });
+
+      const out = redactValue(input, new Set(["password"]), new WeakSet()) as Record<
+        string,
+        unknown
+      >;
+
+      expect(out).toEqual({ password: "[REDACTED]", id: 1 });
+      expect(Object.getOwnPropertyNames(out)).toEqual(["password", "id"]);
+      expect(Object.getOwnPropertySymbols(out)).toEqual([]);
+      expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+      expect(out.polluted).toBeUndefined();
+    });
+
+    it.each(cases)(
+      "in a parsed body that also carries an own __proto__ key, which the copy drops (probe %s)",
+      (_label, mask, probe) => {
+        const input = JSON.parse(
+          `{"__proto__":{"polluted":"yes"},"${READ_ONLY_PROBE}":"kept","password":"p"}`,
+        ) as Record<string, unknown>;
+
+        const out = withReadOnlyPrototypeKey(READ_ONLY_PROBE, () =>
+          redactValue(input, mask, new WeakSet()),
+        ) as Record<string, unknown>;
+
+        expect(out).toEqual({ [READ_ONLY_PROBE]: probe, password: "[REDACTED]" });
+        expect(Object.getOwnPropertyNames(out)).toEqual([READ_ONLY_PROBE, "password"]);
+        expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+        expect(out.polluted).toBeUndefined();
+      },
+    );
+
+    it.each(cases)(
+      "on a class instance it rebuilds, with a masked key and with forceCopy (probe %s)",
+      (_label, mask, probe) => {
+        class Dto {
+          __hiprax_ro_probe = "kept";
+          password = "p";
+          id = 7;
+        }
+        const masked = new Dto();
+        const copied = new Dto();
+
+        const [maskedOut, copiedOut] = withReadOnlyPrototypeKey(READ_ONLY_PROBE, () => [
+          redactValue(masked, mask, new WeakSet()),
+          redactValue(copied, new Set(["no-such-key"]), new WeakSet(), true),
+        ]);
+
+        expect(maskedOut).toEqual({ [READ_ONLY_PROBE]: probe, password: "[REDACTED]", id: 7 });
+        expect(Object.getPrototypeOf(maskedOut)).toBe(Object.prototype);
+        expect(copiedOut).toEqual({ [READ_ONLY_PROBE]: "kept", password: "p", id: 7 });
+        expect(Object.getPrototypeOf(copiedOut)).toBe(Object.prototype);
+        expect(copiedOut).not.toBe(copied);
+        expect(masked).toEqual(new Dto());
+      },
+    );
+
+    it.each(cases)(
+      "as an own field of an Error, through the errorToPlain view (probe %s)",
+      (_label, mask, probe) => {
+        const err = new Error("boom");
+        err.stack = "Error: boom\n    at fixed (file.ts:1:1)";
+        Object.assign(err, { [READ_ONLY_PROBE]: "kept", password: "p" });
+
+        const out = withReadOnlyPrototypeKey(READ_ONLY_PROBE, () =>
+          redactValue(err, mask, new WeakSet()),
+        ) as Record<string, unknown>;
+
+        expect(out).toEqual({
+          name: "Error",
+          message: "boom",
+          stack: "Error: boom\n    at fixed (file.ts:1:1)",
+          [READ_ONLY_PROBE]: probe,
+          password: "[REDACTED]",
+        });
+        expect(Object.keys(out)).toEqual(["name", "message", "stack", READ_ONLY_PROBE, "password"]);
+        expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+        expect((err as unknown as Record<string, unknown>).password).toBe("p");
+      },
+    );
+
+    it.each(cases)(
+      "in a toJSON() output that defines toJSON itself (probe %s)",
+      (_label, mask, probe) => {
+        class SelfSerializing {
+          __hiprax_ro_probe = "kept";
+          password = "p";
+          toJSON(): this {
+            return this;
+          }
+        }
+        const value = new SelfSerializing();
+
+        const out = withReadOnlyPrototypeKey(READ_ONLY_PROBE, () =>
+          redactValue(value, mask, new WeakSet()),
+        ) as Record<string, unknown>;
+
+        expect(out).toEqual({ [READ_ONLY_PROBE]: probe, password: "[REDACTED]" });
+        expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+        expect(value.password).toBe("p");
+      },
+    );
+
+    it("never hands a value to an accessor on Object.prototype, and keeps the key", () => {
+      const input = { [SETTER_PROBE]: "value-1", nested: { [SETTER_PROBE]: "value-2" } };
+
+      const { result, received } = withPrototypeSetter(SETTER_PROBE, () =>
+        redactValue(input, new Set(["password"]), new WeakSet()),
+      );
+
+      expect(received).toEqual([]);
+      expect(result).toEqual({ [SETTER_PROBE]: "value-1", nested: { [SETTER_PROBE]: "value-2" } });
+      expect(Object.getOwnPropertyNames(result)).toEqual([SETTER_PROBE, "nested"]);
+    });
+  });
+
+  describe("createRequestLogger", () => {
+    const parsedBody = (): unknown =>
+      JSON.parse(
+        '{"user":"bob","password":"hunter2","toString":"x","nested":{"valueOf":1,"token":"t"}}',
+      );
+
+    const logBodyWithReadOnlyToString = (options: Partial<RequestLoggerOptions>): unknown => {
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+      const { logger, log } = createMockLogger();
+      const middleware = createRequestLogger({
+        logger,
+        includeHttpContext: true,
+        includeRequestBody: true,
+        ...options,
+      });
+      const { res } = runMiddleware(middleware, { body: parsedBody() });
+
+      withReadOnlyPrototypeKey("toString", () => res.emit("finish"));
+
+      expect(errSpy).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledTimes(1);
+      return log.mock.calls[0][0].http.requestBody;
+    };
+
+    it("logs a body with a toString key while Object.prototype.toString is read-only (default masks)", () => {
+      expect(logBodyWithReadOnlyToString({})).toEqual({
+        user: "bob",
+        password: "[REDACTED]",
+        toString: "x",
+        nested: { valueOf: 1, token: "[REDACTED]" },
+      });
+    });
+
+    it("logs a body with a toString key while Object.prototype.toString is read-only (maskBodyKeys: false)", () => {
+      expect(logBodyWithReadOnlyToString({ maskBodyKeys: false })).toEqual({
+        user: "bob",
+        password: "hunter2",
+        toString: "x",
+        nested: { valueOf: 1, token: "t" },
+      });
+    });
+  });
+
+  describe("request headers", () => {
+    it("drops a header whose LOWERCASED name is __proto__, constructor or prototype", () => {
+      const out = normalizeHeaders(
+        { "User-Agent": "jest", Constructor: "c", __PROTO__: { polluted: "yes" }, PROTOTYPE: "p" },
+        true,
+        undefined,
+      ) as Record<string, unknown>;
+
+      expect(out).toEqual({ "user-agent": "jest" });
+      expect(Object.getOwnPropertyNames(out)).toEqual(["user-agent"]);
+      expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+      expect(out.polluted).toBeUndefined();
+    });
+
+    it("still applies a redactPaths header entry when a __PROTO__ header arrives with header masking off", () => {
+      const { logger, log } = createMockLogger();
+      const middleware = createRequestLogger({
+        logger,
+        includeHttpContext: true,
+        includeRequestHeaders: true,
+        maskHeaderKeys: false,
+        redactPaths: ["requestHeaders.x-secret"],
+      });
+      const { res } = runMiddleware(middleware, {
+        headers: {
+          "user-agent": "jest",
+          "x-secret": "S3CR3T-HEADER",
+          __PROTO__: { a: 1 },
+        } as unknown as MockRequest["headers"],
+      });
+      res.emit("finish");
+
+      expect(log).toHaveBeenCalledTimes(1);
+      const headers = log.mock.calls[0][0].http.requestHeaders;
+      expect(headers).toEqual({ "user-agent": "jest", "x-secret": "[REDACTED]" });
+      expect(Object.getPrototypeOf(headers)).toBe(Object.prototype);
+      expect(JSON.stringify(log.mock.calls[0][0])).not.toContain("S3CR3T-HEADER");
+    });
+
+    it("logs the entry for a Constructor header while Object.prototype.constructor is read-only", () => {
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+      const { logger, log } = createMockLogger();
+      const middleware = createRequestLogger({
+        logger,
+        includeHttpContext: true,
+        includeRequestHeaders: true,
+      });
+      const { res } = runMiddleware(middleware, {
+        headers: { "user-agent": "jest", Constructor: "c" },
+      });
+
+      withReadOnlyPrototypeKey("constructor", () => res.emit("finish"));
+
+      expect(errSpy).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls[0][0].http.requestHeaders).toEqual({ "user-agent": "jest" });
+    });
+
+    const setterCases: [string, Partial<RequestLoggerOptions>, Record<string, string>][] = [
+      [
+        "all headers, default masks",
+        { includeRequestHeaders: true },
+        { "user-agent": "jest", [HEADER_SETTER_PROBE]: "probe-value" },
+      ],
+      [
+        "an allow list, default masks",
+        { includeRequestHeaders: [HEADER_SETTER_PROBE] },
+        { [HEADER_SETTER_PROBE]: "probe-value" },
+      ],
+      [
+        "all headers, header masking off",
+        { includeRequestHeaders: true, maskHeaderKeys: false },
+        { "user-agent": "jest", [HEADER_SETTER_PROBE]: "probe-value" },
+      ],
+    ];
+
+    it.each(setterCases)(
+      "never hands a header value to an accessor on Object.prototype (%s)",
+      (_label, options, expected) => {
+        const { logger, log } = createMockLogger();
+        const middleware = createRequestLogger({ logger, includeHttpContext: true, ...options });
+        const { res } = runMiddleware(middleware, {
+          headers: { "user-agent": "jest", [HEADER_SETTER_PROBE]: "probe-value" },
+        });
+
+        const { received } = withPrototypeSetter(HEADER_SETTER_PROBE, () => res.emit("finish"));
+
+        expect(received).toEqual([]);
+        expect(log).toHaveBeenCalledTimes(1);
+        expect(log.mock.calls[0][0].http.requestHeaders).toEqual(expected);
+      },
+    );
+  });
+});
+
+describe("the request logger's error-path diagnostic line", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  /** A backslash-u escape for the four hex digits given (kept ASCII in this source). */
+  const u = (hex: string): string => "\\u" + hex;
+  const UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+  const CR = String.fromCharCode(13);
+  const LF = String.fromCharCode(10);
+  const ESC = String.fromCharCode(0x1b);
+  const LINE_SEPARATOR = String.fromCodePoint(0x2028);
+  const RIGHT_TO_LEFT_OVERRIDE = String.fromCodePoint(0x202e);
+
+  /** Drives one request whose `enrich` throws `error` and returns the single stderr line. */
+  const failAndCapture = (
+    error: unknown,
+    request: Partial<MockRequest>,
+    options: Partial<RequestLoggerOptions> = {},
+  ): string => {
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      enrich: () => {
+        throw error;
+      },
+      ...options,
+    });
+    const { res } = runMiddleware(middleware, request);
+
+    expect(() => res.emit("finish")).not.toThrow();
+
+    expect(log).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    return errSpy.mock.calls[0][0] as string;
+  };
+
+  it("writes control and format characters from the method, URL and message escaped, on one line", () => {
+    const line = failAndCapture(new Error(`boom${LF}[ERROR] (admin) forged`), {
+      method: `GET${CR}${LF}X`,
+      originalUrl: `/cb?code=SUPER_SECRET&x=1${CR}${LF}[ERROR] (admin) forged${ESC}[31m${LINE_SEPARATOR}${RIGHT_TO_LEFT_OVERRIDE}tail`,
+    });
+
+    expect(line).toBe(
+      "@hiprax/logger request logger failed while logging GET\\r\\nX " +
+        `/cb?code=[REDACTED]&x=1\\r\\n[ERROR] (admin) forged${u("001b")}[31m${u("2028")}${u("202e")}tail: ` +
+        "boom\\n[ERROR] (admin) forged",
+    );
+    expect(UNSAFE.test(line)).toBe(false);
+    expect(line).not.toContain("SUPER_SECRET");
+  });
+
+  it("escapes a double quote and a backslash, so text cannot pass for an escaped control character", () => {
+    const line = failAndCapture(new Error('say "hi"\\nno newline'), { originalUrl: "/p\\q" });
+
+    expect(line).toBe(
+      '@hiprax/logger request logger failed while logging POST /p\\\\q: say \\"hi\\"\\\\nno newline',
+    );
+  });
+
+  it("prints an ordinary method, URL and message byte-identically", () => {
+    const line = failAndCapture(new Error("enrich boom"), {
+      originalUrl: "/oauth/cb?code=SUPER_SECRET_AUTH_CODE&state=x",
+    });
+
+    expect(line).toBe(
+      "@hiprax/logger request logger failed while logging POST /oauth/cb?code=[REDACTED]&state=x: enrich boom",
+    );
+  });
+
+  it("converts a non-string method, URL and message before escaping, keeping every digit", () => {
+    const err = new Error("replaced");
+    Object.defineProperty(err, "message", { value: 404 });
+
+    const line = failAndCapture(
+      err,
+      { method: 7 as unknown as string, originalUrl: 12345 as unknown as string },
+      { maskQueryKeys: false },
+    );
+
+    expect(line).toBe("@hiprax/logger request logger failed while logging 7 12345: 404");
+  });
+
+  it("reports an undefined error message as text, not with the last-resort line", () => {
+    const err = new Error("replaced");
+    Object.defineProperty(err, "message", { get: () => undefined });
+
+    const line = failAndCapture(err, {});
+
+    expect(line).toBe(
+      "@hiprax/logger request logger failed while logging POST /auth/login: undefined",
+    );
+  });
+
+  it("still writes the last-resort line when a value cannot be converted to a string", () => {
+    const line = failAndCapture(new Error("boom"), {
+      method: Object.create(null) as unknown as string,
+    });
+
+    expect(line).toBe("@hiprax/logger request logger failed, and so did reporting the failure.");
+  });
+
+  it("reports a Symbol method through String() instead of the last-resort line", () => {
+    const line = failAndCapture(new Error("boom"), {
+      method: Symbol("verb") as unknown as string,
+    });
+
+    expect(line).toBe(
+      "@hiprax/logger request logger failed while logging Symbol(verb) /auth/login: boom",
+    );
+  });
+});
+
+describe("escapeDiagnosticText", () => {
+  const { escapeDiagnosticText } = __requestInternals;
+  /** A backslash-u escape for the four hex digits given (kept ASCII in this source). */
+  const u = (hex: string): string => "\\u" + hex;
+  const escapeOf = (codeUnit: number): string => u(codeUnit.toString(16).padStart(4, "0"));
+  const char = (codePoint: number): string => String.fromCodePoint(codePoint);
+  const UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
+  it("escapes every C0 control the way JSON does", () => {
+    const named: Record<number, string> = { 8: "\\b", 9: "\\t", 10: "\\n", 12: "\\f", 13: "\\r" };
+    for (let code = 0; code <= 0x1f; code += 1) {
+      expect(escapeDiagnosticText(`a${char(code)}b`)).toBe(`a${named[code] ?? escapeOf(code)}b`);
+    }
+  });
+
+  it("escapes a double quote and a backslash, so a literal backslash-n stays distinct from a newline", () => {
+    expect(escapeDiagnosticText('a"b\\c')).toBe('a\\"b\\\\c');
+    expect(escapeDiagnosticText("a\\nb")).toBe("a\\\\nb");
+    expect(escapeDiagnosticText(`a${char(10)}b`)).toBe("a\\nb");
+  });
+
+  it("escapes DEL and the C1 range (NEL, CSI), and neither neighbour", () => {
+    for (const code of [0x7f, 0x80, 0x85, 0x9b, 0x9f]) {
+      expect(escapeDiagnosticText(char(code))).toBe(escapeOf(code));
+    }
+    expect(escapeDiagnosticText(char(0x7e))).toBe("~");
+    expect(escapeDiagnosticText(char(0xa0))).toBe(char(0xa0));
+  });
+
+  it("escapes the line and paragraph separators, and neither neighbour", () => {
+    expect(escapeDiagnosticText(char(0x2028))).toBe(u("2028"));
+    expect(escapeDiagnosticText(char(0x2029))).toBe(u("2029"));
+    expect(escapeDiagnosticText(char(0x2027))).toBe(char(0x2027));
+    expect(escapeDiagnosticText(char(0x202f))).toBe(char(0x202f));
+  });
+
+  it("escapes the bidirectional controls (Trojan Source), and not a neighbouring character", () => {
+    const bidi = [
+      0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068,
+      0x2069,
+    ];
+    for (const code of bidi) {
+      expect(escapeDiagnosticText(`x${char(code)}y`)).toBe(`x${escapeOf(code)}y`);
+    }
+    expect(escapeDiagnosticText(char(0x061b))).toBe(char(0x061b));
+  });
+
+  it("escapes zero-width characters, the BOM, and a Unicode Tag as its surrogate pair", () => {
+    for (const code of [0x200b, 0x200d, 0x2060, 0xfeff]) {
+      expect(escapeDiagnosticText(char(code))).toBe(escapeOf(code));
+    }
+    expect(escapeDiagnosticText(char(0xe0041))).toBe(u("db40") + u("dc41"));
+  });
+
+  it("escapes a lone surrogate, and keeps letters, accents and emoji as they are", () => {
+    expect(escapeDiagnosticText(String.fromCharCode(0xd800))).toBe(u("d800"));
+    const text = `GET /caf${char(0xe9)}?q=${char(0x1f600)} ok`;
+    expect(escapeDiagnosticText(text)).toBe(text);
+    expect(escapeDiagnosticText("")).toBe("");
+  });
+
+  it("converts a non-string with String() first", () => {
+    expect(escapeDiagnosticText(404)).toBe("404");
+    expect(escapeDiagnosticText(undefined)).toBe("undefined");
+    expect(escapeDiagnosticText(null)).toBe("null");
+    expect(escapeDiagnosticText(Symbol("s"))).toBe("Symbol(s)");
+    expect(escapeDiagnosticText({ toString: () => `multi${String.fromCharCode(10)}line` })).toBe(
+      "multi\\nline",
+    );
+  });
+
+  it("is lossless and leaves no line break, control, format character or lone surrogate (property)", () => {
+    // Every UTF-16 code unit (lone surrogates included) and every code point.
+    const codeUnit = fc.integer({ min: 0, max: 0xffff }).map((code) => String.fromCharCode(code));
+    fc.assert(
+      fc.property(
+        fc.oneof(fc.string({ unit: codeUnit }), fc.string({ unit: "binary" })),
+        (text) => {
+          const out = escapeDiagnosticText(text);
+          expect(JSON.parse(`"${out}"`)).toBe(text);
+          expect(UNSAFE.test(out)).toBe(false);
+          expect(/[\r\n]/.test(out)).toBe(false);
+          expect(/\p{Cs}/u.test(out)).toBe(false);
+        },
+      ),
+      { numRuns: 1000, seed: 20260928 },
+    );
   });
 });

@@ -578,12 +578,14 @@ const ownContext = (enriched: Record<string, unknown>): Record<string, unknown> 
 };
 
 /**
- * Property names that must NEVER be assigned through `acc[key] = …` when
- * rebuilding a header bag, nor followed or written by a `redactPaths` segment.
- * `__proto__` invokes the prototype setter (mutating the local object's
- * prototype chain). `constructor` / `prototype` are likewise structural fields
- * whose assignment can corrupt instanceof checks. Mirrors the deny-list inside
- * `src/redact.ts` for a single source of truth across the package.
+ * Header names a header bag never keeps, and segments a `redactPaths` entry
+ * never follows or writes. The header rebuilds define their keys
+ * (`Object.fromEntries`), so none of these names can repoint the bag's
+ * prototype (assigning `__proto__` would have run the Annex B accessor); they
+ * are checked against the LOWERCASED name, the key actually written, and left
+ * out so the entry keeps the shape it always had. `constructor` /
+ * `prototype` are structural names on the same footing. Mirrors the deny-list
+ * inside `src/redact.ts` for a single source of truth across the package.
  * `redactEntryPath` spells the same three names as literal comparisons (so
  * static analysis can see the guard); a test keeps that list equal to this Set.
  */
@@ -596,14 +598,16 @@ const applyHeaderMask = (
   if (!maskHeaderKeys || maskHeaderKeys.size === 0) {
     return headers;
   }
-  return Object.entries(headers).reduce<Record<string, unknown>>((acc, [key, val]) => {
+  // Keys are defined, never assigned (see `normalizeHeaders`).
+  const entries: [string, unknown][] = [];
+  for (const [key, val] of Object.entries(headers)) {
     // Skip prototype-pollution vectors. See FORBIDDEN_OBJECT_KEYS docstring.
     if (FORBIDDEN_OBJECT_KEYS.has(key)) {
-      return acc;
+      continue;
     }
-    acc[key] = maskHeaderKeys.has(key.toLowerCase()) ? REDACTED : val;
-    return acc;
-  }, {});
+    entries.push([key, maskHeaderKeys.has(key.toLowerCase()) ? REDACTED : val]);
+  }
+  return Object.fromEntries(entries);
 };
 
 /**
@@ -672,6 +676,19 @@ const ownHeaderValue = (value: unknown): unknown =>
  * Normalizes the header bag for logging. Returns a bag that shares no reference
  * with the caller, one level deep — see {@link ownHeaderValue} for why the
  * value copy (not just the bag rebuild) is load-bearing.
+ *
+ * Header names are the client's, so every bag here (and in
+ * {@link applyHeaderMask}) is built by DEFINING its keys (`Object.fromEntries`)
+ * rather than assigning them: an assignment to a key the fresh object does not
+ * own consults `Object.prototype`, where an accessor would receive the raw,
+ * not-yet-masked value. The deny-list is applied to the LOWERCASED name, the
+ * key actually written. It used to be applied to the raw name, so a header
+ * named `__PROTO__` (possible only through a request adapter that does not
+ * lowercase names, as Node does) reached `acc["__proto__"] = value` and
+ * repointed the bag's prototype, which made `redactEntryPath` refuse the bag
+ * and silently skip a `redactPaths` header entry when header masking was off;
+ * and `Constructor` threw under a frozen `Object.prototype`, which dropped the
+ * whole request entry.
  */
 const normalizeHeaders = (
   headers: Record<string, unknown> | undefined,
@@ -694,19 +711,21 @@ const normalizeHeaders = (
     return allowEmpty ? {} : undefined;
   }
 
-  const normalized = Object.entries(headers).reduce<Record<string, unknown>>((acc, [key, val]) => {
-    // Skip prototype-pollution vectors before normalizing the key. See
-    // FORBIDDEN_OBJECT_KEYS docstring.
-    if (FORBIDDEN_OBJECT_KEYS.has(key)) {
-      return acc;
+  const pairs: [string, unknown][] = [];
+  for (const [key, val] of Object.entries(headers)) {
+    const lowerKey = key.toLowerCase();
+    // Skip prototype-pollution vectors, judged on the name actually written.
+    // See FORBIDDEN_OBJECT_KEYS docstring.
+    if (FORBIDDEN_OBJECT_KEYS.has(lowerKey)) {
+      continue;
     }
     // Own the VALUE, not just the key. This single site covers both the
     // `include === true` path and the allow-list path below, because the latter
     // reads out of `normalized`. `applyHeaderMask` deliberately does NOT repeat
     // the copy — it consumes `normalized`, whose values are already owned.
-    acc[key.toLowerCase()] = ownHeaderValue(val);
-    return acc;
-  }, {});
+    pairs.push([lowerKey, ownHeaderValue(val)]);
+  }
+  const normalized: Record<string, unknown> = Object.fromEntries(pairs);
 
   if (include === true) {
     const masked = applyHeaderMask(normalized, maskHeaderKeys);
@@ -717,11 +736,12 @@ const normalizeHeaders = (
   // were filtered out by `if (!include)` above and `true` returned by the
   // previous block. The static branch `Array.isArray(include) ? … : []` was
   // dead code and has been removed for honest coverage.
-  const filtered = include.reduce<Record<string, unknown>>((acc, key) => {
+  const picked: [string, unknown][] = [];
+  for (const key of include) {
     const normalizedKey = key.toLowerCase();
     // Skip prototype-pollution vectors. See FORBIDDEN_OBJECT_KEYS docstring.
     if (FORBIDDEN_OBJECT_KEYS.has(normalizedKey)) {
-      return acc;
+      continue;
     }
     // Own keys only: `normalized` is an ordinary object, so a plain read of a
     // header the request did not send would return whatever an inherited
@@ -731,10 +751,10 @@ const normalizeHeaders = (
       Object.prototype.hasOwnProperty.call(normalized, normalizedKey) &&
       normalized[normalizedKey] !== undefined
     ) {
-      acc[normalizedKey] = normalized[normalizedKey];
+      picked.push([normalizedKey, normalized[normalizedKey]]);
     }
-    return acc;
-  }, {});
+  }
+  const filtered: Record<string, unknown> = Object.fromEntries(picked);
 
   return ensureReturn(applyHeaderMask(filtered, maskHeaderKeys));
 };
@@ -826,7 +846,8 @@ const redactUrlQuery = (url: string, maskQueryKeys: ReadonlySet<string> | undefi
 
 /**
  * Resolves the URL for `finalize()`'s error-path fallback message, with query
- * secrets masked exactly as the happy path masks them.
+ * secrets masked exactly as the happy path masks them. The message escapes
+ * the URL, like the method and the reason, with {@link escapeDiagnosticText}.
  *
  * Two properties are load-bearing:
  *
@@ -874,6 +895,50 @@ const safeRedactedUrl = (
     return "";
   }
 };
+
+/**
+ * Characters `JSON.stringify` leaves as they are but a terminal or log viewer
+ * still acts on: every Unicode control (`Cc`: DEL and the C1 range, which
+ * includes NEL, a line break, and CSI, an 8-bit escape introducer; the C0 range
+ * is already escaped by `JSON.stringify`), every format character (`Cf`: the
+ * bidirectional overrides and isolates that reorder how a line reads, the
+ * zero-width characters, the BOM and the Unicode Tags), and the line and
+ * paragraph separators (`Zl`, `Zp`).
+ */
+const DIAGNOSTIC_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+
+/**
+ * Renders a caller-influenced value for the one-line diagnostic `finalize()`
+ * writes to `console.error` when logging a request fails, so the value can
+ * neither split that line nor forge another one (CodeQL `js/log-injection`,
+ * CWE-117). The request method, URL and error message are all caller- or
+ * client-controlled there: an adapter, or an application that rewrites
+ * `req.url`, can hand over a CR / LF that Node's own parser would reject, and
+ * an ESC would reach the operator's terminal as a control sequence.
+ *
+ * - `String(value)` first: an exotic request adapter or a custom `Error` can
+ *   supply a non-string (`JSON.stringify(404).slice(1, -1)` would print
+ *   `0`, and `undefined` would throw); a value whose conversion throws still
+ *   reaches `finalize()`'s last-resort line.
+ * - `JSON.stringify` (without its quotes) escapes every C0 control (`\r`,
+ *   `\n`, ESC), `"`, `\` and any lone surrogate. Escaping the backslash is
+ *   what keeps the result unambiguous: a literal backslash-n in the input
+ *   prints as `\\n`, never as an escaped newline.
+ * - {@link DIAGNOSTIC_UNSAFE} characters are then written as `\u` escapes,
+ *   one per UTF-16 unit.
+ *
+ * Lossless: `JSON.parse('"' + result + '"')` returns `String(value)`. An
+ * ordinary method, URL or message prints exactly as it is.
+ */
+const escapeDiagnosticText = (value: unknown): string =>
+  JSON.stringify(String(value))
+    .slice(1, -1)
+    .replace(DIAGNOSTIC_UNSAFE, (unsafe) =>
+      Array.from(
+        { length: unsafe.length },
+        (_, index) => `\\u${unsafe.charCodeAt(index).toString(16).padStart(4, "0")}`,
+      ).join(""),
+    );
 
 /**
  * The entry fields a multi-segment `redactPaths` entry may descend into: the
@@ -1450,8 +1515,10 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
           // a hostile url getter still leaves the method and reason reportable.
           const reqUrl = safeRedactedUrl(req, queryMaskSet);
           const reason = err instanceof Error ? err.message : String(err);
+          // All three values are caller- or client-controlled, so each is
+          // escaped: none can split this line or forge another.
           console.error(
-            `@hiprax/logger request logger failed while logging ${method} ${reqUrl}: ${reason}`,
+            `@hiprax/logger request logger failed while logging ${escapeDiagnosticText(method)} ${escapeDiagnosticText(reqUrl)}: ${escapeDiagnosticText(reason)}`,
           );
         } catch {
           console.error("@hiprax/logger request logger failed, and so did reporting the failure.");
@@ -1483,6 +1550,7 @@ export const __requestInternals = {
   buildTruncatedEnvelope,
   redactUrlQuery,
   safeRedactedUrl,
+  escapeDiagnosticText,
   redactEntryPath,
   resolveMaskKeys,
   resolveMaskHeaderKeys,
