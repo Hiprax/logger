@@ -9,24 +9,26 @@ export type LogLevel = "error" | "warn" | "info" | "http" | "verbose" | "debug" 
  * fields), Fastify, Koa, and any other adapter that exposes the same surface.
  *
  * Consumers do NOT need `express` (or `@types/express`) installed to import
- * this type. Express's `Request` is a structural superset, so casting an
- * Express `Request` to `LoggableRequest` is a zero-cost type widening.
+ * this type. Express's `Request` is a structural superset, so an Express
+ * `Request` (or a Node `IncomingMessage`) is assignable to `LoggableRequest`
+ * with no cast. Every optional data property accepts an explicit `undefined`, so
+ * this also holds under `exactOptionalPropertyTypes`.
  */
 export interface LoggableRequest {
   /** HTTP method, e.g. `"GET"`, `"POST"`. */
-  method?: string;
+  method?: string | undefined;
   /** Request URL as received by the server (may include query string). */
-  url?: string;
+  url?: string | undefined;
   /** Express-style normalized URL; preferred over `url` when present. */
-  originalUrl?: string;
+  originalUrl?: string | undefined;
   /** Request headers, lowercased keys per Node convention. */
   headers: Record<string, string | string[] | undefined>;
   /** Parsed body (set by upstream body-parser middleware). */
   body?: unknown;
   /** Express-resolved client IP, when available. */
-  ip?: string;
+  ip?: string | undefined;
   /** Underlying socket, used as a fallback source for the client IP. */
-  socket?: { remoteAddress?: string };
+  socket?: { remoteAddress?: string | undefined } | undefined;
   /** Express-style header lookup helper; checked before falling back to `headers`. */
   get?(name: string): string | undefined;
   /**
@@ -34,7 +36,7 @@ export interface LoggableRequest {
    * consumed. Exposed by Node's `IncomingMessage` and Express's `Request`,
    * but optional on adapters that do not surface it.
    */
-  aborted?: boolean;
+  aborted?: boolean | undefined;
 }
 
 /**
@@ -58,9 +60,9 @@ export interface LoggableResponse {
   /** Removes a previously-attached listener. */
   removeListener(event: string, listener: (...args: any[]) => void): unknown;
   /** True once the response body has been fully written. */
-  writableEnded?: boolean;
+  writableEnded?: boolean | undefined;
   /** True once the underlying socket has been destroyed. */
-  destroyed?: boolean;
+  destroyed?: boolean | undefined;
 }
 
 /**
@@ -73,7 +75,8 @@ export type LoggableNext = (err?: unknown) => void;
  * Framework-agnostic middleware signature returned by `createRequestLogger()`.
  * Compatible with Express `RequestHandler` (Express's req/res are structural
  * supersets of `LoggableRequest`/`LoggableResponse`), so consumers using
- * Express can mount the returned function directly without casts.
+ * Express, or a raw `node:http` server, can mount the returned function
+ * directly without casts, with or without `exactOptionalPropertyTypes`.
  */
 export type LoggableMiddleware = (
   req: LoggableRequest,
@@ -102,7 +105,7 @@ export interface RotationStrategy {
    *
    * Invalid values throw `LoggerOptionError({ code: "INVALID_ROTATION" })`.
    */
-  maxSize?: string;
+  maxSize?: string | undefined;
   /**
    * Maximum number of files to keep. Validated synchronously by
    * `createLogger()` against the contract enforced by
@@ -123,23 +126,23 @@ export interface RotationStrategy {
    *
    * Invalid values throw `LoggerOptionError({ code: "INVALID_ROTATION" })`.
    */
-  maxFiles?: string;
+  maxFiles?: string | undefined;
   /**
    * Pattern used to name rotated files. Defaults to YYYY-MM-DD.
    */
-  datePattern?: string;
+  datePattern?: string | undefined;
   /**
    * Whether rotated files should be zipped.
    */
-  zippedArchive?: boolean;
+  zippedArchive?: boolean | undefined;
 }
 
 export interface LoggerOptions {
-  moduleName?: string;
+  moduleName?: string | undefined;
   /**
    * Directory to store log files. Created automatically when missing.
    */
-  logDirectory?: string;
+  logDirectory?: string | undefined;
   /**
    * Initial level of the logger, which its built-in transports follow unless
    * `consoleLevel` pins the console. Defaults to `"info"`.
@@ -153,17 +156,20 @@ export interface LoggerOptions {
    * ```
    *
    * **Default behavior:** the default `"info"` level swallows `http`,
-   * `verbose`, `debug`, and `silly` calls — they are silently dropped and
-   * never reach any transport. To see HTTP request/response logs from
-   * `createRequestLogger`, set this option to `"http"` (or lower-severity)
-   * on the underlying logger.
+   * `verbose`, `debug`, and `silly` calls: they are silently dropped and
+   * never reach any transport. `createRequestLogger` is not affected: it logs
+   * each request at `info`, `warn` or `error` (by status code), which the
+   * default level already writes. The `"http"` level matters only if you set
+   * the middleware's own `level` option to `"http"`; the logger's level must
+   * then be `"http"` or more verbose.
    *
    * Common choices:
-   * - `"error"` — production-critical only.
-   * - `"warn"` — production with degraded-state visibility.
-   * - `"info"` — default; standard production verbosity.
-   * - `"http"` — include HTTP request/response logs from the middleware.
-   * - `"debug"` / `"silly"` — development / deep diagnostics only.
+   * - `"error"`: production-critical only.
+   * - `"warn"`: production with degraded-state visibility.
+   * - `"info"`: default; standard production verbosity, request logs included.
+   * - `"http"`: also writes entries logged at `http` (for example by a
+   *   middleware whose `level` option is `"http"`).
+   * - `"debug"` / `"silly"`: development / deep diagnostics only.
    *
    * **Runtime changes:** this is the logger's initial level. Assigning
    * `logger.level = "debug"` later takes effect on the console (unless
@@ -190,7 +196,7 @@ export interface LoggerOptions {
    * Validate a level read from configuration before assigning it. To silence
    * a logger, set `logger.silent = true` instead.
    */
-  level?: LogLevel;
+  level?: LogLevel | undefined;
   /**
    * Logging level used specifically for the console transport. Same
    * npm-level semantics as `level`; see that option's docs for the full
@@ -204,11 +210,11 @@ export interface LoggerOptions {
    * second `createLogger()` call for a cached logger is reported by the
    * conflict warning as `consoleLevelPinned`.
    */
-  consoleLevel?: LogLevel;
+  consoleLevel?: LogLevel | undefined;
   /**
    * Enables or disables the console transport.
    */
-  includeConsole?: boolean;
+  includeConsole?: boolean | undefined;
   /**
    * Enables or disables the module specific rotating file transport. When
    * `includeGlobalFile` is on and the module files are the global files (the
@@ -216,11 +222,11 @@ export interface LoggerOptions {
    * {@link LoggerOptions.globalModuleName}), no separate transport is built:
    * they are written once, through the shared global transport.
    */
-  includeFile?: boolean;
+  includeFile?: boolean | undefined;
   /**
    * Enables or disables the shared/global rotating file transport.
    */
-  includeGlobalFile?: boolean;
+  includeGlobalFile?: boolean | undefined;
   /**
    * Name used for the aggregated log file. With `includeGlobalFile` on, a
    * logger whose `moduleName` resolves to the same path writes it once, through the shared transport and with its
@@ -231,19 +237,19 @@ export interface LoggerOptions {
    * `createLogger()` warns once per path; the two keep separate rotators, so
    * give them distinct names.
    */
-  globalModuleName?: string;
+  globalModuleName?: string | undefined;
   /**
    * Additional IANA timezones to render alongside UTC in the log output.
    */
-  extraTimezones?: string | string[];
+  extraTimezones?: string | string[] | undefined;
   /**
    * Rotation tuning for the module specific transport.
    */
-  rotation?: RotationStrategy;
+  rotation?: RotationStrategy | undefined;
   /**
    * Rotation tuning for the global transport. Falls back to `rotation` when omitted.
    */
-  globalRotation?: RotationStrategy;
+  globalRotation?: RotationStrategy | undefined;
   /**
    * Provides custom Winston transports that will be appended to the logger.
    *
@@ -253,7 +259,7 @@ export interface LoggerOptions {
    * Winston-compatible transport (must expose `log` and `on` methods); invalid
    * entries cause `createLogger()` to throw a `TypeError` synchronously.
    */
-  additionalTransports?: winston.transport[];
+  additionalTransports?: winston.transport[] | undefined;
   /**
    * Optional callback invoked when any built-in or additional transport emits
    * an `error` event (filesystem failures, rotation errors, EACCES, ENOSPC,
@@ -269,7 +275,7 @@ export interface LoggerOptions {
    * error messages are deduplicated to prevent log floods (up to 10 unique
    * messages tracked per logger).
    */
-  onTransportError?: (err: Error, transport: winston.transport) => void;
+  onTransportError?: ((err: Error, transport: winston.transport) => void) | undefined;
   /**
    * Optional clock injection point used by the timestamp formatter. When
    * provided, the formatter calls `clock()` every time a log entry is captured
@@ -284,7 +290,7 @@ export interface LoggerOptions {
    * Primarily intended for deterministic tests; production code should leave
    * this option unset.
    */
-  clock?: () => Date;
+  clock?: (() => Date) | undefined;
   /**
    * Whether this logger participates in process-wide crash capture so an
    * `uncaughtException` or `unhandledRejection` is recorded into the log output
@@ -301,14 +307,26 @@ export interface LoggerOptions {
    * `MaxListenersExceededWarning` once it passed ~10 modules.)
    *
    * When a fatal event fires it is logged **once**, through a single elected
-   * logger (the first capture-enabled logger still registered). The crash is
-   * written to all of that logger's transports (console + files + any
-   * additional transports). Other loggers do not each re-log the same crash.
-   * `captureUncaught: false` opts a logger out of registration entirely.
+   * logger: the first still-registered logger that writes to a file, falling
+   * back to the first with any transport. The crash is written to all of that
+   * logger's transports (console + files + any additional transports). Other
+   * loggers do not each re-log the same crash. Under
+   * `node --unhandled-rejections=strict`, where Node reports one rejection
+   * through both events, it is still recorded once, as the uncaught exception
+   * Node raises for it (a rejection whose value is not an `Error` is then known
+   * only through Node's wrapper error, whose message holds a string of the
+   * value, so reject with `Error`s to keep the details). `captureUncaught:
+   * false` opts a logger out of registration entirely.
+   *
+   * **Process-wide by default.** The first capture-enabled logger installs the
+   * two listeners, including the logger `createRequestLogger()` creates when no
+   * `logger` is passed. A library should pass `captureUncaught: false` (or
+   * accept a logger from its caller and default to `createNoopLogger()`), so it
+   * never takes over the host application's crash handling.
    *
    * See {@link exitOnUncaught} for what happens to the process afterward.
    */
-  captureUncaught?: boolean;
+  captureUncaught?: boolean | undefined;
   /**
    * Whether capturing a fatal event (`uncaughtException` / `unhandledRejection`)
    * should terminate the process with exit code `1` after the crash has been
@@ -334,8 +352,25 @@ export interface LoggerOptions {
    * "keep the whole process alive".
    *
    * This option governs BOTH `uncaughtException` and `unhandledRejection`.
+   *
+   * **With your own crash handlers.** Process listeners run in registration
+   * order. After recording the crash, the logger flushes for up to 3 seconds
+   * and then calls `process.exit(1)`, which cuts short any asynchronous work
+   * your own `uncaughtException` / `unhandledRejection` handler (or an error
+   * reporter's) has started. To let your handler decide when to exit, set
+   * `exitOnUncaught: false` (on any one logger) and exit from your handler.
+   * A handler of yours that rethrows a rejection as an exception can make the
+   * logger record both events.
+   *
+   * **With `--unhandled-rejections`.** Once any listener is installed, Node's
+   * own crash behavior no longer applies, so the logger's decision wins in
+   * every mode: with the default `exitOnUncaught: true` the process exits with
+   * code `1` even under `warn`, `none` or `warn-with-error-code`, where Node
+   * alone would keep running; with `exitOnUncaught: false` it keeps running
+   * even under `throw` (Node's default) or `strict`, where Node alone would
+   * exit.
    */
-  exitOnUncaught?: boolean;
+  exitOnUncaught?: boolean | undefined;
   /**
    * Controls ANSI colorization of the console transport's output. Defaults to
    * `{ level: true, message: true }` — both the `[LEVEL]` token AND the
@@ -359,7 +394,10 @@ export interface LoggerOptions {
    *
    * File transports are NEVER colorized regardless of this option.
    */
-  colorize?: boolean | { message?: boolean; level?: boolean; all?: boolean };
+  colorize?:
+    | boolean
+    | { message?: boolean | undefined; level?: boolean | undefined; all?: boolean | undefined }
+    | undefined;
   /**
    * Keys whose values should be replaced with `"[REDACTED]"` in the
    * serialized log output. Matched **case-insensitively** and applied
@@ -429,7 +467,7 @@ export interface LoggerOptions {
    * a shallow clone that dropped the prototype and could diverge on a `toJSON`
    * subject; that duplicate chain no longer exists.)
    */
-  maskMetaKeys?: string[];
+  maskMetaKeys?: string[] | undefined;
   /**
    * Output format applied to BOTH the file pipeline and the console pipeline.
    * Defaults to `"pretty"` for backward compatibility.
@@ -455,7 +493,7 @@ export interface LoggerOptions {
    * and the console transport. Custom `additionalTransports` receive the SAME
    * formatted payload — a `"json"` logger feeds JSON lines to every entry.
    */
-  format?: "pretty" | "json";
+  format?: "pretty" | "json" | undefined;
   /**
    * When `true`, replaces every `\r` and `\n` character in a string-typed
    * `info.message` — and in a string-typed `info.stack` — with the literal
@@ -506,7 +544,7 @@ export interface LoggerOptions {
    * opt-in so existing log-parsing pipelines that expect raw multi-line
    * messages continue to work unchanged.
    */
-  escapeMessageNewlines?: boolean;
+  escapeMessageNewlines?: boolean | undefined;
 }
 
 export interface TimestampContext {
@@ -535,10 +573,10 @@ export interface RequestLogEntry {
    * size, read it from `requestHeaders["content-length"]` (enable
    * `includeRequestHeaders`).
    */
-  contentLength?: number;
-  ip?: string;
-  userAgent?: string;
-  requestId?: string;
+  contentLength?: number | undefined;
+  ip?: string | undefined;
+  userAgent?: string | undefined;
+  requestId?: string | undefined;
   /**
    * Captured request body (after redaction) when `includeRequestBody` is true.
    *
@@ -556,8 +594,8 @@ export interface RequestLogEntry {
    * { redacted: true }`) do not change what gets logged.
    */
   requestBody?: unknown;
-  requestHeaders?: Record<string, unknown>;
-  responseHeaders?: Record<string, unknown>;
+  requestHeaders?: Record<string, unknown> | undefined;
+  responseHeaders?: Record<string, unknown> | undefined;
   /**
    * Whatever {@link RequestLoggerOptions.enrich} returned, as a **fully-owned
    * copy** — never the caller's object by identity. That ownership is what lets
@@ -580,7 +618,7 @@ export interface RequestLogEntry {
    *   `{ _unserializable: true }` rather than sharing the caller's live graph or
    *   letting the failure drop the whole log entry.
    */
-  context?: Record<string, unknown>;
+  context?: Record<string, unknown> | undefined;
   /**
    * Captured value of `res.writableEnded` at finalize time. `true` indicates
    * the response body was fully written before the socket closed; `false`
@@ -592,13 +630,13 @@ export interface RequestLogEntry {
    * `close` event fired AND `responseWritableEnded === false`. A `close` event
    * after a normal `finish` is NOT classified as aborted.
    */
-  responseWritableEnded?: boolean;
+  responseWritableEnded?: boolean | undefined;
   /**
    * Captured value of `res.destroyed` at finalize time. `true` means the
    * underlying socket was destroyed (typically due to a client disconnect or
    * server-initiated reset).
    */
-  responseDestroyed?: boolean;
+  responseDestroyed?: boolean | undefined;
   /**
    * Captured value of `req.aborted` at finalize time when the underlying
    * request adapter exposes it. `true` indicates the client aborted the
@@ -606,22 +644,27 @@ export interface RequestLogEntry {
    * versions and Express `Request` instances expose this property; raw
    * adapters that do not are reported as `undefined`.
    */
-  requestAborted?: boolean;
+  requestAborted?: boolean | undefined;
 }
 
 export interface RequestLoggerOptions {
   /**
-   * Custom logger instance. When omitted a scoped logger will be created automatically.
+   * Custom logger instance. When omitted, a scoped logger is created once, at
+   * middleware creation: `createLogger({ moduleName: "http" })` (or
+   * `"http/<label>"`) with every other `createLogger` default. That means
+   * rotating files under `<cwd>/logs` and process-wide crash capture that
+   * exits with code `1` after a crash (see {@link LoggerOptions.exitOnUncaught}).
+   * Pass your own logger to control those.
    */
-  logger?: winston.Logger;
+  logger?: winston.Logger | undefined;
   /**
    * Overrides the log level or dynamically derives it from the response status code.
    */
-  level?: LogLevel | ((statusCode: number) => LogLevel);
+  level?: LogLevel | ((statusCode: number) => LogLevel) | undefined;
   /**
    * Adds a label to differentiate multiple middleware instances.
    */
-  label?: string;
+  label?: string | undefined;
   /**
    * Customizes the log message string written to the underlying logger. The
    * default builder produces `"METHOD URL STATUS DURATIONms (EVENT)"`.
@@ -633,11 +676,11 @@ export interface RequestLoggerOptions {
    *   intended contract.
    * @returns The message string passed to `logger.log({ message, ... })`.
    */
-  messageBuilder?: (entry: RequestLogEntry) => string;
+  messageBuilder?: ((entry: RequestLogEntry) => string) | undefined;
   /**
    * Provides an escape hatch to skip logging for specific requests.
    */
-  skip?: (req: LoggableRequest, res: LoggableResponse) => boolean;
+  skip?: ((req: LoggableRequest, res: LoggableResponse) => boolean) | undefined;
   /**
    * Injects additional context into the structured payload. A fully-owned copy
    * of the returned object becomes `entry.context` on the resolved
@@ -654,24 +697,61 @@ export interface RequestLoggerOptions {
    * @param durationMs Wall-clock duration in milliseconds since middleware
    *   entry (or since the externally-provided `req[REQUEST_START_SYMBOL]`
    *   when set).
+   *
+   * The context is written only under `info.http`, with
+   * {@link RequestLoggerOptions.includeHttpContext} `true`, or by a custom
+   * {@link RequestLoggerOptions.messageBuilder} that reads the entry. With
+   * neither, `createRequestLogger()` warns once at creation.
    */
-  enrich?: (
-    req: LoggableRequest,
-    res: LoggableResponse,
-    durationMs: number,
-  ) => Record<string, unknown> | null | undefined;
+  enrich?:
+    | ((
+        req: LoggableRequest,
+        res: LoggableResponse,
+        durationMs: number,
+      ) => Record<string, unknown> | null | undefined)
+    | undefined;
   /**
-   * When true, includes request headers. Provide an allow list to control which keys to emit.
+   * When true, captures the request headers; an array is an allow list of
+   * header names to capture. {@link RequestLoggerOptions.maskHeaderKeys} masks
+   * values afterwards.
+   *
+   * What it captures is written only under `info.http`, with
+   * {@link RequestLoggerOptions.includeHttpContext} `true`, or by a custom
+   * {@link RequestLoggerOptions.messageBuilder} that reads the entry. With
+   * neither, `createRequestLogger()` warns once at creation.
    */
-  includeRequestHeaders?: boolean | string[];
+  includeRequestHeaders?: boolean | string[] | undefined;
   /**
-   * When true, includes response headers. Provide an allow list to control which keys to emit.
+   * When true, captures the response headers; an array is an allow list of
+   * header names to capture. {@link RequestLoggerOptions.maskHeaderKeys} masks
+   * values afterwards.
+   *
+   * What it captures is written only under `info.http`, with
+   * {@link RequestLoggerOptions.includeHttpContext} `true`, or by a custom
+   * {@link RequestLoggerOptions.messageBuilder} that reads the entry. With
+   * neither, `createRequestLogger()` warns once at creation.
    */
-  includeResponseHeaders?: boolean | string[];
+  includeResponseHeaders?: boolean | string[] | undefined;
   /**
-   * When true, logs the parsed request body. Provide an allow list of keys to redact everything else.
+   * When true, captures the parsed request body, masked by
+   * {@link RequestLoggerOptions.maskBodyKeys} (safe defaults unless you change
+   * them) and {@link RequestLoggerOptions.redactPaths}, and capped by
+   * {@link RequestLoggerOptions.maxBodyLength}.
+   *
+   * **Mount the middleware after your body parser.** The body is read when the
+   * middleware runs (before `next()`), so a middleware mounted before
+   * `express.json()` always sees `req.body` still unset and logs no body. The
+   * trade-off: a request the parser rejects (malformed JSON, 413 too large, 415
+   * unsupported) never reaches a middleware mounted after it, so it is not
+   * logged here; log those from your error handler. To keep `responseTimeMs`
+   * end-to-end, set `req[REQUEST_START_SYMBOL]` in your first middleware.
+   *
+   * What it captures is written only under `info.http`, with
+   * {@link RequestLoggerOptions.includeHttpContext} `true`, or by a custom
+   * {@link RequestLoggerOptions.messageBuilder} that reads the entry. With
+   * neither, `createRequestLogger()` warns once at creation.
    */
-  includeRequestBody?: boolean;
+  includeRequestBody?: boolean | undefined;
   /**
    * Caps serialized body size to guard against log-flood attacks from huge
    * payloads. Defaults to `3000` (characters).
@@ -682,11 +762,36 @@ export interface RequestLoggerOptions {
    * `RequestLoggerOptionError({ code: "INVALID_BODY_LIMIT" })` synchronously
    * at middleware-creation time.
    */
-  maxBodyLength?: number;
+  maxBodyLength?: number | undefined;
   /**
    * Keys within the request body that should be replaced with `[REDACTED]`.
    * Matched **case-insensitively** and applied **deeply** (including arrays
    * and nested objects).
+   *
+   * **Safe defaults.** When omitted, the body is masked with
+   * `DEFAULT_MASKED_BODY_KEYS` (exported): common credential field names such
+   * as `password`, `token`, `accessToken` / `access_token`, `refreshToken`,
+   * `secret`, `clientSecret`, `apiKey`, `privateKey`, `sessionId`, `otp`,
+   * `cvv` and credential-bearing header names such as `authorization` and
+   * `cookie`. An array REPLACES that list (`["ssn"]` masks only `ssn`); to
+   * extend it, pass `[...DEFAULT_MASKED_BODY_KEYS, "ssn"]`. Pass `false` (or
+   * `[]`) to turn body masking off, which is the 1.2.x behavior. The list is a
+   * floor: key names are matched exactly, so `userPassword` or `pin` are not
+   * covered, and `code` / `key` are deliberately left out (an OAuth
+   * code-exchange or OTP route should add them).
+   *
+   * **A mask changes more than the matched keys.** With any non-empty list
+   * (the default included), the body is walked the masking way even where no
+   * key matches: a nested value's own `toJSON()` is called and its output
+   * masked (as the log serializer would print it), so a body `Error` holding
+   * such a value (an HTTP-client error as its `cause`, for example) is logged
+   * as a plain copy of its fields, where without a mask `info.http.requestBody`
+   * kept your `Error` instance (the serialized line is the same, and your
+   * object is never changed); and a
+   * value whose `toJSON()` throws renders `"[RedactionFailed]"` for that value
+   * alone (without a mask the whole body degraded to its `String()` form). A
+   * body parsed from JSON has none of these values, so for it only the masked
+   * keys differ.
    *
    * **Redaction boundary.** Deep redaction covers plain objects, arrays, the
    * enumerable own fields of class/Error instances, and the output of a
@@ -697,7 +802,7 @@ export interface RequestLoggerOptions {
    * built-in method and are **not** key-redacted — use `redactPaths` or
    * normalize to a plain object for those.
    */
-  maskBodyKeys?: string[];
+  maskBodyKeys?: string[] | false | undefined;
   /**
    * Header names whose values should be replaced with `[REDACTED]` in BOTH
    * request and response headers. Matched case-insensitively, applied AFTER
@@ -708,7 +813,7 @@ export interface RequestLoggerOptions {
    * common secret-in-header leaks). Pass `false` to opt out entirely and
    * surface raw header values; pass an explicit array to override the list.
    */
-  maskHeaderKeys?: string[] | false;
+  maskHeaderKeys?: string[] | false | undefined;
   /**
    * Query-string parameter names whose values should be replaced with
    * `[REDACTED]` in the logged `req.url` / `req.originalUrl`. Matched
@@ -724,7 +829,7 @@ export interface RequestLoggerOptions {
    * entirely and surface raw query strings; pass an explicit array to
    * override the list.
    */
-  maskQueryKeys?: string[] | false;
+  maskQueryKeys?: string[] | false | undefined;
   /**
    * Dot-notation paths into the resolved {@link RequestLogEntry} whose values
    * should be surgically replaced with `[REDACTED]`. Useful for masking a
@@ -747,11 +852,11 @@ export interface RequestLoggerOptions {
    * `redactPaths` for surgical path-based replacement of such values (e.g.
    * `["body.user.createdAt"]` to blank a `Date` field).
    */
-  redactPaths?: string[];
+  redactPaths?: string[] | undefined;
   /**
    * Hard override that can enable/disable request logging (Option 2).
    */
-  loggingEnabled?: boolean;
+  loggingEnabled?: boolean | undefined;
   /**
    * Environment-aware control that decides when logging should run (Option 1).
    * - `"always"` logs in every environment.
@@ -761,11 +866,19 @@ export interface RequestLoggerOptions {
    * - `"test-only"` auto-matches common test env values (`test`, `testing`, `qa`, `staging`).
    * - Provide a config object for custom environment variable/value matching.
    */
-  loggingMode?: RequestLoggingMode;
+  loggingMode?: RequestLoggingMode | undefined;
   /**
-   * When true, attaches the structured HTTP payload under the `info.http` key.
+   * When true, attaches the structured HTTP payload (the resolved
+   * {@link RequestLogEntry}) under the `info.http` key. This is where
+   * {@link RequestLoggerOptions.includeRequestBody},
+   * {@link RequestLoggerOptions.includeRequestHeaders},
+   * {@link RequestLoggerOptions.includeResponseHeaders} and
+   * {@link RequestLoggerOptions.enrich} are written; without it, only the
+   * message string is logged (the default reads the method, URL, status,
+   * duration and event), unless a custom
+   * {@link RequestLoggerOptions.messageBuilder} reads the entry.
    */
-  includeHttpContext?: boolean;
+  includeHttpContext?: boolean | undefined;
 }
 
 /**
@@ -789,15 +902,15 @@ export interface RequestLoggingEnvironmentConfig {
    * Environment variables to inspect, in priority order.
    * Defaults to `["NODE_ENV", "APP_ENV", "ENV"]`.
    */
-  sources?: string[];
+  sources?: string[] | undefined;
   /**
    * Case-insensitive values that enable logging when matched.
    * Defaults to the same values as `"dev-only"`.
    */
-  allow?: string[];
+  allow?: string[] | undefined;
   /**
    * When `true`, logging remains enabled if no environment sources are found.
    * Defaults to `false`.
    */
-  fallback?: boolean;
+  fallback?: boolean | undefined;
 }

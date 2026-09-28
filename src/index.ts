@@ -8,7 +8,13 @@ export {
   getDefaultRotation,
 } from "./logger";
 export type { ShutdownOptions } from "./logger";
-export { createRequestLogger, REQUEST_START_SYMBOL } from "./request-middleware";
+export {
+  createRequestLogger,
+  REQUEST_START_SYMBOL,
+  DEFAULT_MASKED_BODY_KEYS,
+  DEFAULT_MASKED_HEADER_KEYS,
+  DEFAULT_MASKED_QUERY_KEYS,
+} from "./request-middleware";
 export { InvalidTimezoneError, LoggerOptionError, RequestLoggerOptionError } from "./errors";
 export type { LoggerOptionErrorCode, RequestLoggerOptionErrorCode } from "./errors";
 export type {

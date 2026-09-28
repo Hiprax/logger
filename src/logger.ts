@@ -571,6 +571,36 @@ const effectiveDatePattern = (rotation: RotationStrategy): string =>
   rotation.datePattern ? rotation.datePattern : "YYYY-MM-DD";
 
 /**
+ * `rotation` with every field resolved the way the rotating transport applies
+ * it, in {@link defaultRotation} key order: an omitted or explicitly
+ * `undefined` `maxSize` / `maxFiles` is the default (normalized to lowercase,
+ * as {@link buildRotateTransport} passes it), a falsy `datePattern` is the
+ * default pattern (see {@link effectiveDatePattern}), and a missing
+ * `zippedArchive` is `false`. So an explicit `undefined` (for example
+ * `process.env.LOG_MAX_FILES` with the variable unset) and an omitted field are
+ * the same configuration.
+ *
+ * FOR COMPARISONS ONLY (the options signature, the shared-file
+ * `rotationSignature`, the same-file checks), like `effectiveDatePattern`:
+ * the constructor options come from `buildRotateTransport`, which keeps
+ * `datePattern` and `zippedArchive` verbatim for audit-file stability.
+ *
+ * A `null` rotation (from JavaScript, or configuration parsed from JSON)
+ * passes validation and bypasses the `rotation = defaultRotation` default,
+ * which applies to `undefined` only. The spread in `buildRotateTransport` has
+ * always treated it as omitted, so it resolves to the defaults here too.
+ */
+const resolveRotationFields = (option: RotationStrategy | null | undefined): RotationStrategy => {
+  const rotation = option ?? defaultRotation;
+  return {
+    maxSize: normalizeMaxSize(rotation.maxSize ?? defaultRotation.maxSize),
+    maxFiles: normalizeMaxFiles(rotation.maxFiles ?? defaultRotation.maxFiles),
+    datePattern: effectiveDatePattern(rotation),
+    zippedArchive: rotation.zippedArchive ?? defaultRotation.zippedArchive,
+  };
+};
+
+/**
  * Returns a fresh, **mutable** deep copy of {@link defaultRotation}. Useful
  * for consumers who want to start from the package defaults and then mutate
  * one or two fields without spreading manually:
@@ -2273,11 +2303,20 @@ const buildRotateTransport = (options: {
 }) => {
   const rotation = { ...defaultRotation, ...options.rotation };
 
+  // An explicit `undefined` survives the spread above. For `maxSize` and
+  // `maxFiles` that value disables the documented default outright
+  // (`winston-daily-rotate-file` hands it to `getMaxSize` / `max_logs`: no
+  // size cap, and no audit file, so no file is ever pruned), so both fall back
+  // to the default here. `datePattern` and `zippedArchive` are passed exactly
+  // as given: an explicit `undefined` already behaves as their default, and
+  // the audit file is named from a hash of these constructor options, in which
+  // `undefined` and the default value differ, so filling them in would orphan
+  // the audit file of every existing install that passes them.
   const transport = new DailyRotateFile({
     filename: options.filename,
     datePattern: rotation.datePattern,
-    maxSize: normalizeMaxSize(rotation.maxSize),
-    maxFiles: normalizeMaxFiles(rotation.maxFiles),
+    maxSize: normalizeMaxSize(rotation.maxSize ?? defaultRotation.maxSize),
+    maxFiles: normalizeMaxFiles(rotation.maxFiles ?? defaultRotation.maxFiles),
     zippedArchive: rotation.zippedArchive,
     level: options.level,
   });
@@ -2366,7 +2405,7 @@ const stripWinstonCrashFlags = (transports: readonly winston.transport[]): void 
     console.warn(
       `[@hiprax/logger] An \`additionalTransports\` entry set \`handleExceptions\`/\`handleRejections\`; both were cleared. ` +
         `Leaving them set makes winston install one extra process listener per logger (Node warns past 10) and log every crash twice. ` +
-        `Note this changes where crashes land: they are recorded once, through the elected primary logger (the first capture-enabled logger still registered), ` +
+        `Note this changes where crashes land: they are recorded once, through the elected primary logger (the first still-registered capture-enabled logger that writes to a file, else the first with any transport), ` +
         `so this transport receives them only if it belongs to that logger. ` +
         `If it is a dedicated crash sink, attach it to the primary logger. Use \`captureUncaught: false\` to opt this logger out of crash capture entirely.`,
     );
@@ -2441,6 +2480,13 @@ const attachTransportErrorHandler = (
 /**
  * Creates a fully configured Winston logger with safe defaults, rotating files,
  * UTC timestamps, and optional timezone mirrors.
+ *
+ * **Process-wide effects of the defaults.** The file transports write under
+ * `logs/` in the working directory at import time (`logDirectory`), and
+ * crash capture is on: the first logger installs one `uncaughtException` /
+ * `unhandledRejection` listener pair, and after a crash the process is flushed
+ * and exits with code `1` (`captureUncaught`, `exitOnUncaught`). A library
+ * should accept a logger from its caller instead of creating one here.
  *
  * @example
  * ```ts
@@ -2536,22 +2582,16 @@ export const createLogger = (options: LoggerOptions = {}): winston.Logger => {
   const moduleFilename = buildLogFilePath(resolvedLogDirectory, moduleName);
   const registryKey = buildRegistryKey(moduleFilename);
 
-  // Normalize `maxSize` and `maxFiles` the SAME way `buildRotateTransport` does
-  // before they feed the registry signature below — otherwise two calls that
-  // are functionally identical post-normalization (`"20m"` vs `"20M"`, `"14d"`
-  // vs `"14D"`) would hash to different signatures and trip a false-positive
-  // conflict warning. `resolvedGlobalRotation` also feeds the shared-file
-  // rotation signature (see `acquireSharedGlobalFile` below), so normalizing
-  // here closes the same false positive across loggers sharing the global file.
-  const resolvedRotation: RotationStrategy = { ...defaultRotation, ...rotation };
-  resolvedRotation.maxSize = normalizeMaxSize(resolvedRotation.maxSize);
-  resolvedRotation.maxFiles = normalizeMaxFiles(resolvedRotation.maxFiles);
-  const resolvedGlobalRotation: RotationStrategy = {
-    ...defaultRotation,
-    ...(globalRotation ?? rotation),
-  };
-  resolvedGlobalRotation.maxSize = normalizeMaxSize(resolvedGlobalRotation.maxSize);
-  resolvedGlobalRotation.maxFiles = normalizeMaxFiles(resolvedGlobalRotation.maxFiles);
+  // Resolve every rotation field the SAME way the rotating transport applies it
+  // before they feed the registry signature below. Otherwise two calls that are
+  // functionally identical (`"20m"` vs `"20M"`, `"14d"` vs `"14D"`, an explicit
+  // `undefined` or an empty `datePattern` vs an omitted field) would hash to
+  // different signatures and trip a false-positive conflict warning.
+  // `resolvedGlobalRotation` also feeds the shared-file rotation signature (see
+  // `acquireSharedGlobalFile` below), so resolving here closes the same false
+  // positive across loggers sharing the global file.
+  const resolvedRotation = resolveRotationFields(rotation);
+  const resolvedGlobalRotation = resolveRotationFields(globalRotation ?? rotation);
 
   // Resolve the colorize option to per-flag booleans BEFORE the cache lookup
   // (and the options signature it feeds) so a divergent `colorize` between two
@@ -3497,7 +3537,7 @@ const shutdownPromises = new WeakMap<winston.Logger, Promise<void>>();
 
 export interface ShutdownOptions {
   /** Maximum time (in ms) to wait for every transport to flush. Default 5000. */
-  timeoutMs?: number;
+  timeoutMs?: number | undefined;
 }
 
 /**

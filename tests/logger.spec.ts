@@ -37,7 +37,7 @@ import {
   isErrorLike,
 } from "../src/serialize";
 import { InvalidTimezoneError, LoggerOptionError } from "../src/errors";
-import type { LoggerOptions } from "../src/types";
+import type { LoggerOptions, RotationStrategy } from "../src/types";
 import { captureConsole, createTempDir, teardownLogger } from "./_helpers";
 
 /**
@@ -3840,6 +3840,242 @@ describe("createLogger", () => {
       expect(stub.log).toHaveBeenCalledTimes(2);
       expect((stub.log.mock.calls[0][0] as { crash?: string }).crash).toBe("uncaughtException");
       expect((stub.log.mock.calls[1][0] as { crash?: string }).crash).toBe("unhandledRejection");
+    });
+
+    describe('origin "unhandledRejection": the strict-mode pair and the ES-module entry', () => {
+      // Node passes `origin === "unhandledRejection"` to the uncaughtException
+      // listener in two situations (verified on Node 18, 22 and 24):
+      // - `--unhandled-rejections=strict`: then, because that exception was
+      //   handled, it emits 'unhandledRejection' for the same rejection,
+      //   synchronously. The exception is the reason itself when it is
+      //   error-like, otherwise Node's ERR_UNHANDLED_REJECTION wrapper (whose
+      //   message holds only a string of the reason, such as "#<Object>").
+      // - an error while an ES-module entry point loads (a top-level throw, or a
+      //   rejected top-level await): the error itself, never wrapped, and NO
+      //   paired event.
+      // Either way the exception is recorded AT ONCE, as an uncaughtException,
+      // exactly as 1.2.1 did: every uncaughtException listener runs before Node
+      // emits the pair, so waiting for it would lose the record to a later
+      // handler that shuts the loggers down or exits. Only the paired
+      // 'unhandledRejection' is then skipped. These tests call the real
+      // installed listeners in Node's order. Records are counted with
+      // exitOnUncaught: false, because the exit path ends the transport.
+
+      type UncaughtListener = (err: unknown, origin?: string) => void;
+      type UnhandledListener = (reason: unknown) => void;
+
+      const captureWithListeners = (
+        moduleName: string,
+        overrides: Record<string, unknown> = { exitOnUncaught: false },
+      ): {
+        logger: winston.Logger;
+        stub: StubTransport;
+        uncaught: UncaughtListener;
+        unhandled: UnhandledListener;
+      } => {
+        const beforeUncaught = new Set(process.listeners("uncaughtException"));
+        const beforeUnhandled = new Set(process.listeners("unhandledRejection"));
+        const { logger, stub } = makeCaptureLogger(moduleName, overrides);
+        const uncaught = process
+          .listeners("uncaughtException")
+          .find((listener) => !beforeUncaught.has(listener)) as unknown as UncaughtListener;
+        const unhandled = process
+          .listeners("unhandledRejection")
+          .find((listener) => !beforeUnhandled.has(listener)) as unknown as UnhandledListener;
+        return { logger, stub, uncaught, unhandled };
+      };
+
+      /** The error Node's strict mode raises for a reason that is not error-like. */
+      const nodeWrapper = (reason: unknown): Error =>
+        Object.assign(new Error(`The promise rejected with the reason "${String(reason)}".`), {
+          code: "ERR_UNHANDLED_REJECTION",
+        });
+
+      const records = (stub: StubTransport): { crash?: string; error?: unknown }[] =>
+        stub.log.mock.calls.map((call) => call[0] as { crash?: string; error?: unknown });
+
+      it("records a strict-mode Error rejection once, as the uncaughtException Node raises", async () => {
+        const { stub, uncaught, unhandled } = captureWithListeners("strict-error");
+        const reason = new Error("strict-boom");
+
+        uncaught(reason, "unhandledRejection");
+        unhandled(reason);
+        await flushMicrotasks();
+
+        expect(records(stub).map((record) => [record.crash, record.error])).toEqual([
+          ["uncaughtException", reason],
+        ]);
+      });
+
+      it("records a strict-mode non-Error rejection once, through Node's wrapper", async () => {
+        const { stub, uncaught, unhandled } = captureWithListeners("strict-object");
+        const reason = { status: 502, upstream: "billing" };
+        const wrapper = nodeWrapper(reason);
+
+        uncaught(wrapper, "unhandledRejection");
+        unhandled(reason);
+        await flushMicrotasks();
+
+        // The raw value only arrives with the paired event, after every other
+        // uncaughtException listener; recording waits for nothing.
+        expect(records(stub).map((record) => [record.crash, record.error])).toEqual([
+          ["uncaughtException", wrapper],
+        ]);
+      });
+
+      it("records at once, so a later handler that shuts the logger down right away loses nothing", async () => {
+        const { logger, stub, uncaught, unhandled } = captureWithListeners("strict-shutdown");
+        const reason = new Error("then-shutdown");
+
+        uncaught(reason, "unhandledRejection");
+        // A handler registered after the logger's, in the same event.
+        const shutdown = shutdownLogger(logger);
+        expect(records(stub)).toHaveLength(1);
+        await shutdown;
+        unhandled(reason);
+        await flushMicrotasks();
+
+        expect(records(stub).map((record) => [record.crash, record.error])).toEqual([
+          ["uncaughtException", reason],
+        ]);
+      });
+
+      it("an ES-module entry error (no paired event) is recorded at once, as an uncaughtException", async () => {
+        const { stub, uncaught } = captureWithListeners("esm-entry-error");
+        const topLevel = new Error("top-level-throw");
+
+        uncaught(topLevel, "unhandledRejection");
+        expect(records(stub)).toHaveLength(1);
+        await flushMicrotasks();
+
+        expect(records(stub).map((record) => [record.crash, record.error])).toEqual([
+          ["uncaughtException", topLevel],
+        ]);
+      });
+
+      it("an ES-module entry throwing a non-Error value keeps it, unwrapped", async () => {
+        const { stub, uncaught } = captureWithListeners("esm-entry-string");
+
+        uncaught("a-string" as unknown as Error, "unhandledRejection");
+        await flushMicrotasks();
+
+        expect(records(stub).map((record) => [record.crash, record.error])).toEqual([
+          ["uncaughtException", "a-string"],
+        ]);
+      });
+
+      it("an unrelated rejection right after an origin exception is recorded too", async () => {
+        const { stub, uncaught, unhandled } = captureWithListeners("strict-unrelated");
+        const first = new Error("first-exception");
+        const other = new Error("other-rejection");
+
+        uncaught(first, "unhandledRejection");
+        unhandled(other);
+        await flushMicrotasks();
+
+        expect(records(stub).map((record) => [record.crash, record.error])).toEqual([
+          ["uncaughtException", first],
+          ["unhandledRejection", other],
+        ]);
+      });
+
+      it("a rejection that arrives after the next tick is a new event", async () => {
+        const { stub, uncaught, unhandled } = captureWithListeners("strict-late");
+        const reason = new Error("late-rejection");
+
+        uncaught(reason, "unhandledRejection");
+        await flushMicrotasks();
+        unhandled(reason);
+        await flushMicrotasks();
+
+        expect(records(stub).map((record) => record.crash)).toEqual([
+          "uncaughtException",
+          "unhandledRejection",
+        ]);
+      });
+
+      it("two strict-mode rejections in one pass are recorded once each", async () => {
+        const { stub, uncaught, unhandled } = captureWithListeners("strict-two");
+        const first = new Error("first-strict");
+        const secondReason = { status: 503 };
+        const secondWrapper = nodeWrapper(secondReason);
+
+        // Node processes each rejection fully (exception, then its pair) in turn.
+        uncaught(first, "unhandledRejection");
+        unhandled(first);
+        uncaught(secondWrapper, "unhandledRejection");
+        unhandled(secondReason);
+        await flushMicrotasks();
+
+        expect(records(stub).map((record) => [record.crash, record.error])).toEqual([
+          ["uncaughtException", first],
+          ["uncaughtException", secondWrapper],
+        ]);
+      });
+
+      it("never takes an error whose code getter throws for Node's wrapper, and never throws", async () => {
+        const { stub, uncaught, unhandled } = captureWithListeners("strict-hostile");
+        const hostile = Object.defineProperty(new Error("hostile-code"), "code", {
+          get(): never {
+            throw new Error("code getter refused");
+          },
+        });
+        const other = new Error("other-rejection");
+
+        // A different reason follows, so pairing has to ask whether `hostile` is the wrapper.
+        expect(() => uncaught(hostile, "unhandledRejection")).not.toThrow();
+        expect(() => unhandled(other)).not.toThrow();
+        await flushMicrotasks();
+
+        expect(records(stub).map((record) => [record.crash, record.error])).toEqual([
+          ["uncaughtException", hostile],
+          ["unhandledRejection", other],
+        ]);
+      });
+
+      it("uninstalling forgets a remembered exception, so a reinstalled listener records the next rejection", async () => {
+        const first = captureWithListeners("strict-reinstall-a");
+        const reason = new Error("across-reinstall");
+
+        first.uncaught(reason, "unhandledRejection");
+        // Same tick: every logger goes, the listener pair is uninstalled, and a
+        // new logger installs a fresh pair before the next-tick clear could run.
+        resetLoggerRegistry();
+        const second = captureWithListeners("strict-reinstall-b");
+        second.unhandled(reason);
+        await flushMicrotasks();
+
+        expect(records(second.stub).map((record) => [record.crash, record.error])).toEqual([
+          ["unhandledRejection", reason],
+        ]);
+      });
+
+      it("leaves origin uncaughtException unchanged", async () => {
+        const { stub, uncaught, unhandled } = captureWithListeners("strict-plain");
+        const reason = new Error("plain");
+
+        uncaught(reason, "uncaughtException");
+        unhandled(reason);
+        await flushMicrotasks();
+
+        expect(records(stub).map((record) => record.crash)).toEqual([
+          "uncaughtException",
+          "unhandledRejection",
+        ]);
+      });
+
+      it("exits once, with code 1, after a strict-mode rejection", async () => {
+        const { stub, uncaught, unhandled } = captureWithListeners("strict-exit", {});
+        const reason = new Error("strict-exit");
+
+        uncaught(reason, "unhandledRejection");
+        unhandled(reason);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        expect(records(stub)[0].crash).toBe("uncaughtException");
+        expect(exitFn).toHaveBeenCalledTimes(1);
+        expect(exitFn).toHaveBeenCalledWith(1);
+      });
     });
 
     it("latches so a second fatal during the exit window cannot race a second exit", async () => {
@@ -14934,5 +15170,171 @@ describe("maskMetaKeys masks what a nested value's own toJSON() returns", () => 
       expect(out.fileOut).not.toContain("S-DEEP");
       expect(out.fileOut).not.toContain("S-LEAF");
     });
+  });
+});
+
+describe("an explicit undefined rotation field means the default", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  /** The rotation audit files (`.<hash>-audit.json`) present in `dir`. */
+  const auditFiles = (dir: string): string[] =>
+    fs.readdirSync(dir).filter((name) => /^\..+-audit\.json$/.test(name));
+
+  /** The options a rotating transport was constructed with. */
+  const rotateOptions = (transport: unknown): Record<string, unknown> =>
+    (transport as { options: Record<string, unknown> }).options;
+
+  /**
+   * Builds a reference transport with `options` and closes it. When its audit
+   * file is the one the logger already wrote, the directory still holds exactly
+   * one audit file: the two were constructed with identical options.
+   */
+  const closeReference = async (options: DailyRotateFile.DailyRotateFileTransportOptions) => {
+    const reference = new DailyRotateFile(options);
+    await new Promise<void>((resolve) => {
+      reference.once("finish", () => resolve());
+      reference.close?.();
+    });
+  };
+
+  it("uses the default maxSize and maxFiles for the module file, so retention and the size cap apply", async () => {
+    const root = createTempDir();
+    // For example `maxFiles: process.env.LOG_MAX_FILES` with the variable unset.
+    const logger = createLogger({
+      moduleName: "rot-undef-module",
+      logDirectory: root,
+      includeConsole: false,
+      includeGlobalFile: false,
+      captureUncaught: false,
+      rotation: { maxSize: undefined, maxFiles: undefined },
+    });
+
+    const [transport] = moduleRotatingTransports(logger);
+    expect(rotateOptions(transport).maxSize).toBe("20m");
+    expect(rotateOptions(transport).maxFiles).toBe("14d");
+    // An audit file exists (without maxFiles none is written, so nothing is ever
+    // pruned), and it is the one a logger with the rotation omitted uses.
+    expect(auditFiles(root)).toHaveLength(1);
+    await closeReference({
+      filename: path.join(fs.realpathSync.native(root), "rot-undef-module-%DATE%.log"),
+      datePattern: "YYYY-MM-DD",
+      maxSize: "20m",
+      maxFiles: "14d",
+      zippedArchive: false,
+      level: "info",
+    });
+    await shutdownLogger(logger);
+    expect(auditFiles(root)).toHaveLength(1);
+  });
+
+  it("uses the default maxSize and maxFiles for the shared global file", async () => {
+    const root = createTempDir();
+    const logger = createLogger({
+      moduleName: "rot-undef-global",
+      logDirectory: root,
+      includeConsole: false,
+      includeFile: false,
+      captureUncaught: false,
+      globalRotation: { maxSize: undefined, maxFiles: undefined },
+    });
+
+    const [transport] = sharedGlobalTransports();
+    expect(rotateOptions(transport).maxSize).toBe("20m");
+    expect(rotateOptions(transport).maxFiles).toBe("14d");
+    expect(auditFiles(root)).toHaveLength(1);
+    await closeReference({
+      filename: path.join(fs.realpathSync.native(root), "all-logs-%DATE%.log"),
+      datePattern: "YYYY-MM-DD",
+      maxSize: "20m",
+      maxFiles: "14d",
+      zippedArchive: false,
+      level: "silly",
+    });
+    await shutdownLogger(logger);
+    expect(auditFiles(root)).toHaveLength(1);
+  });
+
+  it("keeps the audit file of an explicit undefined datePattern / zippedArchive, which already behaved as the default", async () => {
+    // Those two reach the constructor exactly as before: an explicit undefined
+    // hashes differently from the default value, so filling them in would orphan
+    // the audit file of every existing install that passes them.
+    const root = createTempDir();
+    const logger = createLogger({
+      moduleName: "rot-undef-pattern",
+      logDirectory: root,
+      includeConsole: false,
+      includeGlobalFile: false,
+      captureUncaught: false,
+      rotation: { datePattern: undefined, zippedArchive: undefined },
+    });
+
+    const [transport] = moduleRotatingTransports(logger);
+    expect(rotateOptions(transport).datePattern).toBeUndefined();
+    expect(rotateOptions(transport).zippedArchive).toBeUndefined();
+    await closeReference({
+      filename: path.join(fs.realpathSync.native(root), "rot-undef-pattern-%DATE%.log"),
+      datePattern: undefined,
+      maxSize: "20m",
+      maxFiles: "14d",
+      zippedArchive: undefined,
+      level: "info",
+    } as unknown as DailyRotateFile.DailyRotateFileTransportOptions);
+    await shutdownLogger(logger);
+    expect(auditFiles(root)).toHaveLength(1);
+  });
+
+  it("a null rotation (JavaScript, or parsed JSON config) behaves like an omitted one, as in 1.2.1", () => {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    const root = createTempDir();
+    const common = {
+      moduleName: "rot-null",
+      logDirectory: root,
+      includeConsole: false,
+      includeGlobalFile: false,
+      captureUncaught: false,
+    };
+
+    const first = createLogger({
+      ...common,
+      rotation: null as unknown as RotationStrategy,
+      globalRotation: null as unknown as RotationStrategy,
+    });
+    const [transport] = moduleRotatingTransports(first);
+    expect(rotateOptions(transport).maxSize).toBe("20m");
+    expect(rotateOptions(transport).maxFiles).toBe("14d");
+    expect(createLogger(common)).toBe(first);
+    expect(warn).not.toHaveBeenCalled();
+    teardownLogger(first);
+  });
+
+  it("an explicit undefined (or an empty datePattern) and an omitted field are the same configuration", () => {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    const root = createTempDir();
+    const common = {
+      moduleName: "rot-undef-signature",
+      logDirectory: root,
+      includeConsole: false,
+      includeFile: false,
+      includeGlobalFile: false,
+      captureUncaught: false,
+    };
+
+    const first = createLogger({
+      ...common,
+      rotation: {
+        maxSize: undefined,
+        maxFiles: undefined,
+        datePattern: "",
+        zippedArchive: undefined,
+      },
+      globalRotation: { maxFiles: undefined },
+    });
+    const second = createLogger(common);
+
+    expect(second).toBe(first);
+    expect(warn).not.toHaveBeenCalled();
   });
 });

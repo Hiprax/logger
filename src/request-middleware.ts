@@ -60,7 +60,8 @@ const validateRequestLevelOption = (value: unknown): void => {
  * @param label  Option name used in the error message (e.g. `"maskBodyKeys"`).
  * @param value  The caller-supplied option value.
  * @param allowFalse  When true, the literal `false` is accepted (used by
- *   `maskHeaderKeys` / `maskQueryKeys` to opt out of safe-defaults masking).
+ *   `maskBodyKeys` / `maskHeaderKeys` / `maskQueryKeys` to opt out of
+ *   safe-defaults masking; `redactPaths` has no default, so no opt-out).
  */
 const validateMaskKeysOption = (label: string, value: unknown, allowFalse: boolean): void => {
   if (value === undefined) {
@@ -107,6 +108,56 @@ const validateMaxBodyLength = (value: unknown): void => {
   }
 };
 
+/**
+ * Whether a header-capture option captures anything: `true`, or an allow list
+ * with at least one name. `normalizeHeaders` returns nothing for `false`,
+ * `undefined` and `[]`.
+ */
+const capturesHeaders = (include: boolean | string[] | undefined): boolean =>
+  include === true || (Array.isArray(include) && include.length > 0);
+
+/**
+ * Warns, once per `createRequestLogger` call, when options capture structured
+ * data that nothing will ever write. The captured body, headers and `enrich()`
+ * context live only on the entry, which reaches the log line under `info.http`
+ * (with `includeHttpContext`) or through a custom `messageBuilder`. The
+ * default message builder reads only the method, URL, status, duration and
+ * event, so with neither of them the options are computed per request and
+ * thrown away: a silent misconfiguration that looks like working body
+ * logging. Called before the `loggingEnabled` / `loggingMode` pass-through,
+ * like option validation, so it surfaces in every environment. The checks
+ * mirror how `createRequestLogger` reads each option (truthiness, and a
+ * `messageBuilder` counts whatever it is), so there are no false positives.
+ */
+const warnIfStructuredOptionsInert = (options: RequestLoggerOptions): void => {
+  if (options.includeHttpContext || options.messageBuilder !== undefined) {
+    return;
+  }
+  const inert: string[] = [];
+  if (options.includeRequestBody) {
+    inert.push("includeRequestBody");
+  }
+  if (capturesHeaders(options.includeRequestHeaders)) {
+    inert.push("includeRequestHeaders");
+  }
+  if (capturesHeaders(options.includeResponseHeaders)) {
+    inert.push("includeResponseHeaders");
+  }
+  if (typeof options.enrich === "function") {
+    inert.push("enrich");
+  }
+  if (inert.length === 0) {
+    return;
+  }
+  const names =
+    inert.length === 1
+      ? `${inert[0]} is set, but nothing writes what it captures.`
+      : `${inert.slice(0, -1).join(", ")} and ${inert[inert.length - 1]} are set, but nothing writes what they capture.`;
+  console.warn(
+    `@hiprax/logger createRequestLogger: ${names} The structured entry is attached only with includeHttpContext: true (under info.http), or read by a custom messageBuilder.`,
+  );
+};
+
 const DEFAULT_BODY_LIMIT = 3000;
 const DEFAULT_ENV_SOURCES = ["NODE_ENV", "APP_ENV", "ENV"];
 const DEFAULT_DEV_VALUES = ["dev", "development", "local"];
@@ -135,22 +186,26 @@ export const REQUEST_START_SYMBOL: unique symbol = Symbol.for("hiprax.request.st
 /**
  * Safe-defaults list of header names whose values are redacted when logging.
  * Opt-out (not opt-in) since these are the most common vectors for leaking
- * secrets via HTTP logs (bearer tokens, session cookies, API keys).
+ * secrets via HTTP logs (bearer tokens, session cookies, API keys). Frozen,
+ * because it is exported: an application extends it by spreading it into its
+ * own `maskHeaderKeys` array, and must not be able to change the default for
+ * every other middleware in the process.
  */
-const DEFAULT_MASKED_HEADER_KEYS: readonly string[] = [
+export const DEFAULT_MASKED_HEADER_KEYS: readonly string[] = Object.freeze([
   "authorization",
   "cookie",
   "set-cookie",
   "x-api-key",
   "proxy-authorization",
-];
+]);
 
 /**
  * Safe-defaults list of query-string parameter names whose values are redacted
  * when logging the request URL. Covers the most common token/key/secret param
- * names used by OAuth callbacks, ad-hoc bearer tokens, and login forms.
+ * names used by OAuth callbacks, ad-hoc bearer tokens, and login forms. Frozen
+ * and exported for the same reason as {@link DEFAULT_MASKED_HEADER_KEYS}.
  */
-const DEFAULT_MASKED_QUERY_KEYS: readonly string[] = [
+export const DEFAULT_MASKED_QUERY_KEYS: readonly string[] = Object.freeze([
   "token",
   "access_token",
   "api_key",
@@ -159,7 +214,92 @@ const DEFAULT_MASKED_QUERY_KEYS: readonly string[] = [
   "code",
   "secret",
   "password",
-];
+]);
+
+/**
+ * Safe-defaults list of request-body keys whose values are redacted when
+ * `includeRequestBody` is on and `maskBodyKeys` is not passed. Frozen and
+ * exported for the same reason as {@link DEFAULT_MASKED_HEADER_KEYS}.
+ *
+ * Every entry names a credential: a password, a secret or private key, an
+ * access / refresh / ID / session token, a session id, a one-time code, a card
+ * security code, or a credential-bearing header echoed inside a body (a
+ * webhook payload, an HTTP-client error's request config). These are the
+ * kinds of data the OWASP Logging Cheat Sheet lists for exclusion from logs
+ * (authentication passwords, session identifiers, access tokens, keys, card
+ * data). Matching is by exact key name, case-insensitively (the list is
+ * lowercase; `accessToken` matches `accesstoken`), so camelCase and
+ * snake_case spellings are both listed. It is a floor, not a guarantee:
+ * `userPassword` or `pin` are not matched, so extend it with
+ * `[...DEFAULT_MASKED_BODY_KEYS, "userPassword"]`.
+ *
+ * `code` and `key` are deliberately left out, unlike in
+ * {@link DEFAULT_MASKED_QUERY_KEYS}: in a JSON body they are usually not
+ * secret (error, country and promo codes; `{ key, value }` pairs), and a
+ * default that masked them would push applications to turn masking off
+ * altogether. An OAuth code-exchange or OTP route should add them.
+ */
+export const DEFAULT_MASKED_BODY_KEYS: readonly string[] = Object.freeze([
+  // Passwords.
+  "password",
+  "passwd",
+  "pwd",
+  "passphrase",
+  "password1",
+  "password2",
+  "newpassword",
+  "new_password",
+  "oldpassword",
+  "old_password",
+  "currentpassword",
+  "current_password",
+  "confirmpassword",
+  "confirm_password",
+  "passwordconfirm",
+  "password_confirm",
+  "passwordconfirmation",
+  "password_confirmation",
+  // Secrets and keys.
+  "secret",
+  "secretkey",
+  "secret_key",
+  "clientsecret",
+  "client_secret",
+  "apikey",
+  "api_key",
+  "privatekey",
+  "private_key",
+  // Tokens.
+  "token",
+  "accesstoken",
+  "access_token",
+  "refreshtoken",
+  "refresh_token",
+  "idtoken",
+  "id_token",
+  "authtoken",
+  "auth_token",
+  "sessiontoken",
+  "session_token",
+  "codeverifier",
+  "code_verifier",
+  // Sessions.
+  "sessionid",
+  "session_id",
+  // Credentials, one-time codes and card security codes. `credential` is the
+  // field Google Identity Services posts its ID token in.
+  "credential",
+  "credentials",
+  "otp",
+  "cvv",
+  "cvc",
+  // Credential-bearing header names found inside bodies.
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "set-cookie",
+  "x-api-key",
+]);
 
 const determineLevel = (statusCode: number): LogLevel => {
   if (statusCode >= 500) {
@@ -885,34 +1025,42 @@ const redactEntryPath = (entry: Record<string, unknown>, path: string): void => 
 };
 
 /**
- * Resolves the `maskHeaderKeys` option (default | array | false) to a
- * lowercased `Set<string>` for fast membership checks, or `undefined` when
- * masking is disabled.
+ * Resolves a mask option with safe defaults (`maskHeaderKeys`,
+ * `maskQueryKeys`, `maskBodyKeys`) to a lowercased `Set<string>` for fast
+ * membership checks: `undefined` means `defaults`, an array replaces them,
+ * and `false` disables masking (`undefined` is returned). An explicit empty
+ * array yields an empty set, which masks nothing.
  */
-const resolveMaskHeaderKeys = (
+const resolveMaskKeys = (
   option: string[] | false | undefined,
+  defaults: readonly string[],
 ): ReadonlySet<string> | undefined => {
   if (option === false) {
     return undefined;
   }
-  const list = option ?? DEFAULT_MASKED_HEADER_KEYS;
+  const list = option ?? defaults;
   return new Set(list.map((key) => key.toLowerCase()));
 };
 
-/**
- * Resolves the `maskQueryKeys` option (default | array | false) to a
- * lowercased `Set<string>` for fast membership checks, or `undefined` when
- * masking is disabled.
- */
+/** Resolves the `maskHeaderKeys` option; see {@link resolveMaskKeys}. */
+const resolveMaskHeaderKeys = (
+  option: string[] | false | undefined,
+): ReadonlySet<string> | undefined => resolveMaskKeys(option, DEFAULT_MASKED_HEADER_KEYS);
+
+/** Resolves the `maskQueryKeys` option; see {@link resolveMaskKeys}. */
 const resolveMaskQueryKeys = (
   option: string[] | false | undefined,
-): ReadonlySet<string> | undefined => {
-  if (option === false) {
-    return undefined;
-  }
-  const list = option ?? DEFAULT_MASKED_QUERY_KEYS;
-  return new Set(list.map((key) => key.toLowerCase()));
-};
+): ReadonlySet<string> | undefined => resolveMaskKeys(option, DEFAULT_MASKED_QUERY_KEYS);
+
+/**
+ * Resolves the `maskBodyKeys` option; see {@link resolveMaskKeys}. For
+ * `false` (`undefined`) and an explicit `[]` (an empty set), `serializeBody`
+ * walks with an empty mask, which is exactly the no-mask path it took before the
+ * default list existed.
+ */
+const resolveMaskBodyKeys = (
+  option: string[] | false | undefined,
+): ReadonlySet<string> | undefined => resolveMaskKeys(option, DEFAULT_MASKED_BODY_KEYS);
 
 const buildDefaultMessage = (entry: RequestLogEntry) => {
   const base = `${entry.method} ${entry.url}`;
@@ -974,9 +1122,11 @@ const shouldLogForEnvironment = (mode: RequestLoggingMode | undefined): boolean 
  * works with Express, raw Node `http`/`https` servers, and any other adapter
  * exposing the {@link LoggableRequest} / {@link LoggableResponse} surface.
  *
- * The returned middleware logs structured request/response payloads using the
- * configured Winston logger (or an auto-created scoped logger when none is
- * provided).
+ * The returned middleware logs one entry per request (at `info`, `warn` or
+ * `error`, by status code) using the configured Winston logger, or an
+ * auto-created scoped logger when none is provided. The structured payload
+ * (body, headers, `enrich()` context) is written under `info.http` only with
+ * `includeHttpContext: true`.
  *
  * @example
  * ```ts
@@ -984,15 +1134,16 @@ const shouldLogForEnvironment = (mode: RequestLoggingMode | undefined): boolean 
  * import { createLogger, createRequestLogger } from "@hiprax/logger";
  *
  * const app = express();
- * const logger = createLogger({ moduleName: "api", level: "http" });
+ * const logger = createLogger({ moduleName: "api" });
  *
+ * // The body parser first: the request body is captured when the logger runs.
+ * app.use(express.json());
  * app.use(
  *   createRequestLogger({
  *     logger,
- *     includeRequestHeaders: true,
- *     includeRequestBody: true,
- *     maskBodyKeys: ["password", "token"],
  *     includeHttpContext: true,
+ *     includeRequestHeaders: ["user-agent", "authorization"], // authorization is masked
+ *     includeRequestBody: true, // credential fields are masked by default
  *   }),
  * );
  *
@@ -1005,11 +1156,12 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
   // BEFORE the `loggingEnabled` / `loggingMode` short-circuit so a misconfigured
   // mask is reported even when the resulting middleware is a pass-through.
   validateRequestLevelOption(options.level);
-  validateMaskKeysOption("maskBodyKeys", options.maskBodyKeys, false);
+  validateMaskKeysOption("maskBodyKeys", options.maskBodyKeys, true);
   validateMaskKeysOption("maskHeaderKeys", options.maskHeaderKeys, true);
   validateMaskKeysOption("maskQueryKeys", options.maskQueryKeys, true);
   validateMaskKeysOption("redactPaths", options.redactPaths, false);
   validateMaxBodyLength(options.maxBodyLength);
+  warnIfStructuredOptionsInert(options);
 
   const { loggingEnabled = true, loggingMode } = options;
   const envAllowsLogging = shouldLogForEnvironment(loggingMode);
@@ -1042,13 +1194,10 @@ export const createRequestLogger = (options: RequestLoggerOptions = {}): Loggabl
   // arrays/sets for every request.
   const headerMaskSet = resolveMaskHeaderKeys(maskHeaderKeys);
   const queryMaskSet = resolveMaskQueryKeys(maskQueryKeys);
-  // Pre-resolve the body mask set alongside headerMaskSet/queryMaskSet.
-  // An undefined or empty maskBodyKeys collapses to undefined so serializeBody
-  // builds an empty Set only on the internal (array-based) test path.
-  const bodyMaskSet: ReadonlySet<string> | undefined =
-    Array.isArray(maskBodyKeys) && maskBodyKeys.length > 0
-      ? new Set(maskBodyKeys.map((key) => key.toLowerCase()))
-      : undefined;
+  // Pre-resolve the body mask set alongside headerMaskSet/queryMaskSet. An
+  // omitted maskBodyKeys means DEFAULT_MASKED_BODY_KEYS; `false` or `[]` mean
+  // no masking.
+  const bodyMaskSet = resolveMaskBodyKeys(maskBodyKeys);
   // The caller's LIVE array, deliberately not a copy: a path an application
   // adds after creating the middleware keeps applying (a copy would silently
   // drop it and log what it was meant to hide). Validation above cannot see a
@@ -1335,8 +1484,10 @@ export const __requestInternals = {
   redactUrlQuery,
   safeRedactedUrl,
   redactEntryPath,
+  resolveMaskKeys,
   resolveMaskHeaderKeys,
   resolveMaskQueryKeys,
+  resolveMaskBodyKeys,
   validateRequestLevelOption,
   validateMaskKeysOption,
   validateMaxBodyLength,
@@ -1344,5 +1495,6 @@ export const __requestInternals = {
   VALID_LOG_LEVELS,
   DEFAULT_MASKED_HEADER_KEYS,
   DEFAULT_MASKED_QUERY_KEYS,
+  DEFAULT_MASKED_BODY_KEYS,
   FORBIDDEN_OBJECT_KEYS,
 };
