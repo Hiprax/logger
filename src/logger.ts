@@ -1084,14 +1084,17 @@ const buildTimestampCapture = (clock: () => Date) =>
  * fresh copy whose `message` / `stack` are own ENUMERABLE); rebuilding a raw
  * `Error` into a plain `{}` would instead drop those non-enumerable slots.
  *
- * Because the rebuild targets a fresh object, own keys named `__proto__` /
- * `constructor` / `prototype` (`FORBIDDEN_KEYS`) are skipped rather than
- * assigned — the same prototype-pollution guard `redactValue` applies to every
- * nested rebuild. This matters specifically BECAUSE we rebuild instead of
- * mutating in place: `next["__proto__"] = …` on a plain `{}` would invoke
- * `Object.prototype`'s `__proto__` setter, silently dropping the key and
- * repointing `next`'s prototype; the old in-place code was immune only because
- * `info` already owned that key.
+ * The rebuild DEFINES its string keys (`Object.fromEntries`), like every
+ * nested rebuild in `redact.ts`, instead of assigning them onto a fresh `{}`.
+ * An assignment to a key the fresh object does not own consults
+ * `Object.prototype`: under a frozen `Object.prototype` a caller key named
+ * after one of its members (`toString`) threw, and since the per-key catch
+ * assigned too, the throw escaped this format and the whole entry degraded to
+ * the `_unserializable` line; an accessor planted there received the value;
+ * and `next["__proto__"] = …` ran the Annex B accessor, dropping the key and
+ * repointing `next`'s prototype. Own keys named `__proto__` / `constructor` /
+ * `prototype` (`FORBIDDEN_KEYS`) are still left out, the same deny-list
+ * `redactValue` applies to every nested rebuild.
  *
  * When `maskMetaKeys` is empty (no redaction configured) the format is a
  * no-op pass-through — winston's pipeline still sees the original `info`
@@ -1307,8 +1310,10 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
       }
     }
 
-    const next: Record<string | symbol, unknown> = {};
     if (resolveFailed) {
+      // Fixed keys only (`level`, `message`, `_redactionFailed`), none of them
+      // an `Object.prototype` member, so plain assignment is safe here.
+      const next: Record<string | symbol, unknown> = {};
       // `level` is winston's own write. `message` is a caller slot, so reading
       // it can in principle re-enter caller code — but a throwing `message`
       // getter is never live by the time this format runs: on the single-object
@@ -1328,19 +1333,18 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
       return next as unknown as winston.Logform.TransformableInfo;
     }
 
+    // The copied keys are collected as pairs and DEFINED on the fresh object
+    // in one step (see the docstring above): no key the caller chose is ever
+    // assigned, so none can reach an `Object.prototype` member.
+    const entries: [string, unknown][] = [];
     for (const key of subjectKeys) {
       if (FORBIDDEN_KEYS.has(key)) {
-        // Prototype-pollution vectors are NEVER copied onto the fresh object —
+        // Prototype-pollution vectors are never copied onto the fresh object,
         // the same deny-list `redactValue` applies to every nested rebuild
-        // (`src/redact.ts`). This is load-bearing precisely BECAUSE we now
-        // rebuild instead of mutating in place: a caller-supplied own key named
-        // `"__proto__"` (trivially reachable via `logger.info(JSON.parse(body))`,
-        // where `JSON.parse` mints a genuine own enumerable `"__proto__"` data
-        // property) would make `next["__proto__"] = …` invoke `Object.prototype`'s
-        // `__proto__` setter on the fresh `{}` — silently dropping the key from
-        // the emitted line AND repointing `next`'s prototype for the rest of the
-        // pipeline. The old mutate-in-place code was immune only because `info`
-        // already OWNED that key (an own data property shadows the accessor).
+        // (`src/redact.ts`). A caller-supplied own key named `"__proto__"` is
+        // trivially reachable (`logger.info(JSON.parse(body))`: `JSON.parse`
+        // mints a genuine own enumerable `"__proto__"` data property); left
+        // in, the emitted line would carry it to every consumer of the log.
         continue;
       }
       // In a `toJSON` OUTPUT (`subject !== source`) a `level` or `timestamp`
@@ -1367,24 +1371,27 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
         // `{ message: payload }`), and a non-string `stack` is caller data too
         // (a real Error's stack is a string), so an object in either is
         // redacted through the same helper the pretty chains use.
+        let copied: unknown;
         try {
           const reserved = subject[key];
-          next[key] =
+          copied =
             key === "message" || key === "stack"
               ? redactMessagePayload(reserved, maskMetaKeys, key)
               : reserved;
         } catch {
-          next[key] = REDACTION_FAILED;
+          copied = REDACTION_FAILED;
         }
+        entries.push([key, copied]);
         continue;
       }
       if (maskMetaKeys.has(key.toLowerCase())) {
         // Written without reading `subject[key]` first: the value is discarded
         // either way, and not reading it means a throwing getter on a MASKED
         // key cannot take the log line down.
-        next[key] = "[REDACTED]";
+        entries.push([key, "[REDACTED]"]);
         continue;
       }
+      let walked: unknown;
       try {
         const child = subject[key];
         if (key === "toJSON" && typeof child === "function") {
@@ -1394,10 +1401,10 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
           // be CALLED, printing what the no-mask line never shows.
           continue;
         }
-        next[key] = redactValue(child, maskMetaKeys as Set<string>, seen, false, 0, key);
+        walked = redactValue(child, maskMetaKeys as Set<string>, seen, false, 0, key);
       } catch {
         // Fail closed on this key only — the rest of the line still renders.
-        next[key] = REDACTION_FAILED;
+        walked = REDACTION_FAILED;
         // Every `redactValue` branch removes its entry in a `finally`, so a
         // throw out of the walk no longer leaves the abandoned subtree's
         // objects recorded as "on the active path". The fresh set is kept as
@@ -1405,7 +1412,12 @@ const buildMetaRedactor = (maskMetaKeys?: ReadonlySet<string>) =>
         // legitimately references one of those objects as "[Circular]".
         seen = new WeakSet<object>();
       }
+      entries.push([key, walked]);
     }
+    // `Object.fromEntries` is typed string-keyed only; the Symbol slots below
+    // are winston's own and are copied onto the result by assignment
+    // (`Object.prototype` has no Symbol-keyed members to collide with).
+    const next = Object.fromEntries(entries) as Record<string | symbol, unknown>;
     // Carry every Symbol-keyed slot across by reference. Winston's engine
     // bookkeeping lives here — `LEVEL` is set by `Logger._transform` BEFORE the
     // format chain runs and is what `winston-transport`'s `_write` gates on,
@@ -1932,6 +1944,18 @@ const buildFailClosedChain = (chain: winston.Logform.Format): winston.Logform.Fo
  * is a payload whose keys or prototype cannot be read at all (a Proxy whose
  * `ownKeys` or `getPrototypeOf` trap throws): {@link buildFailClosedChain}
  * around the whole logger-level chain renders a degraded line for it.
+ *
+ * **It ASSIGNS its keys on purpose**, unlike every other rebuild in the
+ * pipeline, which defines them (`Object.fromEntries`). Its output always feeds
+ * `winston-transport`'s own `Object.assign({}, info)` re-clone, and
+ * `Object.assign` assigns (`Set(…, true)`), so a top-level key the fresh clone
+ * cannot take (one named after a read-only `Object.prototype` member, under a
+ * frozen `Object.prototype`) throws there no matter how this format copies it.
+ * Assigning here makes that throw happen inside the logger-level chain, where
+ * {@link buildFailClosedChain} turns it into the degraded line; a defined copy
+ * would pass the key on, and the re-clone's throw would escape out of
+ * `logger.info()` instead. Pinned by the "degrades the default pretty + console
+ * line for such a top-level key instead of throwing" test.
  */
 const neutralizeCallerAccessors = winston.format((info) => {
   const source = info as unknown as Record<string | symbol, unknown>;

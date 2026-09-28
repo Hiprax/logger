@@ -52,14 +52,16 @@ export const bigintSafeReplacer = (_key: string, value: unknown): unknown =>
   typeof value === "bigint" ? value.toString() : value;
 
 /**
- * Property names that must NEVER be assigned through `acc[key] = …` during a
- * rebuild into a fresh object. `__proto__` triggers the prototype setter
- * (corrupts the local object's prototype chain); `constructor` and `prototype`
- * are likewise structural fields whose assignment can break `instanceof`
- * checks and downstream key enumeration. Centralized here so every rebuild in
- * the package (`redactValue` in `redact.ts`, the per-key rebuilds in
- * `logger.ts`, and `errorToPlain` below) shares a single deny-list;
- * `redact.ts` re-exports it.
+ * Own keys every rebuild into a fresh object leaves out. The rebuilds that
+ * define their keys (object spread, `Object.fromEntries`) cannot have their
+ * prototype repointed by these names; the one rebuild that still assigns on
+ * purpose (`neutralizeCallerAccessors` in `logger.ts`) relies on this skip
+ * for that (assigning `__proto__` runs the Annex B accessor). They are also
+ * left out so the output keeps the shape it always had, and so a consumer that
+ * parses a log line and merges it naively cannot be polluted through it. `constructor` and `prototype` are structural names on
+ * the same footing. Centralized here so every rebuild in the package
+ * (`redactValue` in `redact.ts`, the per-key rebuilds in `logger.ts`, and
+ * `errorToPlain` below) shares a single deny-list; `redact.ts` re-exports it.
  */
 export const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -149,7 +151,11 @@ const OWN_ERROR_SLOTS = ["cause", "errors"] as const;
  * the first slot, and a getter, if any, runs once.
  *
  * Getter-safe and total: every read is guarded, and a throwing accessor
- * (or a Proxy trap) drops ONLY that field. Own keys named in
+ * (or a Proxy trap) drops ONLY that field. The fields are defined, never
+ * assigned (`Object.fromEntries`), so an own key named after an
+ * `Object.prototype` member (`toString`) is copied even when
+ * `Object.prototype` is frozen, where an assignment would throw, and no
+ * accessor on `Object.prototype` ever receives a field. Own keys named in
  * `FORBIDDEN_KEYS` are skipped, so the result is always an
  * `Object.prototype`-prototyped object whose prototype no payload can
  * repoint. Symbol-keyed properties are not included (no serializer emits
@@ -159,7 +165,7 @@ const OWN_ERROR_SLOTS = ["cause", "errors"] as const;
  * the result is never the input.
  */
 export const errorToPlain = (err: object): Record<string, unknown> => {
-  const plain: Record<string, unknown> = {};
+  const entries: [string, unknown][] = [];
   const attempted = new Set<string>();
   const take = (key: string, keepUndefined: boolean): void => {
     if (FORBIDDEN_KEYS.has(key) || attempted.has(key)) {
@@ -170,7 +176,7 @@ export const errorToPlain = (err: object): Record<string, unknown> => {
     if (value === UNREADABLE || (value === undefined && !keepUndefined)) {
       return;
     }
-    plain[key] = value;
+    entries.push([key, value]);
   };
   for (const key of STANDARD_ERROR_FIELDS) {
     take(key, false);
@@ -183,7 +189,7 @@ export const errorToPlain = (err: object): Record<string, unknown> => {
       take(key, true);
     }
   }
-  return plain;
+  return Object.fromEntries(entries);
 };
 
 /**

@@ -184,3 +184,80 @@ export const withEnv = <T>(key: string, value: string | undefined, fn: () => T):
     }
   }
 };
+
+/**
+ * Runs `fn` while `Object.prototype[name]` is a read-only data property, which
+ * is what `Object.freeze(Object.prototype)` (the OWASP prototype-pollution
+ * mitigation) makes every member. For such a property an assignment
+ * (`obj[name] = value`, `[[Set]]`) to an object that does not own `name`
+ * throws in strict mode; defining the property (`Object.fromEntries`,
+ * `Object.defineProperty`) does not. An existing member (`toString`) is made
+ * read-only for the call only; any other name is defined for the call and
+ * removed afterward. `Object.prototype` is always restored before this
+ * returns, so assertions belong after it.
+ */
+export const withReadOnlyPrototypeKey = <T>(name: string, fn: () => T): T => {
+  const original = Object.getOwnPropertyDescriptor(Object.prototype, name);
+  Object.defineProperty(
+    Object.prototype,
+    name,
+    original
+      ? { ...original, writable: false }
+      : { value: "inherited", writable: false, enumerable: false, configurable: true },
+  );
+  try {
+    return fn();
+  } finally {
+    if (original) {
+      Object.defineProperty(Object.prototype, name, original);
+    } else {
+      delete (Object.prototype as Record<string, unknown>)[name];
+    }
+  }
+};
+
+/**
+ * Runs `fn` while `Object.prototype[name]` is an accessor, and returns `fn`'s
+ * result together with every value its setter received. An assignment to an
+ * object that does not own `name` calls that setter instead of creating the
+ * key; defining the property never does. The accessor is removed before this
+ * returns.
+ */
+export const withPrototypeSetter = <T>(
+  name: string,
+  fn: () => T,
+): { result: T; received: unknown[] } => {
+  const received: unknown[] = [];
+  Object.defineProperty(Object.prototype, name, {
+    configurable: true,
+    enumerable: false,
+    get: () => undefined,
+    set: (value: unknown) => {
+      received.push(value);
+    },
+  });
+  try {
+    return { result: fn(), received };
+  } finally {
+    delete (Object.prototype as Record<string, unknown>)[name];
+  }
+};
+
+/**
+ * Defense in depth for tests that change `Object.prototype` (run it in
+ * `afterEach`): deletes the named probe properties and makes `toString` /
+ * `constructor` writable again, in case a failing case left them changed.
+ * With every case passing it does nothing, because {@link withReadOnlyPrototypeKey}
+ * and {@link withPrototypeSetter} already restore the prototype.
+ */
+export const restoreObjectPrototype = (probes: readonly string[]): void => {
+  for (const name of probes) {
+    delete (Object.prototype as Record<string, unknown>)[name];
+  }
+  for (const name of ["toString", "constructor"]) {
+    const descriptor = Object.getOwnPropertyDescriptor(Object.prototype, name);
+    if (descriptor && descriptor.writable === false) {
+      Object.defineProperty(Object.prototype, name, { ...descriptor, writable: true });
+    }
+  }
+};
