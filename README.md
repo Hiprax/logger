@@ -41,11 +41,11 @@ Fully typed, production-grade logging toolkit for Node.js applications. Built on
 
 ## Features
 
-- Multi-target logging (console, per-module files, shared global file, custom transports). Console output is colorized and omits timestamps so only rotating files capture the full timeline.
+- Multi-target logging (console, per-module files, shared global file, custom transports). In the default pretty format, console output is colorized and omits timestamps so only rotating files capture the full timeline; with `format: "json"` the console writes the same JSON line as the files.
 - Daily rotation with independent retention rules for module and global files
 - Guaranteed UTC timestamps plus optional verified IANA timezone mirrors
 - Automatic log directory creation (including nested module scopes like `security/failedLogins`)
-- Batteries-included Express middleware with structured HTTP payloads, body redaction, and header filtering
+- Batteries-included Express middleware with structured HTTP payloads, safe-default masking of credentials in headers, query strings and request bodies, and header filtering
 - Graceful fallback for unknown logger methods (warns once, re-routes to `info()`)
 - Environment-aware request logging with built-in presets (`dev-only`, `prod-only`, `test-only`) and custom rules
 - Optional `format: "json"` (NDJSON) for first-class log shipper support (Datadog, Loki, ELK, Splunk)
@@ -76,6 +76,8 @@ The `exports` map declares **per-condition** type declarations so both module sy
 
 Under `"moduleResolution": "node16"` or `"nodenext"` (the TypeScript settings that mirror Node's real ESM/CJS dual-resolution behavior), `require("@hiprax/logger")` resolves the CommonJS-shaped `dist/index.d.cts` declaration and `import ... from "@hiprax/logger"` resolves the ESM `dist/index.d.ts` declaration — both are emitted by `npm run build`. Previously the package only published a single top-level `types` field pointing at the ESM declaration, which made CJS consumers under `node16`/`nodenext` fail to compile with `TS1479 ("the current file is a CommonJS module... cannot be imported")`. Projects using older `moduleResolution` settings (`"node"`, `"bundler"`) are unaffected — they continue to resolve via the legacy top-level `types` field.
 
+**`exactOptionalPropertyTypes`.** Every optional data property of the public types accepts an explicit `undefined`, so a project compiled with `exactOptionalPropertyTypes: true` can pass a value that may be `undefined` (`createLogger({ logDirectory: process.env.LOG_DIR })`) and mount the middleware on an Express app, an Express `Router` or a raw `node:http` server without a cast. A type-level test compiles these uses with the flag on.
+
 ## Quick Start
 
 ```ts
@@ -86,8 +88,15 @@ const securityLogger = createLogger({
   extraTimezones: ["Europe/London"],
 });
 
-securityLogger.warn(`Failed login attempt\nEmail: ${email}\nIP: ${req.realIp}`);
+// A static message, with the request's values as metadata (see "Printf tokens and metadata" below).
+securityLogger.warn("Failed login attempt", { email, ip: req.ip });
 ```
+
+**Defaults worth knowing before you ship:**
+
+- **A crash exits the process.** The first logger installs process-wide `uncaughtException` / `unhandledRejection` listeners; a crash is logged once, flushed, and then the process exits with code `1`, which is what Node itself does after an uncaught exception. If your application has its own crash handler, or you are writing a library, read [Crash Capture](#crash-capture) first.
+- **Files are written to `logs/`** under the working directory at import time. Pass an absolute `logDirectory`, or turn off `includeFile` / `includeGlobalFile` when a platform collects stdout.
+- **Log metadata is not masked** unless you set `maskMetaKeys`. (`createRequestLogger` is different: it masks common credential fields in request bodies, and credential headers and query parameters, by default.)
 
 CommonJS usage:
 
@@ -107,7 +116,7 @@ Creates a fully configured Winston logger with safe defaults, rotating files, UT
 | `logDirectory`          | `string`                                                           | `<process.cwd()>/logs`           | Target directory (auto-created).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `level`                 | `LogLevel`                                                         | `'info'`                         | Initial logger level. The built-in console, module file, and global file follow it, including later `logger.level = ...` changes. See [Log levels](#log-levels) below.                                                                                                                                                                                                                                                                                                                                                                                        |
 | `consoleLevel`          | `LogLevel`                                                         | `level`                          | Console-specific level override. Same hierarchy as `level`. When passed, it pins the console: runtime `logger.level` changes then reach the files but not the console. When omitted, the console follows `logger.level`.                                                                                                                                                                                                                                                                                                                                      |
-| `includeConsole`        | `boolean`                                                          | `true`                           | Enables console logging. Console lines are colorized and omit timestamps.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `includeConsole`        | `boolean`                                                          | `true`                           | Enables console logging. In the pretty format console lines are colorized and omit timestamps; with `format: "json"` the console writes the same JSON line as the files, timestamp included.                                                                                                                                                                                                                                                                                                                                                                  |
 | `includeFile`           | `boolean`                                                          | `true`                           | Enables module-specific rotating file logging. With `includeGlobalFile` on, module files that are the global files (same path and `datePattern`, see `globalModuleName`) are written once, through the shared transport.                                                                                                                                                                                                                                                                                                                                      |
 | `includeGlobalFile`     | `boolean`                                                          | `true`                           | Enables shared rotating file logging.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `globalModuleName`      | `string`                                                           | `'all-logs'`                     | Label for the shared log file. With `includeGlobalFile` on, a logger whose module file resolves to the same path (`moduleName` equal to `globalModuleName`, or two names that sanitize alike) writes it once, with the shared transport's rotation (set by the first logger that opened it); a module `datePattern` that differs from it names different files, so both are kept. When one logger's private module file is another logger's shared global file (same path and `datePattern`), `createLogger()` warns once per path; give them distinct names. |
@@ -305,27 +314,39 @@ The middleware is framework-agnostic — it consumes a request/response pair via
 
 ```ts
 import express from "express";
-import { createRequestLogger } from "@hiprax/logger";
+import { createRequestLogger, DEFAULT_MASKED_BODY_KEYS } from "@hiprax/logger";
 
 const app = express();
+// The body parser first: the request body is captured when the logger runs.
 app.use(express.json());
 
 app.use(
   createRequestLogger({
+    includeHttpContext: true, // writes the structured entry below under info.http
     includeRequestBody: true,
-    includeRequestHeaders: ["authorization"],
+    includeRequestHeaders: ["user-agent", "authorization"], // authorization is masked by default
     includeResponseHeaders: true,
-    maskBodyKeys: ["password", "token"],
+    // The defaults already mask password, token, apiKey, ...; spread them to add your own.
+    maskBodyKeys: [...DEFAULT_MASKED_BODY_KEYS, "ssn"],
     enrich: (req) => ({ tenantId: req.headers["x-tenant-id"] }),
   }),
 );
 ```
 
-When `includeHttpContext` is enabled, the middleware attaches rich structured metadata via `info.http` while emitting a concise human-readable message. It relies on plain Node events (`finish`/`close`) with a guard against double-logging, and does **not** depend on `on-finished`.
+Each request is logged once, with a concise message (`POST /auth/login 201 12.45ms (completed)`). **The structured entry (`RequestLogEntry`) is written only with `includeHttpContext: true`**, under `info.http`: that is where the captured body, headers and `enrich()` context go. Without it, `includeRequestBody`, `includeRequestHeaders`, `includeResponseHeaders` and `enrich` capture data nothing writes (unless a custom `messageBuilder` reads the entry), and `createRequestLogger()` warns once at creation to say so. The middleware relies on plain Node events (`finish`/`close`) with a guard against double-logging, and does **not** depend on `on-finished`.
 
 **HTTP-level visibility:** the middleware emits `info`/`warn`/`error` for normal request/response logs (status-code-driven), so the default logger `level: "info"` is enough to see them. If you customize the `level` option to use winston's `"http"` level (e.g. `level: () => "http"`), the underlying logger's `level` MUST also be `>= "http"` (e.g. `"http"`, `"verbose"`, `"debug"`, `"silly"`) — otherwise the entries are silently dropped per the npm-level hierarchy above. Pass an explicit `logger` option pointed at a `createLogger({ level: "http" })` instance when using `"http"`.
 
-**Mounting position (response-time accuracy):** the middleware captures its start timestamp the moment its `(req, res, next) =>` runs. To make `responseTimeMs` reflect the true end-to-end latency, **mount this middleware first** — before slow body parsers, authentication middleware, rate limiters, etc. If you cannot move it to the top of the stack, set the start timestamp from an earlier instrumentation hook using the exported `REQUEST_START_SYMBOL`:
+**Mounting position.** The middleware does two things when its `(req, res, next) =>` runs: it starts the `responseTimeMs` clock, and (with `includeRequestBody`) it captures `req.body`. It also only logs requests that reach it. So where you mount it is a trade-off:
+
+- **First in the stack:** every request is logged, including the ones a later body parser, authentication or rate limiter rejects, and `responseTimeMs` covers the whole stack. But `req.body` is not parsed yet, so **no request body is logged**:
+
+  ```ts
+  app.use(createRequestLogger({ includeHttpContext: true, includeRequestHeaders: ["user-agent"] }));
+  app.use(express.json()); // after the logger: bodies are parsed too late for it
+  ```
+
+- **After the body parser** (needed for `includeRequestBody`): bodies are logged, but a request the parser rejects (malformed JSON, 413 too large, 415 unsupported) never reaches the middleware and is **not logged by it**, so log those from your error handler. Keep `responseTimeMs` end-to-end by setting the start time in your first middleware with the exported `REQUEST_START_SYMBOL`:
 
 ```ts
 import express from "express";
@@ -339,36 +360,36 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Slow body parser, authentication, etc.
+// The body parser (and anything else slow) before the logger, so the body is parsed when it runs.
 app.use(express.json());
 
 // Logger picks up the start time from the symbol.
-app.use(createRequestLogger({ includeHttpContext: true }));
+app.use(createRequestLogger({ includeHttpContext: true, includeRequestBody: true }));
 ```
 
 The override MUST be a `bigint` produced by `process.hrtime.bigint()`. Any other value (a `number`, a `Date`, etc.) is silently ignored and the middleware falls back to capturing its own start at entry time. (Requires Node 10.7+ for `process.hrtime.bigint()` — well below the package's `engines.node: >=18.0.0` floor.)
 
 **Aborted vs completed classification:** the middleware listens on both `res.once("finish")` and `res.once("close")`. A `close` event is classified as `event === "aborted"` ONLY when `res.writableEnded` is falsy — i.e. the response body was NOT fully written before the socket closed. A `close` after a normal `finish` (HTTP/1 keep-alive socket teardown, HTTP/2 stream end) reports `event === "completed"`. The structured payload also surfaces `responseWritableEnded`, `responseDestroyed`, and `requestAborted` (when available) so downstream consumers can distinguish abort causes.
 
-**Body snapshot timing:** `req.body` is captured at middleware ENTRY time (before `next()` runs). Handler-time mutation of `req.body` (e.g. `req.body = { redacted: true }`) does NOT affect what gets logged. The snapshot is a shallow reference, not a deep clone — handlers that mutate properties INSIDE the body object should redact those keys via `maskBodyKeys` / `redactPaths`. Deep cloning was rejected as a default because (a) it adds non-trivial per-request cost and (b) the common mutation pattern is whole-pointer reassignment, which the shallow reference already isolates against.
+**Body snapshot timing:** `req.body` is captured at middleware ENTRY time (before `next()` runs), which is why the middleware must be mounted after the body parser to log bodies (see Mounting position above). Handler-time mutation of `req.body` (e.g. `req.body = { redacted: true }`) does NOT affect what gets logged. The snapshot is a shallow reference, not a deep clone — handlers that mutate properties INSIDE the body object should redact those keys via `maskBodyKeys` / `redactPaths`. Deep cloning was rejected as a default because (a) it adds non-trivial per-request cost and (b) the common mutation pattern is whole-pointer reassignment, which the shallow reference already isolates against.
 
 | Option                   | Type                                                                     | Default                               | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | ------------------------ | ------------------------------------------------------------------------ | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `logger`                 | `winston.Logger`                                                         | Scoped `http` logger                  | Provide your own logger or use the auto-created scoped one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `logger`                 | `winston.Logger`                                                         | Scoped `http` logger                  | Provide your own logger or use the auto-created one: `createLogger({ moduleName: "http" })` (or `http/<label>`), created once with every other `createLogger` default, so it writes files under `<cwd>/logs` and installs crash capture that exits on a fatal (see [Crash Capture](#crash-capture)). |
 | `level`                  | `LogLevel \| (status: number) => LogLevel`                               | Auto (`info`/`warn`/`error`)          | Override severity. The default maps 5xx to `error`, 4xx to `warn`, rest to `info`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `label`                  | `string`                                                                 | —                                     | Included in the auto-generated logger name (`http/<label>`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `messageBuilder`         | `(entry) => string`                                                      | `"METHOD URL status latency (event)"` | Customize the final message string.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `skip`                   | `(req, res) => boolean`                                                  | —                                     | Return `true` to skip logging for specific requests.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `enrich`                 | `(req, res, durationMs) => Record<string, unknown> \| null \| undefined` | —                                     | Inject extra context (e.g., tenant, user). Attached under `entry.context`. Returning `null` or `undefined` is treated as "no extra context" — `entry.context` is left unset.                                                                                                                                                                                                                                                                                                                                                                              |
-| `includeRequestHeaders`  | `boolean \| string[]`                                                    | `false`                               | `true` for all headers, or an array of allowed header names.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `includeResponseHeaders` | `boolean \| string[]`                                                    | `false`                               | Same as above for response headers.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `includeRequestBody`     | `boolean`                                                                | `false`                               | Logs parsed request body (with redaction support).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `maskBodyKeys`           | `string[]`                                                               | `[]`                                  | Keys replaced with `[REDACTED]`. Applies deeply and case-insensitively, including arrays, the enumerable own fields of class instances, and `Error`s (their own fields, `cause` chain and `AggregateError` members, keeping `name`, `message` and `stack`). A value with its own `toJSON()` (a DTO, an HTTP client error, also inside an error's `cause`) is masked through that method's output; a `toJSON()` returning a string (`Date`, `URL`) and values with no enumerable keys (`Map`, `Set`) pass through unchanged — use `redactPaths` for those. |
+| `enrich`                 | `(req, res, durationMs) => Record<string, unknown> \| null \| undefined` | —                                     | Inject extra context (e.g., tenant, user). Attached under `entry.context`, which is written only with `includeHttpContext` (or read by a custom `messageBuilder`). Returning `null` or `undefined` is treated as "no extra context": `entry.context` is left unset. |
+| `includeRequestHeaders`  | `boolean \| string[]`                                                    | `false`                               | `true` for all headers, or an array of allowed header names. Written only with `includeHttpContext`. |
+| `includeResponseHeaders` | `boolean \| string[]`                                                    | `false`                               | Same as above for response headers. Written only with `includeHttpContext`. |
+| `includeRequestBody`     | `boolean`                                                                | `false`                               | Logs the parsed request body, masked (`maskBodyKeys`, `redactPaths`) and capped (`maxBodyLength`). Captured when the middleware runs, so mount it **after** your body parser (see Mounting position). Written only with `includeHttpContext`. |
+| `maskBodyKeys`           | `string[] \| false`                                                      | safe defaults (see below)             | Body keys replaced with `[REDACTED]`, deeply and case-insensitively. Defaults to the exported `DEFAULT_MASKED_BODY_KEYS` (common credential field names); an array **replaces** the defaults, so extend them with `[...DEFAULT_MASKED_BODY_KEYS, "ssn"]`; `false` (or `[]`) turns body masking off. Applies to arrays, the enumerable own fields of class instances, `Error`s (their own fields, `cause` chain and `AggregateError` members, keeping `name`, `message` and `stack`) and a value's own `toJSON()` output. A `toJSON()` returning a string (`Date`, `URL`) and values with no enumerable keys (`Map`, `Set`) pass through unchanged; use `redactPaths` for those. See [Security Notes](#security-notes) for the list and what a mask changes. |
 | `maskHeaderKeys`         | `string[] \| false`                                                      | safe defaults (see below)             | Header values to redact in BOTH request and response headers (case-insensitive). Pass `false` to opt out.                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `maskQueryKeys`          | `string[] \| false`                                                      | safe defaults (see below)             | Query-string param values to redact in `req.url` / `req.originalUrl` (case-insensitive). Pass `false` to opt out.                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `redactPaths`            | `string[]`                                                               | `[]`                                  | Dot-paths into the resolved entry for surgical redaction (e.g. `["body.user.password"]`). Must be an array of strings; a non-array (e.g. the bare string `"body.password"`) throws `RequestLoggerOptionError({ code: "INVALID_MASK" })`.                                                                                                                                                                                                                                                                                                                  |
 | `maxBodyLength`          | `number`                                                                 | `3000`                                | Caps serialized body size to prevent log floods. String bodies are truncated to exactly `maxBodyLength` characters with a trailing `…`. Object/array bodies whose JSON form exceeds the limit return a structured envelope `{ _truncated: true, _originalLength, _preview }` so the field's shape never flips between an object and a string mid-truncation. Must be a positive number or `Infinity` (unlimited); `NaN`, `0`, negatives, and non-numbers throw `RequestLoggerOptionError({ code: "INVALID_BODY_LIMIT" })`.                                |
-| `includeHttpContext`     | `boolean`                                                                | `false`                               | Attaches the structured `RequestLogEntry` payload under `info.http`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `includeHttpContext`     | `boolean`                                                                | `false`                               | Attaches the structured `RequestLogEntry` payload under `info.http`. This is the only place the body, headers and `enrich()` context are written (besides a custom `messageBuilder`); without it only the message line is logged. |
 | `loggingEnabled`         | `boolean`                                                                | `true`                                | Hard enable/disable switch.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `loggingMode`            | `RequestLoggingMode`                                                     | `'always'`                            | Environment-aware control. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
@@ -665,6 +686,22 @@ createLogger({ moduleName: "auth", captureUncaught: false }); // don't participa
 
 A process has a single lifetime, so the exit decision is a **consensus**: the process exits only when every registered logger allows it. A single `exitOnUncaught: false` on **any** logger therefore keeps the whole process running after a captured fatal, regardless of which logger records the crash or the order the loggers were created in. (The crash is still recorded once, through the elected file-backed logger — recording where a crash lands and deciding whether to exit are independent.) A component that wants no say in process lifetime, and no crash recording either, should use `captureUncaught: false` so it never participates.
 
+#### Your own crash handlers and `--unhandled-rejections`
+
+The listeners are process-wide, so they interact with everything else in your process that handles crashes:
+
+- **The loggers that register.** Every logger created with the default `captureUncaught: true` joins the coordinator, including the logger `createRequestLogger()` creates when you pass no `logger`. A library should not create loggers of its own: accept one from the caller and default to `createNoopLogger()`, or pass `captureUncaught: false`.
+- **Your own `uncaughtException` / `unhandledRejection` handler, or an error reporter's.** Process listeners run in the order they were added. After recording the crash, the logger flushes its transports for up to 3 seconds and calls `process.exit(1)`, which cuts short any asynchronous work your handler started (a report upload, a graceful shutdown). To let your handler decide when to exit, set `exitOnUncaught: false` on any one logger (the consensus above) and exit from your handler once it is done. A handler of yours that rethrows a rejection as an exception can make the logger record both events.
+- **Node's `--unhandled-rejections` flag.** Once any listener is installed, Node no longer crashes on its own, so the logger's decision applies in every mode:
+
+  | Mode                                      | Node alone              | With the logger (`exitOnUncaught: true`)       |
+  | ----------------------------------------- | ----------------------- | --------------------------------------------- |
+  | `throw` (default)                         | exits with code `1`     | recorded once, exits with code `1`            |
+  | `strict`                                  | exits with code `1`     | recorded once (as `uncaughtException`), exits  |
+  | `warn`, `none`, `warn-with-error-code`    | keeps running (the last sets exit code `1` for later) | recorded once, exits with code `1` |
+
+  With `exitOnUncaught: false` the process keeps running in every mode. Under `strict`, Node reports one rejection through both events; the logger records it a single time, immediately, as the uncaught exception Node raises for it, and skips the rejection event that follows. A rejection whose value is not an `Error` is then known only through Node's wrapper error, whose message holds a string of the value (for example `#<Object>`), so reject with `Error`s when you need the details. An error while an ES-module entry point loads is reported the same way by Node and recorded as an `uncaughtException`.
+
 **Custom transports.** The guarantee holds unconditionally, so an `additionalTransports` entry that sets winston's `handleExceptions` / `handleRejections` has both flags cleared (with a one-time warning). Those flags are what make winston install a listener **per logger**, and leaving them set would both re-create the warning above and log every crash twice.
 
 This does change where crashes land, so it is worth stating plainly: because a crash is recorded **once, through the elected logger**, a transport receives crashes only if it belongs to that logger. If you have a dedicated crash sink (Sentry, an HTTP transport) that previously relied on `handleExceptions` to receive crashes from its own module's logger, attach it to the elected logger instead — otherwise it will stop seeing them. To opt a logger out of crash capture entirely, use `captureUncaught: false`.
@@ -675,6 +712,8 @@ This does change where crashes land, so it is worth stating plainly: because a c
 
 ## Log Output Format
 
+For the Quick Start line, `securityLogger.warn("Failed login attempt", { email, ip })`:
+
 **File output** (with timestamps and extra timezones):
 
 ```text
@@ -682,8 +721,10 @@ UTC: 2025-06-15 14:30:22
 Europe/London: 2025-06-15 15:30:22
 [WARN] (security/failedLogins)
 Failed login attempt
-Email: user@example.com
-IP: 192.168.1.1
+{
+  "email": "user@example.com",
+  "ip": "192.168.1.1"
+}
 ```
 
 **Console output** (colorized, no timestamps):
@@ -691,8 +732,10 @@ IP: 192.168.1.1
 ```text
 [WARN] (security/failedLogins)
 Failed login attempt
-Email: user@example.com
-IP: 192.168.1.1
+{
+  "email": "user@example.com",
+  "ip": "192.168.1.1"
+}
 ```
 
 The console line comes from the same formatter as the file line, without the timestamp lines. Colors are added afterwards, to the `[LEVEL]` token and to the rendered message, so a non-string message (an object, an array, a BigInt, `undefined`) shows the same text on the console as in the file.
@@ -853,26 +896,39 @@ npm test
 - `ts-jest` compiles TypeScript on the fly with ESM support.
 - Coverage thresholds are locked at **100%** for branches, functions, lines, and statements — and there are no `c8 ignore` directives in the source tree, so the threshold is honest rather than masked.
 - Tests run in band (`--runInBand`) for deterministic behavior.
+- `tests/consumer-types.spec.ts` compiles type-only consumer fixtures (`tests/fixtures/types/`) with `exactOptionalPropertyTypes` on, so the public types keep working for projects that enable it.
 - The run fails if any test creates, changes or deletes a file inside the repository: a Jest global setup / teardown pair snapshots the tree before and after the run (skipping `.git`, `node_modules`, the coverage and cache directories and top-level dot entries) and lists every changed path. Under `npm run test:watch` the list is printed instead of failing the run.
 
 ## Security Notes
 
 The request middleware ships with **safe defaults** for the most common
-secret-leak vectors. Everything below is opt-out (set the corresponding option
-to `false` if you need raw values for debugging) — it is opt-in only for the
-narrowly scoped `redactPaths` API.
+secret-leak vectors: request bodies (`maskBodyKeys`), headers
+(`maskHeaderKeys`) and URL query strings (`maskQueryKeys`) are masked unless
+you set the option to `false` (for example to see raw values while
+debugging). `redactPaths` is the one opt-in API, because it targets paths you
+name. The logger itself masks nothing by default: set `maskMetaKeys` for your
+own log metadata.
 
 - All filesystem interactions are sandboxed to the configured log directory.
 - Module names are sanitized to prevent path traversal (dangerous characters are replaced with hyphens).
 - Timezones are validated against the Moment timezone database before use.
-- **Body redaction (`maskBodyKeys`)**: opt-in array. Replaces matching keys with `[REDACTED]` recursively in nested objects and arrays, including the enumerable own fields of class instances and the fields of an `Error` (its own fields, its `cause` chain and `AggregateError` members; `name`, `message` and `stack` are kept). Matched case-insensitively. Circular references are safely handled (replaced with `[Circular]`) — only a value that is its own ancestor (a true self-reference or an indirect/mutual cycle) triggers this; the same non-circular object reachable from two different keys, array entries, or nesting depths is fully redacted at every occurrence instead of collapsing after the first. A value with its own `toJSON()` (a DTO, an HTTP client error, also inside an error's `cause`) is masked through that method's output, exactly as the serializer will print it. **Redaction boundary:** masking matches keys, never text, so a `toJSON()` returning a string (`Date`, `URL`) renders unchanged, and values with zero enumerable keys (`Map`, `Set`, `RegExp`) are passed through by the serializer untouched — use `redactPaths` to target those surgically.
-- **Header redaction (`maskHeaderKeys`)**: applied to BOTH request and response headers AFTER the `includeRequestHeaders` / `includeResponseHeaders` allow-list filter. Default mask list (opt-out by passing `false`):
+- **Body redaction (`maskBodyKeys`)**: on by default when `includeRequestBody` is on. The default list, exported as `DEFAULT_MASKED_BODY_KEYS`, names common credential fields, matched exactly and case-insensitively (the list is lowercase, so `accessToken` matches `accesstoken`):
+  - passwords: `password`, `passwd`, `pwd`, `passphrase`, `password1`, `password2`, and the `new` / `old` / `current` / `confirm` / `confirmation` variants in camelCase and snake_case;
+  - secrets and keys: `secret`, `secretKey`, `clientSecret`, `apiKey`, `privateKey` (each also in snake_case);
+  - tokens: `token`, `accessToken`, `refreshToken`, `idToken`, `authToken`, `sessionToken`, `codeVerifier` (each also in snake_case);
+  - sessions, one-time and card codes: `sessionId` / `session_id`, `credential`, `credentials`, `otp`, `cvv`, `cvc`;
+  - credential-bearing header names found inside bodies: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`.
+
+  An array **replaces** the list (`["ssn"]` masks only `ssn`); extend it with `[...DEFAULT_MASKED_BODY_KEYS, "ssn"]`. `false` (or `[]`) turns body masking off. The list is a floor, not a guarantee: `userPassword` or `pin` are not matched, and `code` and `key`, which are in the query-string list, are deliberately not in the body list because in JSON bodies they are usually not secret (error, country and promo codes; `{ key, value }` pairs); add them on an OAuth code-exchange or OTP route. **A mask changes more than the matched keys**: with any non-empty list, the default included, a nested value's own `toJSON()` is called and its output masked, so a body `Error` holding such a value (an HTTP-client error as its `cause`, for example) is logged as a plain copy of its fields instead of as your `Error` instance (the serialized line is the same), and a value whose `toJSON()` throws renders `"[RedactionFailed]"` for that value only. A body parsed from JSON has none of these values, so for it only the masked keys differ.
+
+  The walk replaces matching keys with `[REDACTED]` recursively in nested objects and arrays, including the enumerable own fields of class instances and the fields of an `Error` (its own fields, its `cause` chain and `AggregateError` members; `name`, `message` and `stack` are kept). Matched case-insensitively. Circular references are safely handled (replaced with `[Circular]`) — only a value that is its own ancestor (a true self-reference or an indirect/mutual cycle) triggers this; the same non-circular object reachable from two different keys, array entries, or nesting depths is fully redacted at every occurrence instead of collapsing after the first. A value with its own `toJSON()` (a DTO, an HTTP client error, also inside an error's `cause`) is masked through that method's output, exactly as the serializer will print it. **Redaction boundary:** masking matches keys, never text, so a `toJSON()` returning a string (`Date`, `URL`) renders unchanged, and values with zero enumerable keys (`Map`, `Set`, `RegExp`) are passed through by the serializer untouched — use `redactPaths` to target those surgically.
+- **Header redaction (`maskHeaderKeys`)**: applied to BOTH request and response headers AFTER the `includeRequestHeaders` / `includeResponseHeaders` allow-list filter. Default mask list, exported as `DEFAULT_MASKED_HEADER_KEYS` (an array replaces it, so extend it with `[...DEFAULT_MASKED_HEADER_KEYS, "x-session"]`; opt out by passing `false`):
   - `authorization`
   - `cookie`
   - `set-cookie`
   - `x-api-key`
   - `proxy-authorization`
-- **URL query redaction (`maskQueryKeys`)**: edits the logged `req.originalUrl` / `req.url` query string **in place** — it locates each `key=value` pair in the raw query and replaces only a matched parameter's value with the literal `[REDACTED]`, leaving every other byte untouched. Sibling-parameter encoding (`%20`, `%5B`/`%5D`, `%2B`), the `//host` authority of protocol-relative URLs, the scheme/host of absolute URLs, and the URL fragment are all preserved exactly; parameters are never re-ordered or re-encoded, and the function never throws. Handles both absolute and relative URLs, including a URL whose only `?` appears inside the fragment (e.g. a hash-router path like `"/dash#/r?token=abc"`), which has no real query component and is returned unchanged. Default mask list (opt-out by passing `false`):
+- **URL query redaction (`maskQueryKeys`)**: edits the logged `req.originalUrl` / `req.url` query string **in place** — it locates each `key=value` pair in the raw query and replaces only a matched parameter's value with the literal `[REDACTED]`, leaving every other byte untouched. Sibling-parameter encoding (`%20`, `%5B`/`%5D`, `%2B`), the `//host` authority of protocol-relative URLs, the scheme/host of absolute URLs, and the URL fragment are all preserved exactly; parameters are never re-ordered or re-encoded, and the function never throws. Handles both absolute and relative URLs, including a URL whose only `?` appears inside the fragment (e.g. a hash-router path like `"/dash#/r?token=abc"`), which has no real query component and is returned unchanged. Default mask list, exported as `DEFAULT_MASKED_QUERY_KEYS` (an array replaces it, so extend it with `[...DEFAULT_MASKED_QUERY_KEYS, "sig"]`; opt out by passing `false`):
   - `token`, `access_token`
   - `api_key`, `apikey`, `key`
   - `code` (covers OAuth callback codes)

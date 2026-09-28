@@ -4,6 +4,7 @@ import vm from "node:vm";
 import winston from "winston";
 import {
   createRequestLogger,
+  DEFAULT_MASKED_BODY_KEYS,
   REQUEST_START_SYMBOL,
   __requestInternals,
 } from "../src/request-middleware";
@@ -310,10 +311,14 @@ describe("createRequestLogger", () => {
   it("falls back to string serialization when JSON conversion fails", () => {
     const { logger, log } = createMockLogger();
 
+    // Masking off: the String() fallback is reached only without a mask. With
+    // the default body mask the walk fails this value closed first (pinned in
+    // "default body masking").
     const middleware = createRequestLogger({
       logger,
       includeHttpContext: true,
       includeRequestBody: true,
+      maskBodyKeys: [],
     });
 
     // A throwing `toJSON` is a genuine serialization failure. (A BigInt is NOT
@@ -1013,7 +1018,10 @@ describe("createRequestLogger", () => {
       logger,
       includeHttpContext: true,
       includeRequestBody: true,
+      // Body masking off, so redactPaths alone must hide the field (the default
+      // body mask would hide it anyway and leave this path untested).
       redactPaths: ["body.user.password"],
+      maskBodyKeys: [],
     });
 
     const { res } = runMiddleware(middleware, {
@@ -1113,7 +1121,10 @@ describe("createRequestLogger", () => {
       logger,
       includeHttpContext: true,
       includeRequestBody: true,
+      // Body masking off, so redactPaths alone must hide the field (the default
+      // body mask would hide it anyway and leave this path untested).
       redactPaths: ["requestBody.token"],
+      maskBodyKeys: [],
     });
 
     const { res } = runMiddleware(middleware, {
@@ -1136,7 +1147,10 @@ describe("createRequestLogger", () => {
       logger,
       includeHttpContext: true,
       includeRequestBody: true,
+      // Body masking off, so redactPaths alone must hide the field (the default
+      // body mask would hide it anyway and leave this path untested).
       redactPaths: ["body.password"],
+      maskBodyKeys: [],
     });
 
     const body = { password: "SECRET", filler: "x".repeat(4000) };
@@ -1160,7 +1174,10 @@ describe("createRequestLogger", () => {
       logger,
       includeHttpContext: true,
       includeRequestBody: true,
+      // Body masking off, so redactPaths alone must hide the field (the default
+      // body mask would hide it anyway and leave this path untested).
       redactPaths: ["body.password"],
+      maskBodyKeys: [],
     });
 
     const body = { password: "SECRET", filler: "small" };
@@ -1191,7 +1208,10 @@ describe("createRequestLogger", () => {
       logger,
       includeHttpContext: true,
       includeRequestBody: true,
+      // Body masking off, so redactPaths alone must hide the field (the default
+      // body mask would hide it anyway and leave this path untested).
       redactPaths: ["body.password"],
+      maskBodyKeys: [],
     });
 
     const { res } = runMiddleware(middleware, { body: originalBody });
@@ -1224,7 +1244,10 @@ describe("createRequestLogger", () => {
       logger,
       includeHttpContext: true,
       includeRequestBody: true,
+      // Body masking off, so redactPaths alone must hide the field (the default
+      // body mask would hide it anyway and leave this path untested).
       redactPaths: ["body.password"],
+      maskBodyKeys: [],
     });
 
     const { res } = runMiddleware(middleware, { body: originalBody });
@@ -1234,6 +1257,34 @@ describe("createRequestLogger", () => {
     expect(payload.http.requestBody).toEqual({ username: "alice", password: "[REDACTED]" });
     expect(JSON.stringify(payload.http.requestBody)).not.toContain("REALSECRET");
     // The caller's ORIGINAL instance must be untouched.
+    expect(originalBody.password).toBe("REALSECRET");
+    expect(originalBody.username).toBe("alice");
+  });
+
+  it("with the default body mask, a toJSON-defining class-instance body is masked through its toJSON and left untouched", () => {
+    class SessionDto {
+      public password = "REALSECRET";
+      public username = "alice";
+      toJSON() {
+        return { username: this.username, password: this.password };
+      }
+    }
+    const originalBody = new SessionDto();
+
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+    });
+
+    const { res } = runMiddleware(middleware, { body: originalBody });
+    res.emit("finish");
+
+    const payload = log.mock.calls[0][0];
+    expect(payload.http.requestBody).toEqual({ username: "alice", password: "[REDACTED]" });
+    expect(payload.http.requestBody).not.toBe(originalBody);
+    expect(JSON.stringify(payload.http.requestBody)).not.toContain("REALSECRET");
     expect(originalBody.password).toBe("REALSECRET");
     expect(originalBody.username).toBe("alice");
   });
@@ -2425,6 +2476,8 @@ describe("createRequestLogger", () => {
     const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
     const middleware = createRequestLogger({
       logger,
+      // Not an inert config (no creation warning); enrich throws before it matters.
+      includeHttpContext: true,
       enrich: () => {
         throw new Error("enrich boom");
       },
@@ -2495,6 +2548,8 @@ describe("createRequestLogger", () => {
     const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
     const middleware = createRequestLogger({
       logger,
+      // Not an inert config (no creation warning); enrich throws before it matters.
+      includeHttpContext: true,
       enrich: () => {
         throw new Error("enrich boom fallback");
       },
@@ -2533,6 +2588,8 @@ describe("createRequestLogger", () => {
     const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
     const middleware = createRequestLogger({
       logger,
+      // Not an inert config (no creation warning); enrich throws before it matters.
+      includeHttpContext: true,
       enrich: () => {
         throw new Error("enrich boom");
       },
@@ -2616,6 +2673,8 @@ describe("createRequestLogger", () => {
     const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
     const middleware = createRequestLogger({
       logger,
+      // Not an inert config (no creation warning); enrich throws before it matters.
+      includeHttpContext: true,
       maskQueryKeys: ["sessionid"],
       enrich: () => {
         throw new Error("enrich boom");
@@ -2639,6 +2698,8 @@ describe("createRequestLogger", () => {
     const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
     const middleware = createRequestLogger({
       logger,
+      // Not an inert config (no creation warning); enrich throws before it matters.
+      includeHttpContext: true,
       enrich: () => {
         throw new Error("enrich boom");
       },
@@ -2687,6 +2748,8 @@ describe("createRequestLogger", () => {
     const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
     const middleware = createRequestLogger({
       logger,
+      // Not an inert config (no creation warning); enrich throws before it matters.
+      includeHttpContext: true,
       maskQueryKeys: false,
       enrich: () => {
         throw new Error("enrich boom");
@@ -2716,6 +2779,8 @@ describe("createRequestLogger", () => {
 
     const middleware = createRequestLogger({
       logger,
+      // Not an inert config (no creation warning); enrich throws before it matters.
+      includeHttpContext: true,
       enrich: () => {
         throw hostileError;
       },
@@ -5195,9 +5260,27 @@ describe("nested Errors in the request-log context and body", () => {
         },
       };
 
-      const http = logOnce({ includeRequestBody: true, redactPaths: ["body.err"] }, body);
+      // Masking off, so the redactPaths round-trip is what fails; with the default
+      // body mask the walk fails the body closed first (the next test).
+      const http = logOnce(
+        { includeRequestBody: true, maskBodyKeys: [], redactPaths: ["body.err"] },
+        body,
+      );
 
       expect(http.requestBody).toBe("[UNSERIALIZABLE]");
+    });
+
+    it("with the default body mask, the same body fails closed in the masking walk instead", () => {
+      const body = {
+        err: fixedError("x"),
+        toJSON() {
+          throw new Error("toJSON refused");
+        },
+      };
+
+      const http = logOnce({ includeRequestBody: true, redactPaths: ["body.err"] }, body);
+
+      expect(http.requestBody).toBe("[RedactionFailed]");
     });
 
     it("an Error-free body with a BigInt renders exactly as before", () => {
@@ -5376,14 +5459,467 @@ describe("maskBodyKeys masks what a body value's own toJSON() returns", () => {
     expect(envelope._preview).not.toContain("S-BODY-ERROR-JSON");
   });
 
-  it("without maskBodyKeys the body is unchanged: the toJSON output renders as it did", () => {
+  it("with body masking disabled the body is unchanged: the toJSON output renders as it did", () => {
     const body = bodyWithClientError();
 
-    const http = logOnce({ includeRequestBody: true }, body);
+    const http = logOnce({ includeRequestBody: true, maskBodyKeys: [] }, body);
 
     const rendered = JSON.stringify(http.requestBody, createErrorAwareReplacer());
     expect(rendered).toContain('"authorization":"Bearer S-BODY"');
     // The body's Error holds only primitives beside its cause, so it is shared as is.
     expect((http.requestBody as { err: unknown }).err).toBe(body.err);
+  });
+
+  it("with the default body mask, the client error's authorization header is masked", () => {
+    const body = bodyWithClientError();
+
+    const http = logOnce({ includeRequestBody: true }, body);
+
+    expect((http.requestBody as { err: unknown }).err).toEqual(maskedErr);
+    const rendered = JSON.stringify(http.requestBody, createErrorAwareReplacer());
+    expect(rendered).not.toContain("S-BODY");
+  });
+});
+
+describe("default body masking (maskBodyKeys not passed)", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const STACK = "Error: fixed\n    at fixed (fixed.js:1:1)";
+
+  const logBody = (options: Parameters<typeof createRequestLogger>[0], body: unknown) => {
+    const { logger, log } = createMockLogger();
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      ...options,
+    });
+    const { req, res } = runMiddleware(middleware, { body });
+    res.emit("finish");
+    expect(log).toHaveBeenCalledTimes(1);
+    return { requestBody: log.mock.calls[0][0].http.requestBody as unknown, req };
+  };
+
+  it("masks every default credential key, at any depth and in any letter case", () => {
+    const body: Record<string, unknown> = {
+      email: "user@example.com",
+      code: "PROMO-10",
+      key: "theme",
+      profile: { Password: "nested-secret-1", accessToken: "nested-secret-2", name: "Ada" },
+      items: [{ ApiKey: "nested-secret-3", sku: "A-1" }],
+    };
+    DEFAULT_MASKED_BODY_KEYS.forEach((name, index) => {
+      body[name] = `default-secret-${index}`;
+    });
+    const before = structuredClone(body);
+
+    const { requestBody, req } = logBody({}, body);
+
+    const expected: Record<string, unknown> = {
+      email: "user@example.com",
+      code: "PROMO-10",
+      key: "theme",
+      profile: { Password: "[REDACTED]", accessToken: "[REDACTED]", name: "Ada" },
+      items: [{ ApiKey: "[REDACTED]", sku: "A-1" }],
+    };
+    DEFAULT_MASKED_BODY_KEYS.forEach((name) => {
+      expected[name] = "[REDACTED]";
+    });
+    expect(requestBody).toEqual(expected);
+    // `code` and `key` are deliberately not defaults: routinely non-secret in JSON bodies.
+    expect(JSON.stringify(requestBody)).not.toMatch(/default-secret|nested-secret/);
+    // The caller's body is read, never rewritten.
+    expect(req.body).toBe(body);
+    expect(body).toEqual(before);
+  });
+
+  it("maskBodyKeys: false logs the body verbatim", () => {
+    const body = { email: "user@example.com", password: "topsecret", token: "t-1" };
+
+    const { requestBody } = logBody({ maskBodyKeys: false }, body);
+
+    expect(requestBody).toEqual(body);
+  });
+
+  it("maskBodyKeys: [] logs the body verbatim", () => {
+    const body = { email: "user@example.com", password: "topsecret", token: "t-1" };
+
+    const { requestBody } = logBody({ maskBodyKeys: [] }, body);
+
+    expect(requestBody).toEqual(body);
+  });
+
+  it("an explicit maskBodyKeys list replaces the defaults", () => {
+    const body = { ssn: "078-05-1120", password: "topsecret" };
+
+    const { requestBody } = logBody({ maskBodyKeys: ["ssn"] }, body);
+
+    expect(requestBody).toEqual({ ssn: "[REDACTED]", password: "topsecret" });
+  });
+
+  it("spreading DEFAULT_MASKED_BODY_KEYS extends the defaults", () => {
+    const body = { ssn: "078-05-1120", password: "topsecret", email: "user@example.com" };
+
+    const { requestBody } = logBody({ maskBodyKeys: [...DEFAULT_MASKED_BODY_KEYS, "ssn"] }, body);
+
+    expect(requestBody).toEqual({
+      ssn: "[REDACTED]",
+      password: "[REDACTED]",
+      email: "user@example.com",
+    });
+  });
+
+  it("a default key is already masked inside the _preview of an over-limit body", () => {
+    const body = { password: "OVER-LIMIT-SECRET", filler: "x".repeat(200) };
+
+    const { requestBody } = logBody({ maxBodyLength: 60 }, body);
+
+    const envelope = requestBody as { _truncated: boolean; _preview: string };
+    expect(envelope._truncated).toBe(true);
+    expect(envelope._preview).toContain('"password":"[REDACTED]"');
+    expect(envelope._preview).not.toContain("OVER-LIMIT-SECRET");
+  });
+
+  it("a body value whose toJSON() throws renders [RedactionFailed] for that value only", () => {
+    const throwing = () => ({
+      toJSON(): never {
+        throw new Error("toJSON refused");
+      },
+    });
+    const body = { id: 7, bad: throwing(), items: [throwing(), "ok"] };
+
+    const { requestBody } = logBody({}, body);
+
+    expect(requestBody).toEqual({
+      id: 7,
+      bad: "[RedactionFailed]",
+      items: ["[RedactionFailed]", "ok"],
+    });
+  });
+
+  it("a body Error holding a value with its own toJSON() is a plain copy under the default mask, the caller's instance with masking off", () => {
+    // An HTTP-client-style cause (a class instance with its own toJSON()): under
+    // a mask its toJSON() output replaces it, so the Error around it is rebuilt
+    // from its fields. Without a mask such a value is kept by reference, and so
+    // is the Error. (A PLAIN-object cause is copied with or without a mask.)
+    class UpstreamError {
+      public readonly status = 502;
+      public toJSON(): Record<string, unknown> {
+        return { status: this.status, config: { headers: { authorization: "Bearer S-CAUSE" } } };
+      }
+    }
+    const cause = new UpstreamError();
+    const makeBody = () => {
+      const err = new Error("charge failed", { cause });
+      err.stack = STACK;
+      return { err, id: 1 };
+    };
+    const masked = makeBody();
+    const unmasked = makeBody();
+
+    const { requestBody: maskedBody } = logBody({}, masked);
+    const { requestBody: unmaskedBody } = logBody({ maskBodyKeys: false }, unmasked);
+
+    const maskedErr = (maskedBody as { err: unknown }).err;
+    expect(maskedErr).not.toBeInstanceOf(Error);
+    expect(maskedErr).toEqual({
+      name: "Error",
+      message: "charge failed",
+      stack: STACK,
+      cause: { status: 502, config: { headers: { authorization: "[REDACTED]" } } },
+    });
+    expect((unmaskedBody as { err: unknown }).err).toBe(unmasked.err);
+    // The caller's objects are never changed.
+    expect(masked.err).toBeInstanceOf(Error);
+    expect(masked.err.cause).toBe(cause);
+    expect(Object.keys(masked.err)).toEqual([]);
+  });
+
+  it("a plain-JSON body with no default key serializes byte-identically to the unmasked line", async () => {
+    jest.spyOn(process.hrtime, "bigint").mockReturnValue(1_000_000n);
+    const sink = new PassThrough();
+    const chunks: string[] = [];
+    sink.on("data", (chunk: Buffer | string) => chunks.push(String(chunk)));
+    const logger = loggerModule.createLogger({
+      moduleName: "default-mask-parity",
+      format: "json",
+      includeConsole: false,
+      includeFile: false,
+      includeGlobalFile: false,
+      captureUncaught: false,
+      clock: () => new Date("2026-09-28T10:00:00Z"),
+      additionalTransports: [new winston.transports.Stream({ stream: sink, eol: "\n" })],
+    });
+    const body = {
+      user: { name: "Ada", roles: ["admin", "ops"] },
+      items: [{ sku: "A-1", qty: 2 }],
+      note: null,
+      ratio: 1.5,
+    };
+    for (const options of [{}, { maskBodyKeys: [] }]) {
+      const middleware = createRequestLogger({
+        logger,
+        includeHttpContext: true,
+        includeRequestBody: true,
+        ...options,
+      });
+      const { res } = runMiddleware(middleware, { body });
+      res.emit("finish");
+    }
+    await loggerModule.shutdownLogger(logger);
+
+    const lines = chunks.join("").trim().split("\n");
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toBe(lines[1]);
+    expect(lines[0]).not.toContain("[REDACTED]");
+    expect(JSON.parse(lines[0]).http.requestBody).toEqual(body);
+  });
+
+  it("the README's main example writes the body, headers and context it configures", async () => {
+    const sink = new PassThrough();
+    const chunks: string[] = [];
+    sink.on("data", (chunk: Buffer | string) => chunks.push(String(chunk)));
+    const logger = loggerModule.createLogger({
+      moduleName: "readme-example",
+      format: "json",
+      includeConsole: false,
+      includeFile: false,
+      includeGlobalFile: false,
+      captureUncaught: false,
+      additionalTransports: [new winston.transports.Stream({ stream: sink, eol: "\n" })],
+    });
+    // The options below are the README's main middleware example, plus `logger`.
+    const middleware = createRequestLogger({
+      logger,
+      includeHttpContext: true,
+      includeRequestBody: true,
+      includeRequestHeaders: ["user-agent", "authorization"],
+      includeResponseHeaders: true,
+      maskBodyKeys: [...DEFAULT_MASKED_BODY_KEYS, "ssn"],
+      enrich: (req) => ({ tenantId: req.headers["x-tenant-id"] }),
+    });
+    const { res } = runMiddleware(middleware, {
+      body: { email: "user@example.com", password: "topsecret", ssn: "078-05-1120" },
+      headers: {
+        "user-agent": "jest",
+        authorization: "Bearer secret",
+        "x-tenant-id": "tenant-7",
+      },
+    });
+    res.setHeader("content-type", "application/json");
+    res.emit("finish");
+    await loggerModule.shutdownLogger(logger);
+
+    const lines = chunks.join("").trim().split("\n");
+    expect(lines).toHaveLength(1);
+    const { http } = JSON.parse(lines[0]) as { http: Record<string, unknown> };
+    expect(http.requestBody).toEqual({
+      email: "user@example.com",
+      password: "[REDACTED]",
+      ssn: "[REDACTED]",
+    });
+    expect(http.requestHeaders).toEqual({ "user-agent": "jest", authorization: "[REDACTED]" });
+    expect(http.responseHeaders).toEqual({ "content-type": "application/json" });
+    expect(http.context).toEqual({ tenantId: "tenant-7" });
+    expect(lines[0]).not.toMatch(/topsecret|078-05-1120|Bearer secret/);
+  });
+});
+
+describe("the default mask lists", () => {
+  it("are frozen, and are the very lists the middleware applies", () => {
+    for (const list of [
+      DEFAULT_MASKED_BODY_KEYS,
+      __requestInternals.DEFAULT_MASKED_HEADER_KEYS,
+      __requestInternals.DEFAULT_MASKED_QUERY_KEYS,
+    ]) {
+      expect(Object.isFrozen(list)).toBe(true);
+      expect(() => (list as string[]).push("extra")).toThrow(TypeError);
+    }
+    expect(__requestInternals.DEFAULT_MASKED_BODY_KEYS).toBe(DEFAULT_MASKED_BODY_KEYS);
+  });
+
+  it("the body list is lowercase, has no duplicates, and leaves out code and key", () => {
+    expect(DEFAULT_MASKED_BODY_KEYS.every((name) => name === name.toLowerCase())).toBe(true);
+    expect(new Set(DEFAULT_MASKED_BODY_KEYS).size).toBe(DEFAULT_MASKED_BODY_KEYS.length);
+    expect(DEFAULT_MASKED_BODY_KEYS).not.toContain("code");
+    expect(DEFAULT_MASKED_BODY_KEYS).not.toContain("key");
+    expect(DEFAULT_MASKED_BODY_KEYS).toEqual(
+      expect.arrayContaining(["password", "token", "secret", "apikey", "authorization", "otp"]),
+    );
+  });
+
+  it("the body list is exactly the documented credential names", () => {
+    expect(DEFAULT_MASKED_BODY_KEYS).toEqual([
+      "password",
+      "passwd",
+      "pwd",
+      "passphrase",
+      "password1",
+      "password2",
+      "newpassword",
+      "new_password",
+      "oldpassword",
+      "old_password",
+      "currentpassword",
+      "current_password",
+      "confirmpassword",
+      "confirm_password",
+      "passwordconfirm",
+      "password_confirm",
+      "passwordconfirmation",
+      "password_confirmation",
+      "secret",
+      "secretkey",
+      "secret_key",
+      "clientsecret",
+      "client_secret",
+      "apikey",
+      "api_key",
+      "privatekey",
+      "private_key",
+      "token",
+      "accesstoken",
+      "access_token",
+      "refreshtoken",
+      "refresh_token",
+      "idtoken",
+      "id_token",
+      "authtoken",
+      "auth_token",
+      "sessiontoken",
+      "session_token",
+      "codeverifier",
+      "code_verifier",
+      "sessionid",
+      "session_id",
+      "credential",
+      "credentials",
+      "otp",
+      "cvv",
+      "cvc",
+      "authorization",
+      "proxy-authorization",
+      "cookie",
+      "set-cookie",
+      "x-api-key",
+    ]);
+  });
+
+  it("the header and query lists are unchanged", () => {
+    expect(__requestInternals.DEFAULT_MASKED_HEADER_KEYS).toEqual([
+      "authorization",
+      "cookie",
+      "set-cookie",
+      "x-api-key",
+      "proxy-authorization",
+    ]);
+    expect(__requestInternals.DEFAULT_MASKED_QUERY_KEYS).toEqual([
+      "token",
+      "access_token",
+      "api_key",
+      "apikey",
+      "key",
+      "code",
+      "secret",
+      "password",
+    ]);
+  });
+
+  it("accepts maskBodyKeys: false and rejects true with the opt-out hint", () => {
+    const { logger } = createMockLogger();
+    expect(() =>
+      createRequestLogger({ logger, includeHttpContext: true, maskBodyKeys: false }),
+    ).not.toThrow();
+
+    let caught: unknown;
+    try {
+      createRequestLogger({ logger, maskBodyKeys: true as unknown as false });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(RequestLoggerOptionError);
+    expect((caught as RequestLoggerOptionError).code).toBe("INVALID_MASK");
+    expect((caught as RequestLoggerOptionError).message).toContain("maskBodyKeys");
+    expect((caught as RequestLoggerOptionError).message).toContain("(or `false` to opt out)");
+  });
+});
+
+describe("warning for structured options that nothing writes", () => {
+  afterEach(() => {
+    resetLoggerRegistry();
+    jest.restoreAllMocks();
+  });
+
+  const SUFFIX =
+    "The structured entry is attached only with includeHttpContext: true (under info.http), or read by a custom messageBuilder.";
+
+  it("warns once at creation, naming every option whose capture is never written", () => {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { logger, log } = createMockLogger();
+
+    const middleware = createRequestLogger({
+      logger,
+      includeRequestBody: true,
+      includeRequestHeaders: ["user-agent"],
+      includeResponseHeaders: true,
+      enrich: () => ({ tenantId: "t-1" }),
+    });
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      `@hiprax/logger createRequestLogger: includeRequestBody, includeRequestHeaders, includeResponseHeaders and enrich are set, but nothing writes what they capture. ${SUFFIX}`,
+    );
+    // Never per request, and the line itself is unchanged: only the message.
+    const { res } = runMiddleware(middleware);
+    res.emit("finish");
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0].http).toBeUndefined();
+    expect(log.mock.calls[0][0].message).toMatch(/^POST \/auth\/login 200 [\d.]+ms \(completed\)$/);
+  });
+
+  it("names a single option in the singular", () => {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { logger } = createMockLogger();
+
+    createRequestLogger({ logger, enrich: () => ({ tenantId: "t-1" }) });
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      `@hiprax/logger createRequestLogger: enrich is set, but nothing writes what it captures. ${SUFFIX}`,
+    );
+  });
+
+  it("warns for a pass-through middleware too, like option validation", () => {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { logger } = createMockLogger();
+
+    createRequestLogger({ logger, loggingEnabled: false, includeRequestBody: true });
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      `@hiprax/logger createRequestLogger: includeRequestBody is set, but nothing writes what it captures. ${SUFFIX}`,
+    );
+  });
+
+  it.each([
+    ["includeHttpContext is on", { includeHttpContext: true, includeRequestBody: true }],
+    [
+      "a messageBuilder reads the entry",
+      { messageBuilder: () => "custom", includeRequestBody: true, enrich: () => ({ a: 1 }) },
+    ],
+    ["the header allow lists are empty", { includeRequestHeaders: [], includeResponseHeaders: [] }],
+    ["every capture option is off", { includeRequestBody: false, includeRequestHeaders: false }],
+    ["the default configuration", {}],
+  ])("does not warn when %s", (_label, options) => {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { logger } = createMockLogger();
+
+    createRequestLogger({ logger, ...options });
+
+    expect(warn).not.toHaveBeenCalled();
   });
 });

@@ -81,9 +81,56 @@ const registered = new Map<winston.Logger, CrashCapturePolicy>();
  * there is no separate boolean to drift out of sync with it.
  */
 let handlersInstalled: {
-  uncaught: (err: Error) => void;
+  uncaught: (err: Error, origin?: NodeJS.UncaughtExceptionOrigin) => void;
   unhandled: (reason: unknown) => void;
 } | null = null;
+
+/**
+ * An `uncaughtException` that Node reported with `origin === "unhandledRejection"`
+ * and that was just recorded, so that the `unhandledRejection` Node may emit
+ * for the same rejection is not recorded a second time. Node reports that
+ * origin in two situations (verified on Node 18, 22 and 24):
+ *
+ * - **`--unhandled-rejections=strict`**: Node raises the rejection as an uncaught
+ *   exception and then, because that exception was handled, emits
+ *   `unhandledRejection` for the same rejection, in the same pass and before
+ *   any `process.nextTick` callback runs. The exception is the reason itself
+ *   when it is error-like; otherwise it is Node's `ERR_UNHANDLED_REJECTION`
+ *   wrapper, whose message holds only a string of the reason (`#<Object>` for
+ *   a plain object).
+ * - **An error while an ES-module entry point loads** (a top-level `throw`, or a
+ *   rejected top-level `await`): the thrown value itself, never wrapped, and no
+ *   paired event.
+ *
+ * Either way the exception is recorded AT ONCE, as an `uncaughtException`,
+ * exactly as earlier versions did. That is load-bearing: Node runs every
+ * `uncaughtException` listener before it emits the pair, so a later handler
+ * that shuts the loggers down or exits would lose a record that waited for it
+ * (the raw value of a non-error rejection is only known then, so it is not
+ * recorded: reject with an `Error` to keep the details). The first
+ * `unhandledRejection` afterwards consumes this entry and is skipped when it is
+ * the pair: the same value, or any value when the exception was Node's wrapper.
+ * A `process.nextTick` clears an entry no rejection followed, so it can never
+ * swallow a later, unrelated rejection.
+ */
+interface RecordedOriginRejection {
+  error: unknown;
+}
+
+let recordedOriginRejection: RecordedOriginRejection | null = null;
+
+/**
+ * Whether `err` is the error Node's strict mode raises for a rejection whose
+ * reason is not error-like. Total: a hostile value (a Proxy trap, a throwing
+ * `code` getter) is treated as not being the wrapper, never as a throw.
+ */
+const isNodeRejectionWrapper = (err: unknown): err is Error => {
+  try {
+    return err instanceof Error && (err as { code?: unknown }).code === "ERR_UNHANDLED_REJECTION";
+  } catch {
+    return false;
+  }
+};
 
 /**
  * Latches once the exit path has begun so a second fatal event fired during
@@ -316,12 +363,46 @@ const onFatal = (kind: "uncaughtException" | "unhandledRejection", err: unknown)
   flushThenExit(primary);
 };
 
+/**
+ * The `uncaughtException` listener. Every exception is recorded at once, as it
+ * always was; one whose `origin` is `"unhandledRejection"` is also remembered
+ * so its strict-mode pair is not recorded again (see
+ * {@link RecordedOriginRejection}).
+ */
+const onUncaughtException = (err: Error, origin?: NodeJS.UncaughtExceptionOrigin): void => {
+  onFatal("uncaughtException", err);
+  if (origin !== "unhandledRejection") {
+    return;
+  }
+  const recorded: RecordedOriginRejection = { error: err };
+  recordedOriginRejection = recorded;
+  process.nextTick(() => {
+    if (recordedOriginRejection === recorded) {
+      recordedOriginRejection = null;
+    }
+  });
+};
+
+/**
+ * The `unhandledRejection` listener. It skips the strict-mode pair of an
+ * exception that was just recorded (the same value, or any value when that
+ * exception was Node's wrapper); every other rejection is recorded.
+ */
+const onUnhandledRejection = (reason: unknown): void => {
+  const recorded = recordedOriginRejection;
+  recordedOriginRejection = null;
+  if (recorded !== null && (recorded.error === reason || isNodeRejectionWrapper(recorded.error))) {
+    return;
+  }
+  onFatal("unhandledRejection", reason);
+};
+
 const install = (): void => {
   if (handlersInstalled) {
     return;
   }
-  const uncaught = (err: Error): void => onFatal("uncaughtException", err);
-  const unhandled = (reason: unknown): void => onFatal("unhandledRejection", reason);
+  const uncaught = onUncaughtException;
+  const unhandled = onUnhandledRejection;
   process.on("uncaughtException", uncaught);
   process.on("unhandledRejection", unhandled);
   handlersInstalled = { uncaught, unhandled };
@@ -334,6 +415,7 @@ const uninstall = (): void => {
   process.removeListener("uncaughtException", handlersInstalled.uncaught);
   process.removeListener("unhandledRejection", handlersInstalled.unhandled);
   handlersInstalled = null;
+  recordedOriginRejection = null;
 };
 
 /**
